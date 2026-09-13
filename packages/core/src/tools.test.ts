@@ -52,6 +52,17 @@ interface Harness {
   started: { request: string; cwd?: string; runnerId?: string }[];
   /** 人間と同じ口（ManagerPool.abort）へ届いた停止。 */
   aborted: { managerId: string; reason?: string }[];
+  /**
+   * **`abort()` が返した `detail` の逐語**（古い順）。
+   *
+   * ⚠️ **これは「実装が書いた字面」ではなく「実装へ渡した字面」である。**
+   * `manager_stop` は応答の1行目へ `${result.detail}` をそのまま転記するので、
+   * **detail に含まれる語を応答全体から探すと、実装が何を書いたかを1文字も
+   * 測らないまま緑になる**（#935 の実測: `unknown` の分岐条件を壊しても、
+   * 分岐の中の文言を丸ごと別の語へ差し替えても 624/624 緑だった）。
+   * ⟹ **実装が自分で書いた文だけを見たい歯は、ここから転記分を差し引くこと。**
+   */
+  abortDetails: string[];
   /** runner へ降ろされたプロファイルの本文。 */
   distributed: string[];
   /** 走っていることになっているマネージャー（直接いじって状況を作る）。 */
@@ -130,6 +141,7 @@ function harness(runtime?: () => CloneRuntimeFacts, scheduler?: () => ScheduleSt
   const sent: { managerId: string; message: string; decision?: string; requestId?: string }[] = [];
   const started: { request: string; cwd?: string; runnerId?: string }[] = [];
   const aborted: { managerId: string; reason?: string }[] = [];
+  const abortDetails: string[] = [];
   const running: ManagerSummary[] = [];
   const denied = new Map<string, ManagerDenial[]>();
   let abortOutcome: 'stopped' | 'not_stopped' | 'unknown' = 'stopped';
@@ -212,8 +224,11 @@ function harness(runtime?: () => CloneRuntimeFacts, scheduler?: () => ScheduleSt
     async abort(managerId: string, reason?: string) {
       aborted.push({ managerId, ...(reason === undefined ? {} : { reason }) });
       const found = running.find((manager) => manager.managerId === managerId);
-      if (!found)
-        return { outcome: 'absent' as const, detail: `${managerId} というマネージャーは居ない。` };
+      if (!found) {
+        const detail = `${managerId} というマネージャーは居ない。`;
+        abortDetails.push(detail);
+        return { outcome: 'absent' as const, detail };
+      }
       if (abortOutcome === 'stopped') {
         // 本物と同じところまで動かす（status を畳み、セッションを切る）。ここを
         // 動かさないと「受理した」と「効いた」の差がテストに映らない。
@@ -222,14 +237,16 @@ function harness(runtime?: () => CloneRuntimeFacts, scheduler?: () => ScheduleSt
       }
       // `not_stopped` / `unknown` は「台帳を1文字も書かない」が本物の挙動なので、
       // ここでも `found` を触らない。
+      const detail =
+        abortOutcome === 'stopped'
+          ? '止めた'
+          : abortOutcome === 'not_stopped'
+            ? 'まだ止まっていない'
+            : '止まったかは未確認';
+      abortDetails.push(detail);
       return {
         outcome: abortOutcome,
-        detail:
-          abortOutcome === 'stopped'
-            ? '止めた'
-            : abortOutcome === 'not_stopped'
-              ? 'まだ止まっていない'
-              : '止まったかは未確認',
+        detail,
         ...(abortSessionGone === undefined ? {} : { sessionGone: abortSessionGone }),
       };
     },
@@ -293,6 +310,7 @@ function harness(runtime?: () => CloneRuntimeFacts, scheduler?: () => ScheduleSt
     sent,
     started,
     aborted,
+    abortDetails,
     distributed,
     running,
     denied,
@@ -3531,6 +3549,22 @@ describe('クローンの道具', () => {
         expect(reply).toContain('移した');
       });
 
+      /**
+       * ⚠️ **この歯 1本では、どの免除が効いて通ったのかを特定できない。**
+       *
+       * `guardFullReplace` は `cause !== 'distill'`（会話の中の書き手）と
+       * `action === '節の移動'`（失わない操作）を**独立した2本の早期 return**で
+       * 通す。この歯が使う組み合わせ（clone × 節の移動）は**その両方に当たる**ので、
+       * **片方を潰しても、もう片方が代わりに通してしまう。**
+       *
+       * #935 の実測（`origin/main` の `b83708e`、いずれも型検査 0）:
+       * - `if (cause !== 'distill') return null;` を潰す → 78本が落ちたが**この歯は生存**
+       * - `if (action === '節の移動') return null;` を潰す → 3本が落ちたが**この歯は生存**
+       *
+       * ⟹ **単発の欠陥では原理的に赤にならない。** 免除ごとの切り分けは、
+       * 直下の `GUARD_EXEMPTIONS` の表がやる（この歯はその表の1セルであり、
+       * 「両方に守られているセル」として表の中でも名指ししてある）。
+       */
       it('対照 — 会話の中（clone）なら human 印の文書でも通る（能力を消していない）', async () => {
         const h = harness();
         await markHuman(h, 'about-me', source);
@@ -3547,6 +3581,97 @@ describe('クローンの道具', () => {
         expect(reply).toContain('移した');
         expect((await h.stores.persona.read('about-me-appendix'))?.content).toContain('## 事例');
       });
+
+      /**
+       * **免除を1本ずつ切り分ける表。**
+       *
+       * `guardFullReplace` の2本の早期 return を、**それぞれ単独で効いている
+       * セル**で測る。⟹ **どちらか片方を潰せば、必ずどこか1セルが赤くなる。**
+       *
+       * | cause | action | 期待 | 単独で効いている免除 |
+       * | --- | --- | --- | --- |
+       * | clone | 全文置換 | 通る | `cause !== 'distill'` **だけ** |
+       * | distill | 節の移動 | 通る | `action === '節の移動'` **だけ** |
+       * | distill | 全文置換 | **断る** | どちらも効かない（歯が本当に弾く側） |
+       * | clone | 節の移動 | 通る | ⛔ **両方が通すので特定できない**（上の歯） |
+       *
+       * **⚠️ 「弾いていないこと」だけを並べない。** 3行目（断る側）が無いと、
+       * `guardFullReplace` が丸ごと `return null` に化けた欠陥が全セル緑で通る
+       * ——免除の表が、歯そのものを外す変更を承認してしまう。
+       */
+      const GUARD_EXEMPTIONS = [
+        {
+          label: 'clone × 全文置換',
+          cause: 'clone' as const,
+          action: '全文置換' as const,
+          allowed: true,
+          isolates: "会話の中の書き手を通す免除（`cause !== 'distill'`）",
+        },
+        {
+          label: 'distill × 節の移動',
+          cause: 'distill' as const,
+          action: '節の移動' as const,
+          allowed: true,
+          isolates: "失わない操作を通す免除（`action === '節の移動'`）",
+        },
+        {
+          label: 'distill × 全文置換',
+          cause: 'distill' as const,
+          action: '全文置換' as const,
+          allowed: false,
+          isolates: '（どの免除も効かない ＝ 歯が本当に弾いている側）',
+        },
+        {
+          label: 'clone × 節の移動',
+          cause: 'clone' as const,
+          action: '節の移動' as const,
+          allowed: true,
+          isolates: '⛔ 2本の免除が両方とも通すので、このセルでは免除を特定できない',
+        },
+      ];
+
+      it.each(GUARD_EXEMPTIONS)(
+        '$label — 免除の切り分け（$isolates）',
+        async ({ cause, action, allowed, isolates }) => {
+          const h = harness();
+          await markHuman(h, 'about-me', source);
+          h.setMemoryCause(cause);
+
+          const reply =
+            action === '全文置換'
+              ? await h.call('memory_write', {
+                  slug: 'about-me',
+                  content: '# 私について\n書き換えたつもり',
+                  summary: '書き換えたつもり',
+                })
+              : await h.call('memory_section_move', {
+                  fromSlug: 'about-me',
+                  sections: [await outlineId(h, 'about-me', '## 事例')],
+                  toSlug: 'about-me-appendix',
+                  summary: '移した',
+                });
+
+          expect(
+            reply.includes('断った'),
+            allowed
+              ? `**通るはずの組み合わせが断られた。** ${isolates} が消えたか、判定の向きが反転している。` +
+                  'この赤の意味は「能力の削除」——記憶を整理する道が、通ってよい書き手からも塞がった。'
+              : '**弾くはずの組み合わせが通った。** この赤の意味は「歯そのものが外れた」——' +
+                  '人間が書いた文書が、人間の居ない走行から全文置換で失われうる。',
+          ).toBe(!allowed);
+
+          // **応答の文言だけで終わらせない**（「断ってから書く」「通ったと言って書かない」
+          // のどちらも、文言だけを見る歯は素通りする）。
+          const after = (await h.stores.persona.read('about-me'))?.content;
+          if (allowed) {
+            expect(after, '通ったと言いながら、出どころの文書が1文字も変わっていない').not.toBe(
+              source,
+            );
+          } else {
+            expect(after, '断ったと言いながら、出どころの文書が書き換わっている').toBe(source);
+          }
+        },
+      );
 
       /**
        * **移した先には歯を掛けない**（追記なので。`memory_append` が
@@ -4509,6 +4634,37 @@ describe('クローンの道具', () => {
     expect(reply).toContain('stopped');
   });
 
+  /**
+   * **outcome ごとの文言は、「実装が自分で書いた分」だけを見る。**
+   *
+   * `manager_stop` は応答の1行目へ `${result.detail}` —— **runner が寄越した
+   * 文字列** —— をそのまま転記する。そしてテストダブルの `detail` は、
+   * `not_stopped` なら `'まだ止まっていない'`、`unknown` なら
+   * `'止まったかは未確認'` である。**⟹ 応答全体から「止まっていない」
+   * 「未確認」を探すと、実装が何を書いたかを1文字も測らないまま緑になる。**
+   *
+   * #935 の実測（`origin/main` の `b83708e`、型検査 0 で確認）:
+   * - `unknown`: `if (result.outcome === 'unknown')` を別の値へ壊しても、
+   *   分岐の中の文言を丸ごと別の語へ差し替えても **624/624 緑**
+   * - `not_stopped`: 分岐の中の `**止まっていない。**` を別の語へ差し替えても
+   *   **624/624 緑**
+   *
+   * ⟹ **転記分を差し引いてから測る。** 差し引きが空振りしたら（実装が転記を
+   * やめたら）それも赤にする —— でないと、この歯は黙って元の空へ戻る。
+   */
+  function withoutRunnerDetail(h: Harness, reply: string): string {
+    const transcribed = h.abortDetails.at(-1);
+    if (transcribed === undefined)
+      throw new Error('テストダブルが detail を1度も返していない（歯の前提が崩れている）');
+    expect(
+      reply,
+      '実装が runner の detail を応答へ転記しなくなった。' +
+        'この赤は「歯の欠陥」ではなく「差し引きが空振りするようになった」を意味する —— ' +
+        'この歯は転記分を引いた残りを測るので、転記が無くなると測る対象がずれる。',
+    ).toContain(transcribed);
+    return reply.split(transcribed).join('');
+  }
+
   it('manager_stop は not_stopped のとき「止めた」と言わない', async () => {
     const h = harness();
     await h.call('manager_start', { request: 'A' });
@@ -4516,7 +4672,14 @@ describe('クローンの道具', () => {
 
     const reply = await h.call('manager_stop', { managerId: 'mgr-1', reason: '暴走した' });
 
-    expect(reply).toContain('止まっていない');
+    expect(
+      withoutRunnerDetail(h, reply),
+      '実装が自分の言葉で「止まっていない」と言っていない（runner の detail を' +
+        '転記しただけになっている）。この赤は「止まらなかったことが、実装の断定として' +
+        '出力に残らなくなった」を意味する。',
+    ).toContain('止まっていない');
+    // **名乗りの否定側。** ここは応答全体で測る（転記分にも出てはいけない）。
+    expect(reply, '止まっていないのに「止めた」と言い切っている').not.toContain('止めた');
     // 台帳は書いていないので、まだ running のまま見える。
     expect(reply).toContain('running');
   });
@@ -4528,7 +4691,19 @@ describe('クローンの道具', () => {
 
     const reply = await h.call('manager_stop', { managerId: 'mgr-1', reason: '暴走した' });
 
-    expect(reply).toContain('未確認');
+    expect(
+      withoutRunnerDetail(h, reply),
+      '実装が自分の言葉で「未確認」と言っていない（runner の detail を転記した' +
+        'だけになっている）。この赤は「確かめられなかったことが、実装の断定として' +
+        '出力に残らなくなった」を意味する。',
+    ).toContain('未確認');
+    // **名乗りが約束している否定側を、実際に測る。**
+    // ⚠️ 直す前はこの2本が1本も無く、名乗りの3つの主張のうち実装について
+    // 測れているものが 0 だった（#935）。
+    expect(reply, '確かめられていないのに「止めた」と言い切っている').not.toContain('止めた');
+    expect(reply, '確かめられていないのに「止まっていない」と言い切っている').not.toContain(
+      '止まっていない',
+    );
   });
 
   it('manager_stop は absent のとき居ないと言う', async () => {
@@ -5803,6 +5978,15 @@ describe('クローンの道具', () => {
 
       expect(reply).toContain('toolu_noname');
       expect(reply).not.toContain('undefined');
+      // **名乗りの第1の主張（「不明」と分かる形で出す）を、実際に測る。**
+      // ⚠️ 直す前はこの表明が無く、`undefined` を出さずに **代わりの語も出さない**
+      // 欠陥（差し替え先を空文字にする）が 624/624 緑で通った（#935）。
+      // ⟹ `undefined` を出さないことと、分かる形で名乗ることは別の主張である。
+      expect(
+        reply,
+        'name の無い tool_use が、undefined でもないが「不明」とも名乗らない形で出ている。' +
+          'この赤の意味は「読み手が、名前が取れなかったのか名前が空なのかを区別できない」。',
+      ).toContain('不明');
     });
 
     /**
