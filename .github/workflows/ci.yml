@@ -506,6 +506,51 @@ jobs:
               exit 0
             '
 
+      # **`db` サービス専用の像も、素の `postgres:17-alpine` から `ALTEROID_DATABASE_URL`
+      # 1本だけで起動できることを実物で見る。** ここが無いと、`docker/db.Dockerfile` /
+      # `docker/alteroid-db`（URL パース）の誤りに、実際に `docker compose up` する
+      # まで気づけない——上の `alteroid:ci` の像とは別の Dockerfile なので、上の
+      # ステップはこちらを一切検証していない。
+      - uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          file: ./docker/db.Dockerfile
+          load: true
+          tags: alteroid-db:ci
+          cache-from: type=gha,scope=db
+          cache-to: ${{ env.DRIFT != 'true' && 'type=gha,scope=db' || '' }}
+          no-cache: ${{ env.DRIFT == 'true' }}
+
+      # パスワードに `:` / `@` / パーセントエンコードが混じっても正しく割れること
+      # まで見る（素朴なシェルのパラメータ展開だと誤って割ってしまう値である）。
+      - name: db は ALTEROID_DATABASE_URL 1本（記号入りパスワード込み）から起動できるか
+        run: |
+          docker run -d --name alteroid-db-ci \
+            -e ALTEROID_DATABASE_URL='postgres://alteroid:p%40ss%3Aword@db:5432/alteroid' \
+            alteroid-db:ci
+          trap 'docker logs alteroid-db-ci; docker rm -f alteroid-db-ci >/dev/null 2>&1' EXIT
+
+          # **`pg_isready` だけでは初期化完了を判定できない（実測で踏んだ）。** postgres
+          # 公式イメージは初回起動時、initdb 直後に「セットアップ専用の一時サーバー」
+          # （Unix ソケットで待受けるが `POSTGRES_DB` 相当のデータベース作成前）を
+          # 一時的に起こす。`pg_isready` はこの一時サーバーに対しても「accepting
+          # connections」を返すため、そのタイミングで `psql -d alteroid` を打つと
+          # `FATAL: database "alteroid" does not exist` になる（本番サーバーへの
+          # 切り替えより前）。手元では初期化が速く終わってたまたま踏まなかったが、
+          # CI では実際にこのレースを踏んだ（run 34826494756）。
+          # ⟹ 「接続を受け付けるか」ではなく「実際に目的の db へ繋がるか」自体を
+          # リトライの条件にする。
+          for _ in $(seq 1 30); do
+            docker exec -e PGPASSWORD='p@ss:word' alteroid-db-ci \
+              psql -U alteroid -d alteroid -c 'select 1;' >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # パースしたユーザー名・db 名・（デコードした）パスワードで実際に繋がること。
+          docker exec -e PGPASSWORD='p@ss:word' alteroid-db-ci \
+            psql -U alteroid -d alteroid -c 'select 1;' \
+            || { echo "パースしたユーザー名/パスワードで繋がらない" >&2; exit 1; }
+
   # **PR の base が古く、かつ merge base 以降に main へ入った変更が、この PR と
   # 同じファイルを触っているときだけ赤くする（#838）。** 判定ロジックは
   # `scripts/check-base-overlap-core.mjs` が正本（compare API の向きの実測・
