@@ -241,13 +241,6 @@ export {
   type RenderedMemory,
   type RenderMemoryDocumentsOptions,
 } from './memory.js';
-/**
- * PR / Issue の本文に置く「出所の刻印」（Issue #850）。
- *
- * `CLONE_ACTOR_ID`（`usage.ts`）と語彙を共有する理由・`ORIGIN_HUMAN` が
- * 要る理由は `origin-marker.ts` の doc を見よ。
- */
-export { formatOriginMarker, ORIGIN_HUMAN, ORIGIN_MARKER_NAME } from './origin-marker.js';
 export type { CloneSystemPromptInput } from './prompt.js';
 export {
   buildCloneSystemPrompt,
@@ -841,6 +834,17 @@ export { clearRecentTracesForTesting } from './dropped-record.js';
  * `uncaughtExceptionMonitor` なのか（実測の表つき）は `uncaught-net.ts` に在る。
  */
 export { installUncaughtNet } from './uncaught-net.js';
+
+/**
+ * ワークスペースのリセット（「トークン情報以外を全部消す」）。CLI の
+ * `alteroid reset` と `POST /reset`（`apps/daemon/src/app.ts`）が使う唯一の
+ * 正本 — 何を残し何を消すかはここにしか書かない（`workspace-reset.ts` の doc）。
+ */
+export {
+  resetWorkspaceState,
+  type ResetWorkspaceStateOptions,
+  type WorkspaceResetSummary,
+} from './workspace-reset.js';
 
 /** テスト用ユーティリティ（本番の配線には出てこない）。 */
 export {
