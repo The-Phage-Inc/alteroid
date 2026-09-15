@@ -113,6 +113,7 @@ export const KEY = {
   conversation: (id: string) => ({ type: 'conversation', id }) as const,
   runners: { type: 'runners' } as const,
   tokens: { type: 'tokens' } as const,
+  access: { type: 'access' } as const,
   credentials: { type: 'credentials' } as const,
   dropped: { type: 'dropped' } as const,
   archive: { type: 'archive' } as const,
@@ -382,12 +383,31 @@ export function useRunners() {
  * 認証トークンのプールと、回す契機・冷却の設定（`GET /tokens`）。
  *
  * **alteroid を使う許可があれば読める**（2026-09-06 の同格化で `requireOperator` が
- * 外れた。それ以前は実行環境の持ち主だけだった）。読み取り専用（`PUT /tokens` は
- * この画面からは呼ばない）。
+ * 外れた。それ以前は実行環境の持ち主だけだった）。**2026-09-14 以降、この hook を
+ * 呼ぶ画面（`routes/tokens.tsx`）は `PUT /tokens` も呼ぶ**（追加・削除・
+ * 無効化/有効化——`mutations.ts` の `useAddToken` / `useRemoveToken` /
+ * `useSetTokenDisabled`）。**もう読み取り専用ではない。** 回す契機・冷却の設定
+ * （`policy`）は引き続き CLI（`alteroid token policy`）/ `PUT /tokens/policy`
+ * だけの仕事である。
  */
 export function useTokens() {
   const api = useApi();
   return useSWR(KEY.tokens, () => api.api.GET('/tokens').then(unwrap));
+}
+
+/**
+ * ログインしたアカウントと許可の一覧（`GET /access`）。CLI の
+ * `alteroid access list` と同じもの。
+ *
+ * **alteroid を使う許可があれば読める**（2026-09-06 の同格化で `requireOperator`
+ * が外れた。それ以前は実行環境の持ち主だけだった——`/tokens` と同格。
+ * `.claude/skills/auth-and-access/SKILL.md`）。**読み取り専用**——`grant` /
+ * `revoke` はこの hook を呼ぶ画面（`routes/access.tsx`）からは呼ばない
+ * （Issue #213。理由はその画面の doc）。
+ */
+export function useAccess() {
+  const api = useApi();
+  return useSWR(KEY.access, () => api.api.GET('/access').then(unwrap));
 }
 
 /**
