@@ -14,20 +14,34 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { Commitment, CommitmentOrigin } from '@alteroid/core';
+import type { CommitmentOrigin } from '@alteroid/core';
 import { json, Providers, stubFetch, storeTestBaseUrl } from '~/test-support';
+import type { Commitment } from '~/lib/types';
 
 import Commitments from './commitments';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * `Commitment`（`~/lib/types`。生成 spec から導出した型）は `respondedAt`
+ * （issue #1003）を含む——`GET /commitments` の応答がそのまま持つ欄なので、
+ * ここで手を加える必要は無い（以前はここでローカルに1欄だけ広げていたが、
+ * `commitments.tsx` と同じ理由でその形をやめた）。
+ *
+ * **`updatedAt` は必須欄である**（`commitmentListResponseSchema` の
+ * `entries` が持つ加算欄。`packages/core/src/schema.ts` の
+ * `commitmentUpdatedAt` と同じ導出——`closedAt ?? at`）。画面はこの値を
+ * 直接は読まないが、型を満たすためにここで組み立てる。
+ */
 function commitment(over: Partial<Commitment> = {}): Commitment {
+  const at = over.at ?? new Date(Date.now() - 3 * DAY_MS).toISOString();
   return {
     id: 'cmt-1',
-    at: new Date(Date.now() - 3 * DAY_MS).toISOString(),
     origin: 'human',
     body: 'ドキュメントの誤りを直す',
     ...over,
+    at,
+    updatedAt: over.updatedAt ?? over.closedAt ?? at,
   };
 }
 
@@ -281,6 +295,60 @@ describe('/commitments 画面', () => {
 
     await screen.findByText('引き受けたまま終わっていない仕事はない。');
     expect((screen.getByRole('button', { name: '積む' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+/**
+ * 「放置」と「進行中」の見分け（issue #1003）。
+ *
+ * ここで固定するのは導出の結果そのものではない（それは
+ * `packages/core/src/schema.test.ts` の `commitmentRespondedAt` の歯が持つ）。
+ * ここが固定するのは、**サーバが返した `respondedAt` を画面が正しく読み分ける
+ * こと**——`origin: 'human'` のときだけ「返答済み・未クローズ」/「未着手」の
+ * どちらかを出し、それ以外の `origin` には（この概念が無いので）どちらも
+ * 出さないこと。
+ */
+describe('返答済み・未クローズ / 未着手（issue #1003）', () => {
+  it('origin: human の未了行に respondedAt が付けば「返答済み・未クローズ」が出る', async () => {
+    stubCommitments([
+      commitment({
+        origin: 'human',
+        source: 'conv-1',
+        respondedAt: '2026-09-14T00:00:00.000Z',
+      }),
+    ]);
+    renderPage();
+
+    await screen.findByText('ドキュメントの誤りを直す');
+    expect(screen.getByText(/返答済み・未クローズ/)).toBeTruthy();
+    expect(screen.queryByText('未着手')).toBeNull();
+  });
+
+  it('origin: human で respondedAt が無ければ「未着手」が残余として出る', async () => {
+    stubCommitments([commitment({ origin: 'human', source: 'conv-1' })]);
+    renderPage();
+
+    await screen.findByText('ドキュメントの誤りを直す');
+    expect(screen.getByText('未着手')).toBeTruthy();
+    expect(screen.queryByText(/返答済み・未クローズ/)).toBeNull();
+  });
+
+  /**
+   * **`origin` が `human` でなければ、`respondedAt` が付いていてもバッジを
+   * 出さない。** チャット以外の3経路（`self` / `manager` / `external`）には
+   * 「クローンが人間へ返答したか」という概念自体が無いので、`未着手` という
+   * 強い言葉を当てはまらない行に貼らない
+   * （`packages/core/src/schema.ts` の `commitmentRespondedAt` の doc）。
+   */
+  it('origin が human でなければ、respondedAt があっても両方のバッジを出さない', async () => {
+    stubCommitments([
+      commitment({ origin: 'self', source: undefined, respondedAt: '2026-09-14T00:00:00.000Z' }),
+    ]);
+    renderPage();
+
+    await screen.findByText('ドキュメントの誤りを直す');
+    expect(screen.queryByText(/返答済み・未クローズ/)).toBeNull();
+    expect(screen.queryByText('未着手')).toBeNull();
   });
 });
 
