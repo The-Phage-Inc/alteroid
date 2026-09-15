@@ -11,7 +11,6 @@ import {
   reachedStart,
   readConversationWindow,
   searchExchanges,
-  toMessage,
 } from './conversation.js';
 import {
   commitmentPosition,
