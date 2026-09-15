@@ -5782,6 +5782,98 @@ describe('クローンの道具', () => {
   });
 
   /**
+   * **現行の欠陥を仕様として固定したものである（#809）。** `describeManagerFailure`
+   * が回復の見込みを判定するのに使っているのは `lastReport` の**文言**
+   * （`limitRecoveryOf`）だけで、`failure.code`（`SDKAssistantMessageError` の語。
+   * ここでは `verification_required`）は `⚠` 行の表示にしか使われず、判定には
+   * 一切使われていない。**⟹ `SDKAssistantMessageError` の語 → 回復の見込み、
+   * という軸そのものがいまの実装に無い。**
+   *
+   * `verification_required` の実測（`sdk-failure.ts` の doc 参照 ——
+   * 403/`permission_error`・専用クラス名 `VerificationRequiredError`・
+   * "blocked"固定文言・`/goal` の回復不能群・専用の箱・`apiErrorIsTransient`
+   * 不在）はどれも「人間（または組織の管理者）が動くまで開かない」側を指して
+   * いるが、`lastReport` の本文（サーバの `error.message` をそのまま通した
+   * もの——実測ではなくあり得る形を組み立てたもの。`sdk-failure.test.ts` の
+   * `VERIFICATION_REQUIRED_TEXT` と同じ形）は `USAGE_LIMIT_ERROR_PREFIXES` の
+   * どれとも一致しないので、いまは何も足されない。**軸が無い**からであって、
+   * 「分からないから」ではない。
+   *
+   * **この期待値は #809 の実装（語の軸）が入ると反転する。**
+   *
+   * ---
+   *
+   * **反転（#809 の実装が入った）。** `describeManagerFailure` はいま、
+   * 文言側（`limitRecoveryOf(lastReport)`）が `unknown` を返したときに限り
+   * `failure.code`（`via === 'assistant_error'` のときだけ）を
+   * `limitRecoveryOfAssistantError` へ通す。`verification_required` は
+   * `usage-limits.ts` の `LIMIT_RECOVERY_BY_ASSISTANT_ERROR` で `action` と
+   * 判断してある（根拠は同表の doc）ので、いまは `⚠` 行の末尾に回復の見込みが
+   * 添えられる。**上のコメント（欠陥の固定）は経緯として残す**——文言側の軸に
+   * 手を入れたのではなく、語ベースの軸をフォールバックとして足したことで
+   * この期待値が変わった。
+   */
+  it('manager_list は verification_required では、語の軸から回復の見込み（action）を添える（#809）', async () => {
+    const h = harness();
+    await h.call('manager_start', { request: 'A' });
+    const target = h.running[0];
+    if (!target) throw new Error('準備に失敗');
+    target.lastReport =
+      '（このターンは応答を返さずに終わった: verification_required / assistant_error）\n' +
+      'API Error: organization verification required · complete verification at ' +
+      'https://console.anthropic.com/settings/verification';
+    target.lastFailure = {
+      code: 'verification_required',
+      via: 'assistant_error',
+      at: '2026-09-09T01:23:45.000Z',
+    };
+
+    const reply = await h.call('manager_list', {});
+
+    expect(reply).toContain('⚠ 直近のターンは報告ではなく失敗で終わっている');
+    // **いまはここに語ベースの回復の見込みが足される。** 軸が入ったことの裏付け。
+    expect(reply).toContain('（回復の見込み: 人間が動かないと戻らない（action））');
+  });
+
+  /**
+   * **同じ欠陥を逆向き（`time` になるはずの語）でも固定する（#809）。**
+   * `overloaded` は SDK 自身が「wait and retry」と言っている一時的な過負荷で、
+   * 待てば戻る側の代表例だが、`lastReport` の文言はやはり
+   * `USAGE_LIMIT_ERROR_PREFIXES` のどれとも一致しないので、いまは何も足さない。
+   * **`action` 側だけでなく `time` 側でも同じ非対称が起きることを示す**——
+   * どちらの向きに倒すべきかが分かっている語でも、軸が無ければ両方とも
+   * 無回答のまま取り残される。
+   *
+   * **この期待値も #809 の実装（語の軸）が入ると反転する。**
+   *
+   * ---
+   *
+   * **反転（#809 の実装が入った）。** `overloaded` は
+   * `LIMIT_RECOVERY_BY_ASSISTANT_ERROR` で `time` と判断してある
+   * （一時的な過負荷。根拠は同表の doc）ので、いまは `⚠` 行の末尾に
+   * `time` の回復の見込みが添えられる。
+   */
+  it('manager_list は overloaded では、語の軸から回復の見込み（time）を添える（#809）', async () => {
+    const h = harness();
+    await h.call('manager_start', { request: 'A' });
+    const target = h.running[0];
+    if (!target) throw new Error('準備に失敗');
+    target.lastReport =
+      '（このターンは応答を返さずに終わった: overloaded / assistant_error）\n' +
+      'API Error: Overloaded';
+    target.lastFailure = {
+      code: 'overloaded',
+      via: 'assistant_error',
+      at: '2026-09-09T01:23:45.000Z',
+    };
+
+    const reply = await h.call('manager_list', {});
+
+    expect(reply).toContain('⚠ 直近のターンは報告ではなく失敗で終わっている');
+    expect(reply).toContain('（回復の見込み: 時間で戻る（time））');
+  });
+
+  /**
    * `turnEndedAt` / `turnEndReason` / `turnEndTail`（Issue #567、PR #588）を
    * `manager_list` で表示する `describeTurnEnd`（`tools.ts`）の歯。
    * 分岐の設計は同関数の doc を参照。
