@@ -643,6 +643,9 @@
                         },
                         "conversationId": {
                           "type": "string"
+                        },
+                        "supersedes": {
+                          "type": "string"
                         }
                       },
                       "required": ["type", "id", "at", "with", "role", "text"]
@@ -2509,6 +2512,9 @@
                                 "type": "string"
                               },
                               "conversationId": {
+                                "type": "string"
+                              },
+                              "supersedes": {
                                 "type": "string"
                               }
                             },
