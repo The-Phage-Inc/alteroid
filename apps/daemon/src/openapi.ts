@@ -4,6 +4,7 @@ import {
   agentTokenViewSchema,
   commitmentSchema,
   createMemoryStores,
+  INBOX_EVENT_TYPE_ORDER,
   jobSchema,
   jobStatusSchema,
   journalEntrySchema,
@@ -1440,6 +1441,52 @@ export const archiveRemovedResponseSchema = z.object({
   removedAt: z.string(),
   bytes: z.number().int(),
   archiveId: z.string().optional(),
+});
+
+// ---------------------------------------------------------------------------
+// 受信箱（/inbox）— issue #972
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /inbox/remove` の入力（issue #972 提案4「人間の入口から叩けること」）。
+ * 絞り込み（種類・送信元・齢）・既定（`dryRun` を省略すると試算）は
+ * `commitment_close_many`（#844）を参照モデルにした。
+ *
+ * ⚠️ **クローン自身の道具（`inbox_remove_many`）はまだ無い。** #972 本文が
+ * 「クローン自身の道具にするかは別途の判断」と保留していたところへ依頼の
+ * ブリーフが誤って必須スコープに書いてしまったため、いったん取り下げた
+ * ——人間起点の合図（`human_message` / `human_answer`）を選べない形にする案を
+ * 別 PR（draft・`[保留]`）で提案中。この HTTP の口は `types` に7種類のどれも
+ * 制限なく渡せる（人間が直接操作する入口なので、自分自身の発言を巻き込む
+ * ことの是非は道具の場合と条件が異なる）。
+ *
+ * **`types` は必須で空にできない。** ハンドラ側（`app.ts`）で「在る7種類を
+ * 全部並べた呼びは断る」を判定する——ここでは判定しない（`z.array` に
+ * 「特定の組み合わせを禁じる」制約は素直に書けないため。`commitment_close_many`
+ * と同じ役割分担）。
+ */
+export const inboxRemoveManyRequestSchema = z.object({
+  types: z.array(z.enum(INBOX_EVENT_TYPE_ORDER)).min(1),
+  sources: z.array(z.string().min(1)).min(1).optional(),
+  before: z.string().min(1).optional(),
+  reason: z.string().min(1),
+  dryRun: z.boolean().optional(),
+  limit: z.number().int().min(1).optional(),
+});
+
+/**
+ * `POST /inbox/remove` の応答。**`removedIds` は打ち切らない**——JSON の
+ * 応答は人間・スクリプトが読むもので、クローンの道具の文脈窓のような制約が
+ * 無い。
+ */
+export const inboxRemoveManyResponseSchema = z.object({
+  ok: z.literal(true),
+  dryRun: z.boolean(),
+  totalPending: z.number().int(),
+  matched: z.number().int(),
+  targeted: z.number().int(),
+  removedIds: z.array(z.string()),
+  remaining: z.number().int(),
 });
 
 // ---------------------------------------------------------------------------

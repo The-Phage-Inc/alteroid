@@ -429,10 +429,14 @@ export {
  */
 export {
   INBOX_BACKLOG_LOUD_THRESHOLD,
+  INBOX_EVENT_TYPE_ORDER,
   inboxBacklogDedupeKey,
+  inboxBacklogSourceFor,
   summarizeInboxBacklog,
   describeInboxBacklogBreakdown,
+  matchesInboxRemoveManyFilter,
   type InboxBacklogBreakdown,
+  type InboxRemoveManyFilter,
 } from './inbox-backlog.js';
 /**
  * 「この委譲から、この合図より後に報告が届いている」の判定と文面
@@ -760,6 +764,10 @@ export {
   MCP_SERVER_NAME,
   MEMORY_GUARD_ENV,
   MEMORY_GUARD_VALUES,
+  REMOVE_MANY_JOURNAL_ID_CHARS,
+  REMOVE_MANY_LIMIT_DEFAULT,
+  REMOVE_MANY_LIMIT_MAX,
+  chunkIdsByChars,
   createCloneMcpServer,
   createCloneTools,
   qualifiedToolName,

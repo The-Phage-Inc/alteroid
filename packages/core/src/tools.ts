@@ -1139,6 +1139,35 @@ const CLOSE_MANY_IDS_SHOWN = 20;
 /** 0件だったときに「実在する source」を挙げて見せる件数の上限（同じ理由）。 */
 const CLOSE_MANY_SOURCES_SHOWN = 8;
 /**
+ * 受信箱（inbox_events）の絞り込み一括削除（issue #972）が共有する上限3つ。
+ *
+ * **いまはクローンの道具を持たない。** `apps/daemon/src/app.ts` の
+ * `POST /inbox/remove`（人間の入口）だけがこの上限を使う——#972 本文が
+ * 「クローン自身の道具にするかは別途の判断（自分の受信箱を自分で捨てられる
+ * ことの是非があるため、まずは人間の手で足りる）」と保留していたのに、
+ * 依頼のブリーフが誤ってこれを必須スコープへ書き換えていたため、いったん
+ * クローンの道具は取り下げた。**取り下げた案（人間起点の合図 `human_message`
+ * / `human_answer` を選べない形にする）は別 PR（draft・`[保留]`）で提案中**
+ * ——ここに定数だけ残しているのは、その PR がこの値をそのまま再利用できる
+ * ようにするため。値を決め直す理由は無い（`commitment_close_many` の同名の
+ * 定数と値を使い回さないのと同じ判断——ここは台帳の行ではなく受信箱の合図が
+ * 対象で、上限を上げ下げする理由も別に生まれうるので export した独立の値と
+ * している）。
+ *
+ * **`REMOVE_MANY_LIMIT_DEFAULT` / `REMOVE_MANY_LIMIT_MAX` の意味は
+ * `CLOSE_MANY_LIMIT_DEFAULT` / `CLOSE_MANY_LIMIT_MAX` の doc と同じ**
+ * ——1回の呼びが背負うもの（ストアへの書き込み・日誌の件数・戻り値の長さ）
+ * を抑える上限と、呼ぶ側が指定できる上限の上限。**行を消す操作は台帳の
+ * `close` と違って取り消せない**（`InboxStore` に reopen は無い）ので、
+ * `dryRun` の既定（`POST /inbox/remove` の実装）と合わせて2段構えにしてある。
+ *
+ * **`REMOVE_MANY_JOURNAL_ID_CHARS` の意味も同じ**——#972 の要求（「消した id
+ * は全部日誌に残す」）を「予算は件数ではなく文字数」の形で満たす。
+ */
+export const REMOVE_MANY_LIMIT_DEFAULT = 500;
+export const REMOVE_MANY_LIMIT_MAX = 2_000;
+export const REMOVE_MANY_JOURNAL_ID_CHARS = 3_600;
+/**
  * `profile_write` が返す配布先の一覧（`配った先` / `配れなかった先`）を
  * 抜粋する厚み（#409）。
  *
