@@ -385,10 +385,7 @@ export function useConversations(limit = 30) {
  * をそのまま束ねるだけ。`packages/core/src/conversation.ts` の
  * `computeSupersededIds` が正本）。
  */
-export function useConversation(
-  id: string | null,
-  options: { includeSuperseded?: boolean } = {},
-) {
+export function useConversation(id: string | null, options: { includeSuperseded?: boolean } = {}) {
   const api = useApi();
   const includeSuperseded = options.includeSuperseded ?? false;
   return useSWR(id === null ? null : KEY.conversation(id, includeSuperseded), ({ id }) =>

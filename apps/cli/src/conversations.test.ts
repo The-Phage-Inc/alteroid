@@ -320,9 +320,7 @@ describe('alteroid conversations show', () => {
       status: 200,
       body: {
         conversationId: 'conv-1',
-        messages: [
-          { id: 'm2', at: '2026-08-16T10:02:00.000Z', role: 'inbound', text: '直した文' },
-        ],
+        messages: [{ id: 'm2', at: '2026-08-16T10:02:00.000Z', role: 'inbound', text: '直した文' }],
         scanned: 5,
         reachedStart: true,
         supersededCount: 2,

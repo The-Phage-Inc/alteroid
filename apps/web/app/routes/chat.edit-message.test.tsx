@@ -215,9 +215,7 @@ describe('編集して送信する', () => {
       if (url.includes(`/conversations/${CONVERSATION_ID}`)) {
         return json({
           conversationId: CONVERSATION_ID,
-          messages: [
-            { id: 'm1', at: '2026-08-20T00:00:00.000Z', role: 'inbound', text: '元の文' },
-          ],
+          messages: [{ id: 'm1', at: '2026-08-20T00:00:00.000Z', role: 'inbound', text: '元の文' }],
           scanned: 1,
           reachedStart: true,
           supersededCount: 0,

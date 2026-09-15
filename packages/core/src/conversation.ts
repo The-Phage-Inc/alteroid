@@ -132,7 +132,8 @@ export function computeSupersededIds(chronological: Exchange[]): Map<string, str
     }
     for (let k = i; k < j; k += 1) {
       const hiddenId = chronological[k]?.id;
-      if (hiddenId !== undefined && !supersededBy.has(hiddenId)) supersededBy.set(hiddenId, entry.id);
+      if (hiddenId !== undefined && !supersededBy.has(hiddenId))
+        supersededBy.set(hiddenId, entry.id);
     }
   });
   return supersededBy;
@@ -269,7 +270,9 @@ export function conversationMessages(
   const supersededBy = computeSupersededIds(chronological);
   const messages = chronological.map((entry) => {
     const hiddenBy = supersededBy.get(entry.id);
-    return hiddenBy === undefined ? toMessage(entry) : { ...toMessage(entry), supersededBy: hiddenBy };
+    return hiddenBy === undefined
+      ? toMessage(entry)
+      : { ...toMessage(entry), supersededBy: hiddenBy };
   });
   if (options.includeSuperseded) return messages;
   return messages.filter((message) => message.supersededBy === undefined);

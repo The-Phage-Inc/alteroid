@@ -191,7 +191,9 @@ export async function conversationsShowCommand(
   const { messages, scanned, reachedStart, supersededCount } = await response.json();
   // `renderConversationDetail` も改行で終わらずに返す（理由は上の
   // `renderConversationsList` の呼び出しと同じ。#326）。
-  stdout.write(`${renderConversationDetail(id, messages, scanned, reachedStart, supersededCount)}\n`);
+  stdout.write(
+    `${renderConversationDetail(id, messages, scanned, reachedStart, supersededCount)}\n`,
+  );
 }
 
 /**

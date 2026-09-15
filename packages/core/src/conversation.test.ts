@@ -444,7 +444,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
 
   it('編集の連鎖（編集をさらに編集）が正しく畳まれる', () => {
     const entries: JournalEntry[] = [
-      exchange({ id: 'c3', at: '2026-08-20T00:05:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c3',
+        at: '2026-08-20T00:05:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h3',
         at: '2026-08-20T00:04:00.000Z',
@@ -452,7 +457,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
         text: '2度目の編集',
         supersedes: 'h2',
       }),
-      exchange({ id: 'c2', at: '2026-08-20T00:03:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c2',
+        at: '2026-08-20T00:03:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h2',
         at: '2026-08-20T00:02:00.000Z',
@@ -460,8 +470,18 @@ describe('conversationMessages（supersedes を畳む）', () => {
         text: '1度目の編集',
         supersedes: 'h1',
       }),
-      exchange({ id: 'c1r', at: '2026-08-20T00:01:00.000Z', conversationId: 'c1', role: 'outbound' }),
-      exchange({ id: 'h1', at: '2026-08-20T00:00:00.000Z', conversationId: 'c1', text: '最初の発言' }),
+      exchange({
+        id: 'c1r',
+        at: '2026-08-20T00:01:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
+      exchange({
+        id: 'h1',
+        at: '2026-08-20T00:00:00.000Z',
+        conversationId: 'c1',
+        text: '最初の発言',
+      }),
     ];
 
     // 既定（畳んだ後）は最後の編集とその返答だけが残る。
@@ -476,14 +496,24 @@ describe('conversationMessages（supersedes を畳む）', () => {
 
   it('編集の後ろに続く往復は残る（畳まれるのは旧発言から編集の直前まで）', () => {
     const entries: JournalEntry[] = [
-      exchange({ id: 'c3', at: '2026-08-20T00:05:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c3',
+        at: '2026-08-20T00:05:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h3',
         at: '2026-08-20T00:04:00.000Z',
         conversationId: 'c1',
         text: '編集ではない、続きの発言',
       }),
-      exchange({ id: 'c2', at: '2026-08-20T00:03:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c2',
+        at: '2026-08-20T00:03:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h2',
         at: '2026-08-20T00:02:00.000Z',
@@ -491,7 +521,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
         text: '編集後の発言',
         supersedes: 'h1',
       }),
-      exchange({ id: 'c1r', at: '2026-08-20T00:01:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c1r',
+        at: '2026-08-20T00:01:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({ id: 'h1', at: '2026-08-20T00:00:00.000Z', conversationId: 'c1', text: '旧発言' }),
     ];
 
@@ -504,7 +539,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
   it('対象が窓の外にあるときに何も畳まれず落ちない', () => {
     // h1（supersedes の対象）が scan の窓に入っておらず、この会話には h2 しか無い。
     const entries: JournalEntry[] = [
-      exchange({ id: 'c2', at: '2026-08-20T00:02:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c2',
+        at: '2026-08-20T00:02:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h2',
         at: '2026-08-20T00:01:00.000Z',
@@ -521,7 +561,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
 
   it('日誌のレコード自体は一切変わらない（射影だけが畳む）', () => {
     const entries: JournalEntry[] = [
-      exchange({ id: 'c2', at: '2026-08-20T00:02:00.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c2',
+        at: '2026-08-20T00:02:00.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({
         id: 'h2',
         at: '2026-08-20T00:01:00.000Z',
@@ -529,7 +574,12 @@ describe('conversationMessages（supersedes を畳む）', () => {
         text: '編集後の発言',
         supersedes: 'h1',
       }),
-      exchange({ id: 'c1r', at: '2026-08-20T00:00:30.000Z', conversationId: 'c1', role: 'outbound' }),
+      exchange({
+        id: 'c1r',
+        at: '2026-08-20T00:00:30.000Z',
+        conversationId: 'c1',
+        role: 'outbound',
+      }),
       exchange({ id: 'h1', at: '2026-08-20T00:00:00.000Z', conversationId: 'c1', text: '旧発言' }),
     ];
     // 個々のエントリを凍結する — この関数群が1バイトでも書き換えようとすれば

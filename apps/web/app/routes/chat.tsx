@@ -219,7 +219,7 @@ export function buildEditVersions(
 
   // 古い順の id 列（先頭がいちばん古い版）。
   const ids: string[] = [headId];
-  for (let cursor = head; cursor.supersedes !== undefined; ) {
+  for (let cursor = head; cursor.supersedes !== undefined;) {
     const previous = byId.get(cursor.supersedes);
     if (previous === undefined) break;
     ids.unshift(previous.id);
@@ -1561,8 +1561,7 @@ export function ChatPane({
                             onKeyDown={(event) => {
                               if (
                                 event.key === 'Enter' &&
-                                (event.nativeEvent.isComposing ||
-                                  event.nativeEvent.keyCode === 229)
+                                (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
                               ) {
                                 return;
                               }
@@ -1586,7 +1585,11 @@ export function ChatPane({
                             >
                               確定
                             </Button>
-                            <Button size="sm" variant="ghost" onClick={() => setEditingKey(undefined)}>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => setEditingKey(undefined)}
+                            >
                               キャンセル
                             </Button>
                           </div>
@@ -1673,18 +1676,20 @@ export function ChatPane({
                         （`hiddenFollowUps`）も出す——ここが「前の版へ戻って
                         読める」の本体である。
                       */}
-                      {viewingOldVersion && viewing !== undefined && viewing.hiddenFollowUps.length > 0 && (
-                        <div className="flex max-w-[46rem] flex-col gap-1 rounded-lg border border-dashed border-border px-3 py-2 text-xs whitespace-pre-wrap text-muted">
-                          {viewing.hiddenFollowUps.map((entry, index) => (
-                            <p key={index}>
-                              <span className="mr-1 font-semibold">
-                                {entry.role === 'human' ? '人間' : 'クローン'}
-                              </span>
-                              {entry.text}
-                            </p>
-                          ))}
-                        </div>
-                      )}
+                      {viewingOldVersion &&
+                        viewing !== undefined &&
+                        viewing.hiddenFollowUps.length > 0 && (
+                          <div className="flex max-w-[46rem] flex-col gap-1 rounded-lg border border-dashed border-border px-3 py-2 text-xs whitespace-pre-wrap text-muted">
+                            {viewing.hiddenFollowUps.map((entry, index) => (
+                              <p key={index}>
+                                <span className="mr-1 font-semibold">
+                                  {entry.role === 'human' ? '人間' : 'クローン'}
+                                </span>
+                                {entry.text}
+                              </p>
+                            ))}
+                          </div>
+                        )}
                     </div>
                   ) : null}
                 </li>

@@ -818,9 +818,7 @@ export async function runSlashCommand(
       }
       const owningConversationId = listed.messagesConversationId;
       if (owningConversationId === null) {
-        stdout.write(
-          '先に /conversation <番号|id> でその発言が含まれる会話を開いてください\n',
-        );
+        stdout.write('先に /conversation <番号|id> でその発言が含まれる会話を開いてください\n');
         return 'ok';
       }
       if (target === undefined) {
