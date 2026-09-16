@@ -20,6 +20,7 @@ import type {
   UsageProbeQuery,
 } from '@alteroid/core';
 import {
+  ARCHIVE_REMOVE_MANY_LIMIT_MAX,
   captureStderr,
   clearRecentTracesForTesting,
   createAuthProviderRegistry,
@@ -1411,6 +1412,338 @@ describe('HTTP API', () => {
 
       const rest = await stores.inbox.peekPending();
       expect(rest.map((r) => r.event.id)).toEqual(['evt-3']);
+    });
+  });
+
+  /**
+   * `POST /archive/remove`（issue #698）。`POST /inbox/remove`（#972）と同じ
+   * 設計——絞り込み・既定（`dryRun` 省略で試算）・「絞り込みの無い呼びを断る」・
+   * 塊ごとに日誌を交互に書く。
+   *
+   * ⭐ #1049（「消した」と名乗った応答の後もクローンへ配達され続けた事故）と
+   * 同じ形を撃つ——**応答の `dryRun` / `ok` フィールドだけを見て終わりにせず、
+   * 実際に読む口（`GET /archive/:id` / `GET /archive`）で確かめる。**
+   */
+  describe('POST /archive/remove', () => {
+    it('既定（dryRun省略）は試算だけで1件も消さない（GET /archive/:id が本文を返し続ける）', async () => {
+      const idA = (await stores.archive.archive('sess-dry', 'A')).id;
+      await stores.archive.archive('sess-dry', 'AB'); // newest, idA を含む(前方一致)
+
+      const response = await app.request(
+        '/archive/remove',
+        json({ minStoredBytes: 0, reason: '試算のつもり' }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, dryRun: true, targeted: 1 });
+
+      // ⭐ 応答の dryRun:true を見て終わりにせず、読む口そのもので確かめる。
+      const read = await app.request(`/archive/${idA}`);
+      expect(read.status).toBe(200);
+      expect(await read.text()).toBe('A');
+    });
+
+    it('dryRun:false で実行後、GET /archive/:id は410になり、GET /archive には removedAt/removedBytes 付きで残る', async () => {
+      const idA = (await stores.archive.archive('sess-exec', 'A')).id;
+      const idB = (await stores.archive.archive('sess-exec', 'AB')).id; // newest
+
+      const response = await app.request(
+        '/archive/remove',
+        json({ minStoredBytes: 0, reason: '本当に消す', dryRun: false }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        dryRun: false,
+        targeted: 1,
+        removedIds: [idA],
+        removedBytes: Buffer.byteLength('A', 'utf8'),
+      });
+
+      // 読む口そのもので「消えたことが後から分かる」ことを確かめる。
+      const read = await app.request(`/archive/${idA}`);
+      expect(read.status).toBe(410);
+      expect(await read.json()).toMatchObject({ error: 'removed' });
+
+      const list = (await (await app.request('/archive')).json()) as {
+        entries: { id: string; removedAt?: string; removedBytes?: number }[];
+      };
+      const rowA = list.entries.find((e) => e.id === idA);
+      expect(rowA).toMatchObject({
+        removedAt: expect.any(String),
+        removedBytes: Buffer.byteLength('A', 'utf8'),
+      });
+      // idB(最新行)は行そのものは変わらず残る（removedAt が付かない）。
+      const rowB = list.entries.find((e) => e.id === idB);
+      expect(rowB?.removedAt).toBeUndefined();
+    });
+
+    it('セッションの最新行は、絞り込みに当たっても消えない', async () => {
+      const idOnly = (await stores.archive.archive('sess-newest-only', 'ONLY')).id;
+
+      const response = await app.request(
+        '/archive/remove',
+        json({ minStoredBytes: 0, reason: '最新行しか無い', dryRun: false }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        targeted: 0,
+        removedIds: [],
+        skipped: expect.objectContaining({ newest: 1 }),
+      });
+
+      const read = await app.request(`/archive/${idOnly}`);
+      expect(read.status).toBe(200);
+      expect(await read.text()).toBe('ONLY');
+    });
+
+    it('走行中の委譲が抱えている行は消えず skipped.inUse に数えられ、本文が読めたまま', async () => {
+      const idA = (await stores.archive.archive('sess-running', 'A')).id;
+      await stores.archive.archive('sess-running', 'AB'); // newest
+      fake.runningOwners.set(idA, 'mgr-running-archive');
+
+      const response = await app.request(
+        '/archive/remove',
+        json({ minStoredBytes: 0, reason: '走行中は消せないはず', dryRun: false }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        // targeted は選定（selectArchiveRemovalTargets）が選んだ件数——
+        // 走行中で実行時に弾かれた分もここには数える。実際に消せたかは
+        // removedIds / skipped.inUse を見ること。
+        //
+        // ⚠️ 2026-09-16 反転（#698 欠陥1）: 上のコメントが固定していた
+        // `targeted: 1` は、guard で飛ばした行を `targeted` と
+        // `skipped.inUse` の両方で数える壊れた不変条件
+        // （`matched === targeted + skipped5欄 + remaining` が
+        // 1 ≠ 2 で破れる）をそのまま仕様として固定していた。
+        // `targeted` は「guard を通った後の件数」（＝実際に消しにいった
+        // 件数）に直した——guard で飛ばした行は `skipped.inUse` だけに
+        // 数える。あわせて欠陥3（missing の行がどの欄にも現れない）を
+        // 直す `raced` を応答に足したので、ここでも0を明示して撃つ。
+        targeted: 0,
+        removedIds: [],
+        removedBytes: 0,
+        skipped: expect.objectContaining({ inUse: 1 }),
+        raced: 0,
+      });
+
+      const read = await app.request(`/archive/${idA}`);
+      expect(read.status).toBe(200);
+      expect(await read.text()).toBe('A');
+    });
+
+    /**
+     * ⭐ **数の帳尻そのものを撃つ歯**（#698 欠陥1・欠陥3）。
+     *
+     * 応答の欄を1つずつ確かめる歯は「その欄が正しいか」しか言わない。
+     * **1行が0回または2回数えられている**という壊れ方は、欄を個別に見ても
+     * 見つからない——実際、guard で飛ばした行を `targeted` と
+     * `skipped.inUse` の両方で数える欠陥は、既存の歯を全部通り抜けていた。
+     * ⟹ **等式そのものを不変条件として撃つ。**
+     */
+    it('数の不変条件: matched === targeted + remaining + skipped5欄（下見でも実行でも）', async () => {
+      // 5つの欄が全部1以上になるように仕込む。
+      const idOld = (await stores.archive.archive('sess-inv-chain', 'A')).id; // 消せる
+      await stores.archive.archive('sess-inv-chain', 'AB'); // このセッションの最新 → newest
+      const idRunning = (await stores.archive.archive('sess-inv-run', 'R')).id;
+      await stores.archive.archive('sess-inv-run', 'RR'); // newest
+      fake.runningOwners.set(idRunning, 'mgr-inv'); // → inUse
+      const idGone = (await stores.archive.archive('sess-inv-gone', 'G')).id;
+      await stores.archive.archive('sess-inv-gone', 'GG'); // newest
+      await stores.archive.remove(idGone); // → alreadyRemoved
+      await stores.archive.archive('sess-inv-div', 'XYZ'); // 前方一致しない → notContained
+      await stores.archive.archive('sess-inv-div', 'QQQ'); // newest
+
+      const check = async (dryRun: boolean) => {
+        const response = await app.request(
+          '/archive/remove',
+          json({ minStoredBytes: 0, reason: '不変条件を撃つ', dryRun }),
+        );
+        expect(response.status).toBe(200);
+        const body = (await response.json()) as {
+          matched: number;
+          targeted: number;
+          remaining: number;
+          removedIds: string[];
+          raced: number;
+          skipped: {
+            protected: number;
+            alreadyRemoved: number;
+            newest: number;
+            notContained: number;
+            inUse: number;
+          };
+        };
+        const skippedTotal =
+          body.skipped.protected +
+          body.skipped.alreadyRemoved +
+          body.skipped.newest +
+          body.skipped.notContained +
+          body.skipped.inUse;
+        // 🔑 これが本体。1行は必ず1回だけ数えられる。
+        expect(body.targeted + body.remaining + skippedTotal).toBe(body.matched);
+        // 仕込んだ4つの理由が実際に1件以上ずつ立っていること——立っていないと
+        // 「等式は成り立ったが、そもそもどの欄も0だった」という空振りになる。
+        expect(body.skipped.newest).toBeGreaterThan(0);
+        expect(body.skipped.alreadyRemoved).toBeGreaterThan(0);
+        expect(body.skipped.notContained).toBeGreaterThan(0);
+        expect(body.skipped.inUse).toBeGreaterThan(0);
+        return body;
+      };
+
+      const preview = await check(true);
+      const executed = await check(false);
+      // `targeted === removedIds.length + raced`（実行時のみ。#698 欠陥3）。
+      expect(executed.removedIds.length + executed.raced).toBe(executed.targeted);
+      expect(idOld).toBeDefined();
+      expect(preview.targeted).toBeGreaterThan(0);
+    });
+
+    /**
+     * ⭐ **下見が実行の予告になっていることを撃つ歯**（#698 欠陥2）。
+     *
+     * この口は「下見を既定にして、見てから押す」ことを設計の中心に置いている。
+     * 下見が guard を評価していないと、下見は「N件消える」と言い、実行は
+     * 走行中の委譲のぶんだけ少なく消す——**しかも減った理由は実行するまで
+     * 見えない。** それでは中心が成り立たない。
+     */
+    it('下見と実行が同じ targeted / skipped.inUse を返す（走行中の委譲が混ざっていても）', async () => {
+      const idRunning = (await stores.archive.archive('sess-preview', 'P')).id;
+      const idFree = (await stores.archive.archive('sess-preview-free', 'F')).id;
+      await stores.archive.archive('sess-preview', 'PP'); // newest
+      await stores.archive.archive('sess-preview-free', 'FF'); // newest
+      fake.runningOwners.set(idRunning, 'mgr-preview');
+
+      const ask = async (dryRun: boolean) =>
+        (await (
+          await app.request(
+            '/archive/remove',
+            json({ minStoredBytes: 0, reason: '下見と実行を突き合わせる', dryRun }),
+          )
+        ).json()) as { targeted: number; skipped: { inUse: number }; removedIds: string[] };
+
+      const preview = await ask(true);
+      const executed = await ask(false);
+
+      expect(preview.targeted).toBe(executed.targeted);
+      expect(preview.skipped.inUse).toBe(executed.skipped.inUse);
+      // 下見が名指しした id が、実行で実際に消えた id と一致すること。
+      expect(preview.removedIds).toEqual(executed.removedIds);
+      expect(preview.removedIds).toContain(idFree);
+      expect(preview.removedIds).not.toContain(idRunning);
+    });
+
+    it('冪等: 同じ呼びを2回実行しても2回目は removedBytes を二重に数えず例外も出ない', async () => {
+      const idA = (await stores.archive.archive('sess-idempotent', 'A')).id;
+      await stores.archive.archive('sess-idempotent', 'AB'); // newest
+
+      const filter = json({ minStoredBytes: 0, reason: '2回叩く', dryRun: false });
+      const first = await app.request('/archive/remove', filter);
+      expect(first.status).toBe(200);
+      expect(await first.json()).toMatchObject({
+        removedIds: [idA],
+        removedBytes: Buffer.byteLength('A', 'utf8'),
+      });
+
+      const second = await app.request('/archive/remove', filter);
+      expect(second.status).toBe(200);
+      expect(await second.json()).toMatchObject({
+        targeted: 0,
+        removedIds: [],
+        removedBytes: 0,
+        skipped: expect.objectContaining({ alreadyRemoved: 1 }),
+      });
+
+      // 二重に消してもバイト数の帳尻・応答のどちらも壊れていない。
+      const read = await app.request(`/archive/${idA}`);
+      expect(read.status).toBe(410);
+      expect(await read.json()).toMatchObject({ bytes: Buffer.byteLength('A', 'utf8') });
+    });
+
+    /**
+     * 400の4通り。**実行前後で `GET /archive` が変わらないこと**まで見る
+     * ——応答が400でも、その手前で何かを消してしまっていないかを確かめる。
+     */
+    describe('400（絞り込みの無い呼び／不正な入力）— どれも1件も消さない', () => {
+      const snapshot = async () => (await (await app.request('/archive')).json()) as unknown;
+
+      it('sessionIds / before / minStoredBytes のどれも渡さない呼びは400', async () => {
+        await stores.archive.archive('sess-400-a', 'A');
+        const before = await snapshot();
+
+        const response = await app.request('/archive/remove', json({ reason: '絞り込み無し' }));
+        expect(response.status).toBe(400);
+        const body = (await response.json()) as { error: string };
+        expect(body.error).toContain('1件も消していない');
+        expect(await snapshot()).toEqual(before);
+      });
+
+      it('before が ISO8601 として読めなければ400', async () => {
+        await stores.archive.archive('sess-400-b', 'A');
+        const before = await snapshot();
+
+        const response = await app.request(
+          '/archive/remove',
+          json({ minStoredBytes: 0, before: '来週のどこか', reason: 'x', dryRun: false }),
+        );
+        expect(response.status).toBe(400);
+        expect(await snapshot()).toEqual(before);
+      });
+
+      it('limit が上限を超えると400', async () => {
+        await stores.archive.archive('sess-400-c', 'A');
+        const before = await snapshot();
+
+        const response = await app.request(
+          '/archive/remove',
+          json({
+            minStoredBytes: 0,
+            limit: ARCHIVE_REMOVE_MANY_LIMIT_MAX + 1,
+            reason: 'x',
+            dryRun: false,
+          }),
+        );
+        expect(response.status).toBe(400);
+        expect(await snapshot()).toEqual(before);
+      });
+
+      it('requireContainment: false なのに sessionIds が無いと400', async () => {
+        await stores.archive.archive('sess-400-d', 'A');
+        const before = await snapshot();
+
+        const response = await app.request(
+          '/archive/remove',
+          json({
+            minStoredBytes: 0,
+            requireContainment: false,
+            reason: 'x',
+            dryRun: false,
+          }),
+        );
+        expect(response.status).toBe(400);
+        expect(await snapshot()).toEqual(before);
+      });
+    });
+
+    it('日誌に理由と消した id が残る', async () => {
+      const idA = (await stores.archive.archive('sess-journal', 'A')).id;
+      await stores.archive.archive('sess-journal', 'AB'); // newest
+
+      await app.request(
+        '/archive/remove',
+        json({ minStoredBytes: 0, reason: '日誌に残るはず', dryRun: false }),
+      );
+
+      const journalEntries = (await stores.journal.list({ types: ['decision'] })) as {
+        type: 'decision';
+        decision: string;
+        grounds: string;
+      }[];
+      const entry = journalEntries.find((e) => e.decision.includes(idA));
+      expect(entry).toBeDefined();
+      expect(entry?.decision).toContain('日誌に残るはず');
+      expect(entry?.decision).toContain(idA);
+      expect(entry?.grounds).toBe('人間が直接 API から操作した');
     });
   });
 
