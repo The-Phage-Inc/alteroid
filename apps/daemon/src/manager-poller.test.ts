@@ -51,6 +51,9 @@ function fakeManagers(
     transcript: () => {
       throw new Error('not implemented');
     },
+    unpushedWork: () => {
+      throw new Error('not implemented');
+    },
     runningManagerOwning: () => undefined,
     restore: () => Promise.resolve([]),
     resumeStoppedByUsage: () => Promise.resolve([]),

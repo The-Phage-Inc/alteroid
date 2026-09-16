@@ -131,6 +131,7 @@ function stubPool(input: {
             daemonRevision: { status: 'unknown' as const, reason: 'テスト' },
           }),
     transcript: notImplemented,
+    unpushedWork: notImplemented,
     runningManagerOwning: () => undefined,
     restore: () => Promise.resolve([]),
     resumeStoppedByUsage: () => Promise.resolve([]),
