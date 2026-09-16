@@ -13,6 +13,7 @@ import {
   TOKEN_POOL_REOPENED_SOURCE,
   worthDeliveringNow,
 } from './index.js';
+import type { CloneWakeGate } from './index.js';
 
 /**
  * 認証トークン回りの日誌1行を stdout/stderr のどちらへ出すかの分類
@@ -369,48 +370,48 @@ describe('createCloneWakeGate', () => {
   it('クローンが枠で止まっているなら配る（畳んでいなければ folded は0）', () => {
     const gate = createCloneWakeGate();
 
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 0 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 0 });
   });
 
   it('クローンが枠で止まっていないなら畳む（配らない）', () => {
     const gate = createCloneWakeGate();
 
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
   });
 
   it('畳んだ回数を数え、配る回にその数を渡す', () => {
     const gate = createCloneWakeGate();
 
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
     // 3回畳んだ後に配ると、畳んだ数（3）を持って `wake` が返る。
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 3 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 3 });
   });
 
   it('配ったら0へ戻る（次に畳み始めたら1から数え直す）', () => {
     const gate = createCloneWakeGate();
 
-    gate.decide('tok-a', false);
-    gate.decide('tok-a', false);
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 2 });
+    gate.decide('tok-a', false, false);
+    gate.decide('tok-a', false, false);
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 2 });
 
     // リセット後、畳んでいない状態で配れば folded は0に戻っている。
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 0 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 0 });
     // 改めて1回畳めば1から数え直す。
-    gate.decide('tok-a', false);
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 1 });
+    gate.decide('tok-a', false, false);
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 1 });
   });
 
   it('トークンごとに独立して数える', () => {
     const gate = createCloneWakeGate();
 
-    gate.decide('tok-a', false);
-    gate.decide('tok-a', false);
+    gate.decide('tok-a', false, false);
+    gate.decide('tok-a', false, false);
     // tok-b は tok-a の畳み込みに影響されない。
-    expect(gate.decide('tok-b', true)).toEqual({ kind: 'wake', folded: 0 });
+    expect(gate.decide('tok-b', true, false)).toEqual({ kind: 'wake', folded: 0 });
     // tok-a のカウントはそのまま残っている。
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 2 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 2 });
   });
 
   /**
@@ -427,20 +428,20 @@ describe('createCloneWakeGate', () => {
     const gate = createCloneWakeGate();
 
     // 1回目: クローンは枠で止まっている（落ちている）→ 戻ったら配る。
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 0 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 0 });
 
     // 配った直後、クローンはまだ枠で止まっていない状態が続く（この間に届いた
     // 「戻った」はすべて畳む——まだ本物の再起動が要る状態ではない）。
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
 
     // また枠に当たって落ちた。その後もう一度「戻った」が観測された
     // ——ここが2本目の「戻った」である。畳み込みの結果として消えてはいけない。
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 1 });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 1 });
 
     // 3本目も同様に届く（何回繰り返しても、止まっているときは必ず配る）。
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
-    expect(gate.decide('tok-a', false)).toEqual({ kind: 'fold' });
-    expect(gate.decide('tok-a', true)).toEqual({ kind: 'wake', folded: 2 });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', false, false)).toEqual({ kind: 'fold' });
+    expect(gate.decide('tok-a', true, false)).toEqual({ kind: 'wake', folded: 2 });
   });
 });
 
@@ -505,10 +506,11 @@ describe('isTokenPoolReopenedNotice', () => {
  *
  * ## 何を測るか
  *
- * `blocked` が `true` / `false` の両方で、
- * `cloneWakeGate.decide(tokenId, blocked).kind === 'wake'` と
- * `redeliveryGate(tokenPoolEvent, { usageBlocked: blocked }) === true` が一致する
- * こと。`redeliveryGate` は本番の配線（`index.ts` の `createClone(...)`）と
+ * `blocked` × `releasePending` の**4通り全部**で、
+ * `cloneWakeGate.decide(tokenId, blocked, releasePending).kind === 'wake'` と
+ * `redeliveryGate(tokenPoolEvent, { usageBlocked, releasePending }) === true` が
+ * 一致すること（**組を1つでも落とすと、片側だけが Issue #1051 の畳み込みを
+ * 持っている状態が緑のまま通る**）。`redeliveryGate` は本番の配線（`index.ts` の `createClone(...)`）と
  * **同じ2つの部品**（`isTokenPoolReopenedNotice` / `worthDeliveringNow`）から
  * 組み立てる——配線そのものが同じ部品を呼んでいることは、直後の「本番の配線」
  * describe が原文で固定する。
@@ -517,22 +519,40 @@ describe('歯1: CloneWakeGate.decide と redeliveryGate は同じ答えを返す
   // **本番の `createClone(...)` に渡す `redeliveryGate` と同じ形。** 部品
   // （`isTokenPoolReopenedNotice` / `worthDeliveringNow`）が本番と同一の実体で
   // あることは import 経由で保証されている——コピーはしていない。
-  const redeliveryGate = (event: InboxEvent, context: { usageBlocked: boolean }): boolean =>
-    isTokenPoolReopenedNotice(event) ? worthDeliveringNow(context.usageBlocked) : true;
+  const redeliveryGate = (
+    event: InboxEvent,
+    context: { usageBlocked: boolean; releasePending: boolean },
+  ): boolean =>
+    isTokenPoolReopenedNotice(event)
+      ? worthDeliveringNow(context.usageBlocked, context.releasePending)
+      : true;
 
-  it.each([true, false] as const)('usageBlocked=%s のとき、wake の判定と一致する', (blocked) => {
-    const gate = createCloneWakeGate();
+  it.each([
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ] as const)(
+    'usageBlocked=%s / releasePending=%s のとき、wake の判定と一致する',
+    (blocked, releasePending) => {
+      const gate = createCloneWakeGate();
 
-    const wakeSaysWake = gate.decide('tok-a', blocked).kind === 'wake';
-    const gateSaysDeliver = redeliveryGate(tokenPoolEvent(), { usageBlocked: blocked });
+      const wakeSaysWake = gate.decide('tok-a', blocked, releasePending).kind === 'wake';
+      const gateSaysDeliver = redeliveryGate(tokenPoolEvent(), {
+        usageBlocked: blocked,
+        releasePending,
+      });
 
-    expect(gateSaysDeliver).toBe(wakeSaysWake);
-  });
+      expect(gateSaysDeliver).toBe(wakeSaysWake);
+    },
+  );
 
-  it('token-pool 以外の合図は usageBlocked に関わらず常に配る（wake 側の対象外）', () => {
+  it('token-pool 以外の合図は usageBlocked / releasePending に関わらず常に配る（wake 側の対象外）', () => {
     const other = tokenPoolEvent('runner-registry');
-    expect(redeliveryGate(other, { usageBlocked: true })).toBe(true);
-    expect(redeliveryGate(other, { usageBlocked: false })).toBe(true);
+    expect(redeliveryGate(other, { usageBlocked: true, releasePending: false })).toBe(true);
+    expect(redeliveryGate(other, { usageBlocked: false, releasePending: false })).toBe(true);
+    expect(redeliveryGate(other, { usageBlocked: true, releasePending: true })).toBe(true);
+    expect(redeliveryGate(other, { usageBlocked: false, releasePending: true })).toBe(true);
   });
 });
 
@@ -548,12 +568,14 @@ describe('本番の配線: redeliveryGate は wake() と同じ部品を呼ぶ', 
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 
   it('redeliveryGate が isTokenPoolReopenedNotice と worthDeliveringNow を呼ぶ', () => {
-    const at = source.indexOf('redeliveryGate: (event, { usageBlocked })');
+    const at = source.indexOf('redeliveryGate: (event, { usageBlocked, releasePending })');
     expect(at).toBeGreaterThan(-1);
     const block = source.slice(at, source.indexOf('\n  });', at));
 
     expect(block).toContain('isTokenPoolReopenedNotice(event)');
-    expect(block).toContain('worthDeliveringNow(usageBlocked)');
+    // **引数2つとも原文で見る（Issue #1051）。** `releasePending` を渡し忘れた
+    // 配線は型では落ちない——落ちないまま、配り直しの側だけが往復を通し続ける。
+    expect(block).toContain('worthDeliveringNow(usageBlocked, releasePending)');
   });
 });
 
@@ -712,5 +734,124 @@ describe('recovered の日誌行は、受信箱へ配ったかどうかと無関
     ).toEqual([]);
     expect(closeAt).toBeLessThan(appendAt);
     expect(reopenedBlockStart).toBeLessThan(closeAt);
+  });
+});
+
+/**
+ * **🔴 Issue #1051: 1回の再開の機会につき、配る合図は1件**
+ *
+ * ## なぜ真偽表では足りないか
+ *
+ * 上の `createCloneWakeGate` の describe が測っているのは `decide` の**引数**で
+ * ある。**引数が現実のどの状態に対応するかは、そこからは分からない** ——
+ * 「常に `fold` を返す」実装も、引数の並べ方を間違えた歯なら通ってしまう。
+ *
+ * ⟹ **ここでは、クローンの状態のほうを本物と同じ順序で動かす。** 動かし方が
+ * 本物と一致していることは `packages/core/src/clone.test.ts` の
+ * 「usageReleasePending（…Issue #1051）」が実物の `Clone` で固定している
+ * （1件目の `post` で印が立ち、2件目は何も動かさず、印は `#pump` が消費する）。
+ *
+ * | このファイルの歯 | 測るもの |
+ * | --- | --- |
+ * | `createCloneWakeGate` | `decide` の引数と返り値の対応 |
+ * | **ここ** | **本物と同じ順序で状態を動かしたとき、配る件数がいくつになるか** |
+ * | `clone.test.ts` の `usageReleasePending` | その順序が実物の `Clone` と一致すること |
+ */
+describe('🔴 #1051: 1回の再開の機会につき、配る合図は1件', () => {
+  /**
+   * クローンの2つの窓（`usageBlocked` / `usageReleasePending`）を、本物と同じ
+   * 遷移だけで動かす最小の模型。
+   *
+   * **勝手な遷移を足さないこと。** ここに無い動き方をさせると、測っているのは
+   * 本物ではなくこの模型になる。
+   */
+  function fakeClone() {
+    let blocked = false;
+    let pending = false;
+    return {
+      get usageBlocked() {
+        return blocked;
+      },
+      get usageReleasePending() {
+        return pending;
+      },
+      /** 枠で落ちた（`#usageBlocked` が立つ）。 */
+      hitUsageLimit() {
+        blocked = true;
+      },
+      /** 合図が届いた（`post()` の中の1文。止まっているときだけ印が立つ）。 */
+      receiveNotice() {
+        if (blocked) pending = true;
+      },
+      /** `#pump` の先頭 —— 印を消費して枠を降ろし、再試行へ入る。 */
+      consumeRelease() {
+        pending = false;
+        blocked = false;
+      },
+    };
+  }
+
+  /** 門を通して、配ったなら合図をクローンへ渡す（`wake()` と同じ並び）。 */
+  function emit(gate: CloneWakeGate, clone: ReturnType<typeof fakeClone>, tokenId: string) {
+    const decision = gate.decide(tokenId, clone.usageBlocked, clone.usageReleasePending);
+    if (decision.kind === 'wake') clone.receiveNotice();
+    return decision.kind;
+  }
+
+  it('回復が2回続けて検出されても、配るのは1件だけ（往復のぶんを畳む）', () => {
+    const gate = createCloneWakeGate();
+    const clone = fakeClone();
+    clone.hitUsageLimit();
+
+    // 429 → 成功 → 429 → 成功 …の往復で、回し手は「戻った」を何度でも立てる
+    // （`packages/core/src/token-rotator.test.ts` の #1051 の describe が実測）。
+    const kinds = [emit(gate, clone, 'tok-a'), emit(gate, clone, 'tok-a')];
+
+    expect(kinds).toEqual(['wake', 'fold']);
+  });
+
+  it('何十件届いても、再試行が始まるまでは1件しか配らない', () => {
+    const gate = createCloneWakeGate();
+    const clone = fakeClone();
+    clone.hitUsageLimit();
+
+    const kinds = Array.from({ length: 30 }, () => emit(gate, clone, 'tok-a'));
+
+    expect(kinds.filter((kind) => kind === 'wake')).toEqual(['wake']);
+    expect(kinds.filter((kind) => kind === 'fold')).toHaveLength(29);
+  });
+
+  it('🔴 回復 → 枠に入る → また回復 なら2件とも配る（起こし損ねを作らない）', () => {
+    const gate = createCloneWakeGate();
+    const clone = fakeClone();
+
+    // 1回目: 枠で止まって、戻った。
+    clone.hitUsageLimit();
+    const first = emit(gate, clone, 'tok-a');
+
+    // クローンが印を使って再試行に入り、また枠で落ちた。
+    clone.consumeRelease();
+    clone.hitUsageLimit();
+
+    // 2回目の「戻った」。**畳んではいけない** —— 前の印はもう使われている。
+    const second = emit(gate, clone, 'tok-a');
+
+    expect([first, second]).toEqual(['wake', 'wake']);
+  });
+
+  it('別のトークンが戻った回は、前のトークンの印に巻き込まれない', () => {
+    const gate = createCloneWakeGate();
+    const clone = fakeClone();
+    clone.hitUsageLimit();
+
+    expect(emit(gate, clone, 'tok-a')).toBe('wake');
+    // **同じクローンの印が立っているので、これは畳む。** トークンが違っても
+    // 立てる印は同じ1つで、既に立っている ⟹ 2件目が動かすものは無い。
+    expect(emit(gate, clone, 'tok-b')).toBe('fold');
+
+    // 再試行が入って、また枠で落ちたなら配る。
+    clone.consumeRelease();
+    clone.hitUsageLimit();
+    expect(emit(gate, clone, 'tok-b')).toBe('wake');
   });
 });
