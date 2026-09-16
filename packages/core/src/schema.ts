@@ -2134,8 +2134,8 @@ export const commitmentEditedBySchema = z.enum(['clone', 'human']);
  * これは `MemoryProtectionStatus` と同じ非対称で、**実体は日誌にあり、ここに
  * 在るのはその時点の値**である。
  */
-export const commitmentAppraisalSchema = z.enum(['good', 'bad', 'unclear']);
-export type CommitmentAppraisal = z.infer<typeof commitmentAppraisalSchema>;
+export const appraisalSchema = z.enum(['good', 'bad', 'unclear']);
+export type AppraisalValue = z.infer<typeof appraisalSchema>;
 
 /**
  * 評定を**誰が付けたか**。
@@ -2151,8 +2151,8 @@ export type CommitmentAppraisal = z.infer<typeof commitmentAppraisalSchema>;
  * 使わない。** 理由は `commitmentClosedBySchema` の doc と全く同じである — 未知の
  * enum 値1つで台帳の一覧が丸ごと読めなくなる側へ倒さない。
  */
-export const commitmentAppraisedBySchema = z.enum(['clone', 'human']);
-export type CommitmentAppraisedBy = z.infer<typeof commitmentAppraisedBySchema>;
+export const appraisedBySchema = z.enum(['clone', 'human']);
+export type AppraisedBy = z.infer<typeof appraisedBySchema>;
 
 /**
  * 引き受けたまま終わっていない仕事1件（PRD「自律」の器を、単発の依頼へ広げたもの）。
@@ -2272,7 +2272,7 @@ export const commitmentSchema = z.object({
    * `case` は `bodyMarkup` を書かないので、`undefined` のままである。
    */
   /**
-   * **いまの評定**（#1054。`commitmentAppraisalSchema` の doc に3値の意味と、
+   * **いまの評定**（#1054。`appraisalSchema` の doc に3値の意味と、
    * なぜ履歴をここに積まないかが書いてある）。
    *
    * **無いことは「まだ評定していない」であって、「普通」でも「良くない」でも
@@ -2280,14 +2280,14 @@ export const commitmentSchema = z.object({
    *
    * **型は `z.string()` で緩く持つ**（`closedBy` / `bodyMarkup` と同じ理由 —
    * 未知の値1つで台帳の一覧が丸ごと読めなくなる側へ倒さない）。書き込み側は
-   * `CommitmentStore.appraise` の引数の型で `commitmentAppraisalSchema` に
+   * `CommitmentStore.appraise` の引数の型で `appraisalSchema` に
    * 縛ってあるので、**この器が書く値は3つに限られる。**
    */
   appraisal: z.string().optional(),
   /** 評定を付けた（または覆した）時刻。評定が在れば必ず在る。 */
   appraisedAt: isoDateTime.optional(),
   /**
-   * 評定を**誰が付けたか**（既知の値は `commitmentAppraisedBySchema`）。
+   * 評定を**誰が付けたか**（既知の値は `appraisedBySchema`）。
    *
    * **人間がクローンの評定を覆すと、この欄は `'human'` になる。** 覆される前に
    * クローンが何と言っていたかは**日誌**に残る（追記専用）— 評価する側を較正
@@ -2300,7 +2300,7 @@ export const commitmentSchema = z.object({
    *
    * **`closedReason` とは別の欄である。** あちらは「どう片付いたか」で、
    * こちらは「なぜその評定なのか」である。**軸を足したくなったらここを先に
-   * 読むこと**（`commitmentAppraisalSchema` の doc）。
+   * 読むこと**（`appraisalSchema` の doc）。
    */
   appraisalReason: z.string().optional(),
   bodyMarkup: z.string().optional(),
@@ -2443,17 +2443,30 @@ export const COMMITMENT_APPRAISAL_DECISION_PREFIX = '引き受けた仕事に評
  * 評定の3値の日本語ラベル。**字面の生成元はここ1箇所である** —— MCP の説明文・
  * 一覧の1行・画面のボタンが同じ語で呼ぶ。
  *
- * **`Record<CommitmentAppraisal, string>` にしてあるので、値を1つ足すと
+ * **`Record<AppraisalValue, string>` にしてあるので、値を1つ足すと
  * `tsc` がここで落ちる。** 落ちない形（`Partial` や添字アクセス）にすると、
  * 足した値だけラベルが無いまま画面に生の `appraisal` が出る —— それは
  * `MemoryProtectionStatus` の網羅性を `never` で強制しているのと同じ理由で
  * 避ける。
  */
-export const COMMITMENT_APPRAISAL_LABELS: Record<CommitmentAppraisal, string> = {
+export const APPRAISAL_LABELS: Record<AppraisalValue, string> = {
   good: 'うまくいった',
   bad: 'うまくいかなかった',
   unclear: '判定できない',
 };
+
+/**
+ * 委譲に評定を書いた日誌行（`type: 'decision'`）の先頭に必ず置く印（#1054）。
+ *
+ * **台帳の `COMMITMENT_APPRAISAL_DECISION_PREFIX` とは別の印である。** 同じ印に
+ * すると、段2（同じ種類の仕事の直近 N 件を束ねる）で「台帳の行の評定」と「委譲の
+ * 評定」が同じ束に混ざる —— 片方は人間との約束の始末で、もう片方はマネージャーに
+ * 出した仕事の出来なので、**数え上げの分母が別物になる。**
+ *
+ * 専用の日誌の枝にしない理由は台帳側と同じ（`COMMITMENT_APPRAISAL_DECISION_PREFIX`
+ * の doc）。
+ */
+export const JOB_APPRAISAL_DECISION_PREFIX = '委譲に評定を付けた';
 
 /**
  * 評定を1行の字面にする（#1054）。**評定が無ければ `null` —— 1文字も増やさない。**
@@ -2473,13 +2486,24 @@ export const COMMITMENT_APPRAISAL_LABELS: Record<CommitmentAppraisal, string> = 
  * （`commitmentSchema.appraisal` の doc）、将来の書き手が増えた値がここへ来うる。
  * 落とすと、読み手には未評定と区別が付かなくなる。
  */
-export function describeCommitmentAppraisal(
-  entry: Pick<Commitment, 'appraisal' | 'appraisedBy' | 'appraisalReason'>,
-): string | null {
+/**
+ * 評定を持つもの（台帳の1行・委譲の1本）が最低限そなえる欄。**構造で受ける** ——
+ * `Commitment` と `Job` のどちらも通るようにするためで、どちらかを名指しすると
+ * もう一方が同じ字面を別の関数で作ることになる（この repo が「導出が各実装の側に
+ * あって、書き忘れても何も落ちない」形で繰り返し踏んだもの。`commitmentUpdatedAt`
+ * の doc）。
+ */
+export interface AppraisedEntry {
+  appraisal?: string;
+  appraisedBy?: string;
+  appraisalReason?: string;
+}
+
+export function describeAppraisal(entry: AppraisedEntry): string | null {
   if (entry.appraisal === undefined) return null;
   // 未知の値はラベルが無いので、生の値をそのまま出す（落とさない）。
-  const known = commitmentAppraisalSchema.safeParse(entry.appraisal);
-  const label = known.success ? COMMITMENT_APPRAISAL_LABELS[known.data] : entry.appraisal;
+  const known = appraisalSchema.safeParse(entry.appraisal);
+  const label = known.success ? APPRAISAL_LABELS[known.data] : entry.appraisal;
   const by = entry.appraisedBy === undefined ? '' : `・${entry.appraisedBy}`;
   const reason = entry.appraisalReason === undefined ? '' : `: ${entry.appraisalReason}`;
   return `評定: ${label}（${entry.appraisal}${by}）${reason}`;
@@ -2964,6 +2988,38 @@ export const jobSchema = z.object({
    * `report` が来たときだけ上書きされる。台帳を消す操作ではない）。
    */
   lastReportAt: z.string().optional(),
+  /**
+   * **その委譲がどうだったか**（#1054。自己改善の段1の後半）。値の意味・4状態の
+   * 数え方・なぜ履歴をここに積まないかは `appraisalSchema` の doc が持つ
+   * （台帳の `Commitment.appraisal` と**同じ軸・同じ3値**である）。
+   *
+   * ## ⚠️ `status` とは別の軸である。混ぜないこと
+   *
+   * `status` の終端4値（`done` / `failed` / `lost` / `stopped`）が答えるのは
+   * **どう終わったか**であって、**良かったか**ではない —— `done` は「マネージャーの
+   * セッションが終わった」の意味でしかない（#1054 の出発点そのもの）。
+   *
+   * **とくに `digest.ts` の `judgement`（`isManagerAwaitingJudgement`）と取り違え
+   * ないこと。** あちらは `lost` 1値を指す語で、意味は**「終わったかどうかを観測
+   * していない」** —— この欄とはほぼ正反対である。
+   *
+   * ## 書く経路は1つだけ（`ManagerPool.appraise`）
+   *
+   * **`JobStore` へ直に書かないこと。** 走行中の委譲の `Job` は `ManagerPool` が
+   * プロセス内の像として握っていて、`#persist` は `record.job` を丸ごと書く ——
+   * 外から1欄だけ足すと**次の `#persist` が黙って踏み消す。** 所有者を通す理由は
+   * `ManagerPool.appraise` の doc に在る。
+   */
+  appraisal: z.string().optional(),
+  /** 評定を付けた（または覆した）時刻。評定が在れば必ず在る。 */
+  appraisedAt: isoDateTime.optional(),
+  /**
+   * 評定を**誰が付けたか**（既知の値は `appraisedBySchema`）。人間がクローンの
+   * 評定を覆すとここが `'human'` になり、覆される前の値は**日誌**に残る。
+   */
+  appraisedBy: z.string().optional(),
+  /** 評定の理由（1行）。**`lastReport` とは別の欄である**（あちらは委譲側の報告）。 */
+  appraisalReason: z.string().optional(),
   /**
    * 直近の報告が**報告ではなく失敗**だったこと（SDK が「これは応答ではない」と
    * 言った回）。応答として終わった回では消える。
