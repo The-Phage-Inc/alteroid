@@ -850,3 +850,108 @@ describe('状況の1行に受信箱の滞留が載る（#783 段0）', () => {
     expect(line).not.toContain('処理せよ');
   });
 });
+
+/**
+ * **メモリの配達待ち行列（issue #1084）は、器の行数（`backlog`）とは別の軸で
+ * ある。** 直上の節が `backlog`（`InboxStore.pending()`＝器の行数）を測るのに
+ * 対し、この節が測るのは `queuedInMemory`（`Clone#inbox` の `size` +
+ * `#deferred.length`）。**同じ「受信箱の滞留」という話題でも、材料の器が違う**
+ * ——`describeSituationInboxBacklog` の doc「メモリの配達待ち行列は別の軸で
+ * ある」。
+ *
+ * この節が固定する要点は2つ:
+ *
+ * 1. **⭐ 足した軸が実際に見える**（`queuedInMemory` を渡すと、その数の行が
+ *    出る）。
+ * 2. **⭐ 陰性対照——取れなかったときに 0 と名乗らない。** ここでは「読めない」
+ *    という状態がそもそも無い（同期の getter だけで組むため）ので、代わりに
+ *    「省略（`undefined`）」が「0」に潰れていないことを固定する——`backlog` の
+ *    `'unreadable'` に対応する非対称性は無いが、**器の軸（`backlog`）が
+ *    `'unreadable'` を名乗っている回でも、メモリの軸は独立して自分の値を
+ *    名乗ること**（片方が読めないからといって、もう片方まで消えたり 0 を
+ *    騙ったりしない）を固定する。
+ */
+describe('状況の1行にメモリの配達待ち行列が載る（#1084）', () => {
+  it('省略した呼びでは行が出ない（既存の呼び出しを壊さない）', () => {
+    const out = describeSituation({ managers: [], runners: [] });
+
+    expect(out).not.toContain('メモリの配達待ち行列');
+  });
+
+  it('0件のときは行が出ない（読めない状態が無いので、0は素直に0件を意味する）', () => {
+    const out = describeSituation({
+      managers: [],
+      runners: [],
+      queuedInMemory: 0,
+    });
+
+    expect(out).not.toContain('メモリの配達待ち行列');
+  });
+
+  it('⭐ 1件以上なら、器の行数（backlog）とは無関係に専用の1行が出る', () => {
+    const out = describeSituation({
+      managers: [],
+      runners: [],
+      // **器の軸は 0（行が出ない）。** それでもメモリの軸は独立して出る——
+      // これがまさに issue #1084 の症状（器は空なのにメモリには残っている）を
+      // 出力の形で再現したものである。
+      backlog: { count: 0 },
+      queuedInMemory: 3326,
+    });
+
+    expect(out).not.toContain('受信箱の未処理');
+    const line = out.split('\n').find((l) => l.includes('メモリの配達待ち行列'));
+    if (line === undefined) throw new Error('行が見つからない');
+    expect(line).toContain('メモリの配達待ち行列 3326 件');
+    // **⭐ 行自身が「足し引きするな」と名乗っている。** 数を出すだけでは
+    // 足りない——`#remember` は配達より前に器へ書き、`#forget` はターンが
+    // 終わってからしか呼ばれないので、**通常は同じ合図が両方の軸に数えられて
+    // いる**（`describeSituationInboxQueued` の doc「2つの軸は重なる」）。
+    // 「別の軸」とだけ言うと、読む側は互いに素な2つの箱だと読んで**合計を
+    // 取り、負荷を倍に見積もる。** ここが測るのは、その誤読を止める文言が
+    // 行の中に在ることである（添えるのではなく行の中——`AGENTS.md`「報告の
+    // 形」）。
+    expect(line).toContain('足しても引いても意味が無い');
+    // **食い違いが何を意味するかも、同じ行が持つ。** これが無いと、読む側は
+    // 2つの数を見比べる理由を持てない（#1049 の形＝器が空でメモリに残る、が
+    // この軸を足した理由そのものである）。
+    expect(line).toContain('食い違ったときだけ');
+  });
+
+  it(
+    '⭐ 陰性対照——器の軸が `unreadable`（読めなかった）でも、メモリの軸は' +
+      '0 を騙らず、自分の値をそのまま名乗る',
+    () => {
+      const out = describeSituation({
+        managers: [],
+        runners: [],
+        backlog: 'unreadable',
+        queuedInMemory: 7,
+      });
+
+      // 器の軸: 「数えられなかった」であって 0 ではない（既存の保証）。
+      const dbLine = out.split('\n').find((l) => l.includes('受信箱の未処理'));
+      if (dbLine === undefined) throw new Error('器の行が見つからない');
+      expect(dbLine).toContain('受信箱の未処理を数えられなかった');
+      expect(dbLine).not.toContain('0');
+      // メモリの軸: 器が読めなかったことに引きずられず、7 件をそのまま名乗る。
+      const memLine = out.split('\n').find((l) => l.includes('メモリの配達待ち行列'));
+      if (memLine === undefined) throw new Error('メモリの行が見つからない');
+      expect(memLine).toContain('メモリの配達待ち行列 7 件');
+    },
+  );
+
+  it('指図を書かない（「〜せよ」の類が1文字も無い）', () => {
+    const out = describeSituation({
+      managers: [],
+      runners: [],
+      queuedInMemory: 42,
+    });
+    const line = out.split('\n').find((l) => l.includes('メモリの配達待ち行列'));
+    if (line === undefined) throw new Error('行が見つからない');
+
+    expect(line).not.toContain('確認せよ');
+    expect(line).not.toContain('対処せよ');
+    expect(line).not.toContain('処理せよ');
+  });
+});
