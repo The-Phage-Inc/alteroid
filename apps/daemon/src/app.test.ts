@@ -55,6 +55,11 @@ function fakeClone() {
   const ended: string[] = [];
   const answered: { id: string; answer: string }[] = [];
   const posted: InboxEvent[] = [];
+  /**
+   * `CloneHost.dropQueuedInboxEvents` が受け取った id の塊（issue #1049）。
+   * **塊ごとに1要素**（`POST /inbox/remove` は id を塊に分けて回す）。
+   */
+  const droppedFromDelivery: string[][] = [];
   let reply: ChatStreamEvent[] = [{ type: 'text', text: 'やあ' }, { type: 'done' }];
 
   const emit = (conversationId: string, event: ChatStreamEvent) => {
@@ -238,6 +243,13 @@ function fakeClone() {
     async answerApproval(id, answer) {
       answered.push({ id, answer });
     },
+    // 消した合図の配達を止める（issue #1049）。**何を渡されたかを記録する** ——
+    // `POST /inbox/remove` が器から消すだけで終わっていないことを、応答の文言
+    // ではなく「この口が実際に呼ばれた実物」で測るため。
+    async dropQueuedInboxEvents(ids) {
+      droppedFromDelivery.push([...ids]);
+      return ids.length;
+    },
     async stop() {},
   };
 
@@ -246,6 +258,7 @@ function fakeClone() {
     ended,
     answered,
     posted,
+    droppedFromDelivery,
     managerList,
     managerDenials,
     transcripts,
@@ -1412,6 +1425,56 @@ describe('HTTP API', () => {
 
       const rest = await stores.inbox.peekPending();
       expect(rest.map((r) => r.event.id)).toEqual(['evt-3']);
+    });
+
+    /**
+     * **消した合図の配達も止める**（issue #1049）。この口はかつて器
+     * （`InboxStore`）の行しか消さず、それでも応答は `removedIds` を並べて
+     * 「消した」と名乗っていた —— クローンのメモリ上の待ち行列へ既に載った
+     * 合図は配られ続けた。
+     *
+     * ⭐ **応答のフィールドだけを見て終わりにしない**（同じ describe の
+     * `POST /archive/remove` が置いている作法と同じ）。**クローンの口が実際に
+     * 呼ばれた実物**（`fake.droppedFromDelivery`）で測る。
+     */
+    it('消した id を、クローンの配達停止の口へ実際に渡す（応答にも件数が出る）', async () => {
+      await stores.inbox.put(
+        managerReport('evt-1', '2026-08-10T00:00:00.000Z'),
+        '2026-08-10T00:00:00.000Z',
+      );
+      await stores.inbox.put(
+        managerReport('evt-2', '2026-08-11T00:00:00.000Z'),
+        '2026-08-11T00:00:00.000Z',
+      );
+
+      const response = await app.request(
+        '/inbox/remove',
+        json({ types: ['manager_message'], reason: '配達も止める', dryRun: false }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        removedIds: ['evt-1', 'evt-2'],
+        droppedFromDelivery: 2,
+      });
+      // 🔴 器から消すだけで終わっていないことを、呼ばれた実物で測る。
+      expect(fake.droppedFromDelivery).toEqual([['evt-1', 'evt-2']]);
+    });
+
+    it('試算（dryRun）では配達停止の口を1度も呼ばず、droppedFromDelivery は 0 を返す', async () => {
+      await stores.inbox.put(
+        managerReport('evt-1', '2026-08-10T00:00:00.000Z'),
+        '2026-08-10T00:00:00.000Z',
+      );
+
+      const response = await app.request(
+        '/inbox/remove',
+        json({ types: ['manager_message'], reason: '試算' }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ dryRun: true, droppedFromDelivery: 0 });
+      expect(fake.droppedFromDelivery).toEqual([]);
     });
   });
 
