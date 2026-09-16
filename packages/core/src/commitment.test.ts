@@ -12,6 +12,7 @@ import {
   isDaemonSelfNotice,
 } from './clone.js';
 import { verifyCommitmentAppraisalContract } from './commitment-appraisal-contract.js';
+import { verifyCommitmentFoldContract } from './commitment-fold-contract.js';
 import { verifyStoreIsolationContract } from './store-isolation-contract.js';
 import { buildActivityDigest } from './digest.js';
 import type { CloneHost } from './host.js';
@@ -230,11 +231,19 @@ describe('引き受けたまま終わっていない仕事', () => {
     const stores = createMemoryStores();
     const event = humanMessage('一度だけやる仕事');
 
-    expect(await stores.commitments.open(commitmentFor(event) as Commitment)).toBe(true);
+    expect(await stores.commitments.open(commitmentFor(event) as Commitment)).toEqual({
+      opened: true,
+      folded: false,
+    });
     await stores.commitments.close(event.id, new Date().toISOString(), '済んだ', 'clone');
 
-    // 配り直し = 同じ id でもう一度開こうとする
-    expect(await stores.commitments.open(commitmentFor(event) as Commitment)).toBe(false);
+    // 配り直し = 同じ id でもう一度開こうとする。**`folded` は偽である**（#1041）——
+    // 畳んだのではなく「同じ id が既に在る」のであって、この2つを取り違えると
+    // `#commitmentNoticeFor` が断る理由も取り違える（`CommitOutcome` の doc）。
+    expect(await stores.commitments.open(commitmentFor(event) as Commitment)).toEqual({
+      opened: false,
+      folded: false,
+    });
 
     expect((await stores.commitments.list()).entries).toHaveLength(0);
   });
@@ -933,6 +942,104 @@ describe('引き受けたまま終わっていない仕事', () => {
     await s.clone.stop();
   });
 
+  /**
+   * **Issue #1041。** 段0 ではわざと落ちる赤い歯だった —— 原子化（畳み込みを
+   * `CommitmentStore.open` の1操作へ移すこと）が入って緑になった。**この歯を
+   * 消さないこと。** これが落ちるときは、畳み込みが `open()` の外へ出ている。
+   *
+   * **上の「429 連投の再現」が測っていないもの。** あの歯は**1つの `Clone`
+   * インスタンス**に対して `post()` を同期区間で3連投するが、`post()` の
+   * 中の `#foldIntoPendingCollapse`（Issue #954 続き・`inboxCollapseKey`）が
+   * 同一インスタンス内で `#commit` へ届く前に同文を1件へ畳んでしまうので、
+   * `#commit`（台帳側。`list()` → `open()`）は実質1回しか走らない——
+   * `#foldIntoPendingCollapse` 自身の doc がそう明言している:
+   *
+   * > 「在るか調べてから登録する」という手順に、台帳側で #1041 が挙げるような
+   * > `list()` と `open()` の間の TOCTOU は構造的に生まれない（#1041 そのもの
+   * > を直したとは主張しない — あれは台帳側の話であり、ここは最初からその種の
+   * > 隙間を持たない、という違いである）。
+   *
+   * （逐語は `grep -Fn -- '台帳側で #1041 が挙げるような' packages/core/src/clone.ts`。
+   * `#pendingCollapse` の doc 側にも同じ趣旨の断りがもう1箇所在る——
+   * `grep -Fn -- '#1041 が台帳側（' packages/core/src/clone.ts`）
+   *
+   * ⟹ **`#commit` の TOCTOU（Issue #1041 本題）そのものは、単一インスタンスの
+   * `Clone#post()` からは到達できない。** `#pendingCollapse`（畳み込みの索引）が
+   * プロセス内メモリにしか無く、`post()` は同期関数なので、同一インスタンス内で
+   * 同文の manager_message が2回 `#commit` に届くことは構造的に無い（`kind` は
+   * `z.enum(['report', 'question', 'permission'])` の固定3値で、どの2つも
+   * 互いのプレフィックスにならないため、`inboxCollapseKey`（`managerId`+`kind`+
+   * `text`、NUL区切りで曖昧さが無い）が異なるのに `commitmentFor` の `body`
+   * （`` `[${kind}] ${text}` ``、区切りなしの連結）だけが一致する組み合わせも
+   * 作れない——確かめた。`#restoreUnread`（前の器が拾い直す経路）も、直接
+   * ストアへ2件の重複行を仕込んでから起動させて確かめたが、ループの `await`
+   * が十分に直列化し、インメモリストアでは畳まれた（1行）——この経路も
+   * 到達できなかった（探索用の使い捨てスクリプトでの確認で、この歯の一部
+   * ではない）。
+   *
+   * **それでも `#commit` 自体の欠陥（`list()` と `open()` を排他するものが
+   * コード上どこにも無い）は現存する。** それを見せるには、**同一の
+   * ストアを共有する2つの `Clone` インスタンス**（＝2つのデーモンプロセスが
+   * 同じ記憶ストアを指す状態。`#pendingCollapse` はインスタンスごとの
+   * インメモリなので、互いの書き込みを知らない）が同時に `post()` する形を
+   * 使う。**これは「単一プロセスの通常経路」ではない**——しかし記憶ストア
+   * （fs なら `~/.alteroid/`、pg なら DB）自体は複数プロセスから同時に
+   * 触られうる資源であり、誤って（または再起動の重なりで）2つの `alteroidd`
+   * が同じストアを指せば、この形がそのまま起きる。**「これが日常的に起きる」
+   * とは主張しない**——ここでは `#commit` の TOCTOU が実在することだけを示す。
+   */
+  it('⭐ Issue #1041: 同一ストアを共有する2つの Clone インスタンスが同時に post しても、台帳は1行のままである', async () => {
+    const stores = createMemoryStores();
+    const body = "You've hit your session limit · resets 5:10pm (UTC)";
+
+    // 2つの独立した Clone インスタンス（＝2つのデーモンプロセスを模す）が
+    // 同じストアを共有する。`#pendingCollapse` はインスタンスごとの
+    // インメモリ索引なので、互いの post を知らない。
+    const a = setup(stores);
+    const b = setup(stores);
+
+    // **await を挟まない。** 2つのインスタンスの `#commit`（`list()` →
+    // `open()` の非同期チェーン）を同じ同期区間から起こすことで、
+    // 「重複確認が互いの書き込みより先に走る」窓を作る（Issue #1041 の
+    // 「同じ本文の通知が、前段の書き込みが終わる前に2件目の重複確認に到達
+    // すると、両方が『重複なし』と判定して両方が開く」そのもの）。
+    a.clone.post(managerMessage(body, 'evt-1041-a'));
+    b.clone.post(managerMessage(body, 'evt-1041-b'));
+
+    // **固定の待ち（`setTimeout`）は使わない。** 競合を測る歯が時間で揺れると、
+    // 次に赤くなったときに「本物か、揺れか」が分からなくなる——競合そのものと
+    // 同じ形の不確かさを、それを測る道具の側へ持ち込むことになる。
+    //
+    // 代わりに**両方のインスタンスのターンが実際に入力を読んだこと**を条件に
+    // する。ターンは入力を組み立てる前に自分の記帳の決着を待つので
+    // （逐語は `grep -Fn -- 'const outcome = await this.#committed.get(pending.id);'
+    // packages/core/src/clone.ts`）、**両方の `calls` に入力が載った時点で、
+    // 両方の `#commit` は決着している。**
+    //
+    // ⚠ **台帳の件数を条件にしてはいけない。** 「2件になるまで待つ」は競合が
+    // 直った後に待ち続けて時間切れになり、「1件以上になるまで待つ」は1件目が
+    // 開いた瞬間に抜けて2件目の決着を見ない。⟹ 条件は**競合が直っていても
+    // 直っていなくても同じように成立する**ものでなければならない。
+    await waitFor(
+      () => a.calls.length > 0 && b.calls.length > 0,
+      '2つのインスタンスのターンが両方とも入力を読むこと',
+    );
+
+    const open = (await stores.commitments.list()).entries;
+
+    // **同一マネージャー×同一本文×未了は台帳で1行に畳まれる**（PR #1035／#954
+    // 提案3の規則。いまは `findOpenManagerDuplicate` が持つ）。
+    //
+    // **段0 の時点では、ここが 2 になって落ちた。** `#commit` が `list()` →
+    // 判定 → `open()` と割っており、2つのインスタンスが互いの書き込みより先に
+    // 重複確認へ到達したためである。判定を `open()` の中へ移して緑にした。
+    // ⟹ **この行が再び 2 になったら、誰かが読んでから書く形へ戻している。**
+    expect(open).toHaveLength(1);
+
+    await a.clone.stop();
+    await b.clone.stop();
+  });
+
   it('⭐ 陰性対照: 同じマネージャーでも本文が違えば畳まれない（2行とも残る）', async () => {
     const s = setup();
     const inputs = () => s.calls.flatMap((call) => call.inputs);
@@ -1054,14 +1161,35 @@ describe('引き受けたまま終わっていない仕事', () => {
     await s.clone.stop();
   });
 
-  it('重複確認（list()）が失敗しても、開く側へ倒れる（依頼を黙って落とさない）', async () => {
+  /**
+   * **⚠️ Issue #1041 でこの歯の意味が変わった。読み直すこと。**
+   *
+   * かつて `#commit` は `list()` を読んで重複を判定してから `open()` を呼んでいた。
+   * この歯はそこを踏んでおり、「**重複確認が失敗しても開く側へ倒す**（確認できずに
+   * 依頼を1件黙って落とすほうが、まれに重複を見逃すより高くつく）」を測っていた。
+   *
+   * **いま `#commit` は `list()` を呼ばない。** 判定は `CommitmentStore.open` の
+   * 中（＝書き込みと同じ1操作）へ移った。⟹ **`list()` を壊しても `#commit` の
+   * 判定経路は踏まれない** —— このまま置くと、名前が測っていないことを名乗る歯に
+   * なる（緑なのは壊した先を通らなくなったからで、倒れ方が正しいからではない）。
+   *
+   * **⟹ 2つに書き直した。どちらも #1041 の後でも live である。**
+   *
+   * 1. **台帳の読みが壊れていても、記帳そのものは通る。** `list()` はターンの
+   *    断り書き（`#commitmentNoticeFor`）が読むので、壊れれば断り書きは出ない
+   *    ——**それでも依頼は台帳へ載る。** 読めないことでターンまで止めない
+   * 2. **⭐ 読みが壊れていても、畳み込みは効く。** これが #1041 の直しそのもの
+   *    である —— 畳み込みが `list()` に依存していた頃は、`list()` が壊れた瞬間に
+   *    壁が消えて同文が2行になった。いまは `open()` の中で判定するので、
+   *    **`list()` が1バイトも読めなくても1行に畳まれる**
+   */
+  it('台帳の読み（list()）が壊れていても、記帳は通り、畳み込みも効く（#1041 で意味が変わった歯）', async () => {
     const stores = createMemoryStores();
     const broken: Stores = {
       ...stores,
       commitments: {
         ...stores.commitments,
-        // `list()` だけを壊す。`get()` / `open()` は本物のまま——重複確認の
-        // 経路だけを踏ませて、書き込みそのものが本当に通ったかを `get()` で見る。
+        // `list()` だけを壊す。`get()` / `open()` は本物のまま。
         list: () => Promise.reject(new Error('台帳が読めない（実測を模す）')),
       },
     };
@@ -1077,7 +1205,15 @@ describe('引き受けたまま終わっていない仕事', () => {
     expect(entry?.origin).toBe('manager');
     expect(entry?.body).toContain('list が壊れていても届く報告');
 
+    // 2. **読みが壊れていても畳み込みは効く。** 別のインスタンスから同文を
+    //    打つ（同一インスタンスでは受信箱側の壁が先に畳むため。#1077）。
+    const other = setup(broken);
+    other.clone.post(managerMessage('list が壊れていても届く報告', 'evt-list-broken-2'));
+    await waitFor(() => other.calls.length > 0, '2つ目のインスタンスのターンが入力を読むこと');
+    expect(await broken.commitments.get('evt-list-broken-2')).toBeNull();
+
     await s.clone.stop();
+    await other.clone.stop();
   });
 
   /**
@@ -1880,6 +2016,11 @@ describe('台帳の評定', () => {
   it('評定の契約（#1054。3実装で同じことを測る）', async () => {
     const stores = createMemoryStores();
     await verifyCommitmentAppraisalContract(stores.commitments);
+  });
+
+  it('畳み込みの契約（#1041。3実装で同じことを測る。⚠ 名乗れるのはプロセス内で原子であることまで）', async () => {
+    const stores = createMemoryStores();
+    await verifyCommitmentFoldContract(stores.commitments);
   });
 
   it('ストアが返す値は書いた側の握りと別物である（#1072。3実装で同じことを測る）', async () => {

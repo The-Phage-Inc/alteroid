@@ -4,6 +4,7 @@ import {
   createRunnerRegistry,
   renderMemoryDocuments,
   verifyCommitmentAppraisalContract,
+  verifyCommitmentFoldContract,
   verifyStoreIsolationContract,
   verifyJournalStoreOrderContract,
   verifyJournalStoreQueryEdgeContract,
@@ -19,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from './db.js';
 import { createPgStoresFromDb, migrate, seedPgWorkspace, type PgStores } from './index.js';
-import { agentTokens, archive, jobs as jobsTable, memory } from './schema.js';
+import { agentTokens, archive, commitments, jobs as jobsTable, memory } from './schema.js';
 
 /**
  * pg ドライバの受け入れ確認。
@@ -1252,6 +1253,10 @@ describe('PgJournalStore', () => {
       await verifyCommitmentAppraisalContract(stores.commitments);
     });
 
+    it('畳み込みの契約（#1041。3実装で同じことを測る。⚠ 名乗れるのはプロセス内で原子であることまで）', async () => {
+      await verifyCommitmentFoldContract(stores.commitments);
+    });
+
     it('ストアが返す値は書いた側の握りと別物である（#1072。3実装で同じことを測る）', async () => {
       await verifyStoreIsolationContract(stores);
     });
@@ -1981,6 +1986,133 @@ describe('PgScheduleStore', () => {
   });
 });
 
+describe('PgCommitmentStore の畳み込みの索引（#1041。pg だけが持つ段）', () => {
+  const managerEntry = (id: string, body: string, source = 'mgr-1'): Commitment => ({
+    id,
+    at: '2026-09-17T00:00:00.000Z',
+    origin: 'manager',
+    source,
+    body,
+  });
+
+  /** `open()` の `where not exists` を経由しない、素の insert。 */
+  const rawInsert = async (entry: Commitment): Promise<void> => {
+    await db.insert(commitments).values({
+      id: entry.id,
+      at: new Date(entry.at),
+      closedAt: null,
+      commitment: entry,
+    });
+  };
+
+  /**
+   * **ここで測るのは `open()` の `where not exists` ではなく、DB の制約そのもの
+   * である。**
+   *
+   * `open()` の中の `where not exists` は**直列に**来た同文しか畳めない。同時に来た
+   * 2件は互いの行を読み取りスナップショットに持たないので、両方ともすり抜ける——
+   * それが #1041 の欠陥であり、**トランザクションを張っても直らない**（READ
+   * COMMITTED の select → insert は排他しない。`PgCommitmentStore.open` の doc）。
+   * 最後に残るのは索引だけである。
+   *
+   * ⚠️ **その「同時」そのものは、この repo では再現できない。** PGlite は単一接続
+   * なので2つのセッションを同時に走らせられない。**だから競合を再現する代わりに、
+   * 制約が在ることを直接測る** —— `where not exists` を経由しない insert は、
+   * 同時に来た2件目が見る世界とちょうど同じものである（相手の行がまだ見えない）。
+   * ⟹ **「同時に来たら DB が拒む」は、この歯と `open()` の doc の読み合わせで
+   * しか言えない。歯そのものが言えるのは「素の insert を DB が拒む」までである。**
+   */
+  /** drizzle は元の例外を `cause` に包む（外側は `Failed query: ...` の1行）。 */
+  const reasonChain = (error: unknown): string => {
+    const lines: string[] = [];
+    for (let current = error; current instanceof Error; current = current.cause)
+      lines.push(current.message);
+    return lines.join('\n');
+  };
+
+  it('⭐ 同一マネージャー×同一本文×未了の2件目は、素の insert なら DB が拒む', async () => {
+    await stores.commitments.open(managerEntry('idx-a', '同じ一言'));
+    const rejection = await rawInsert(managerEntry('idx-b', '同じ一言')).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    if (rejection === null) throw new Error('素の insert が通ってしまった（索引が効いていない）');
+    // **索引の名前まで見る。** 主キー（id）で弾かれたのでは、本文の重複を拒んだ
+    // ことにならない —— 測りたいのは #1041 が足した索引そのものである。
+    expect(reasonChain(rejection)).toContain('commitments_open_manager_body_idx');
+  });
+
+  it('⭐ 陰性対照: source が違う同文は、素の insert でも通る', async () => {
+    await stores.commitments.open(managerEntry('idx-a', '同じ一言'));
+    await rawInsert(managerEntry('idx-c', '同じ一言', 'mgr-2'));
+    expect((await stores.commitments.list()).entries).toHaveLength(2);
+  });
+
+  it('⭐ 陰性対照: 閉じた行と同文は、素の insert でも通る', async () => {
+    await stores.commitments.open(managerEntry('idx-a', '同じ一言'));
+    await stores.commitments.close('idx-a', '2026-09-18T00:00:00.000Z', '片付けた', 'clone');
+    await rawInsert(managerEntry('idx-d', '同じ一言'));
+    expect((await stores.commitments.list()).entries).toHaveLength(1);
+  });
+
+  it('⭐ 陰性対照: origin が manager でなければ、同文でも素の insert で通る', async () => {
+    await stores.commitments.open({
+      id: 'idx-h1',
+      at: '2026-09-17T00:00:00.000Z',
+      origin: 'human',
+      source: 'conv-1',
+      body: '人間の同じ一言',
+    });
+    await rawInsert({
+      id: 'idx-h2',
+      at: '2026-09-17T00:00:00.000Z',
+      origin: 'human',
+      source: 'conv-1',
+      body: '人間の同じ一言',
+    });
+    expect((await stores.commitments.list()).entries).toHaveLength(2);
+  });
+
+  /**
+   * **索引の鍵が `md5(body)` であることを、この歯が固定する。**
+   *
+   * 生の `body` を鍵にすると btree の索引行のサイズ上限（約2.7KB）を超え、
+   * **長い報告だけが記帳できなくなる**（insert が落ちる）。⟹ 鍵を「素直に」
+   * 全文へ直した瞬間にここが落ちる。代償（md5 の衝突）は
+   * `PgCommitmentStore.open` の doc に全文で書いてある。
+   */
+  /**
+   * **索引が無い DB でも、畳み込みそのものは効く（#1041）。**
+   *
+   * `migrate` は既存の重複行が在ると索引を作らずに進む（`ensureOpenManagerBodyIndex`
+   * の doc）。⟹ **索引の在る DB と無い DB が両方ありうる。** そのとき台帳が
+   * #1035 以前（畳み込みが1つも無い状態）へ戻るなら、重複を持つ DB だけが静かに
+   * 悪化することになる。
+   *
+   * ⟹ **索引を落としたうえで、3実装に当てているのと同じ契約をもう一度当てる。**
+   * ここが緑である限り、`open()` の中の `where not exists`（直列に来た同文の
+   * 畳み込み）は索引と独立に効いている。
+   *
+   * ⚠️ **索引が在る状態では、この契約は `where not exists` を1行も踏まなくても
+   * 通ってしまう**（索引が弾いた回を `on conflict do nothing` が吸い、`existing`
+   * が畳んだ先を返すため）—— 実際に `where not exists` を消す実験をして、
+   * 索引が在る側の歯は1本も落ちないことを確かめた。**この歯だけがそれを落とす。**
+   */
+  it('⭐ 索引を落としても、畳み込みの契約は満たされる（where not exists が索引と独立に効いている）', async () => {
+    await db.execute(sql.raw('drop index commitments_open_manager_body_idx'));
+    await verifyCommitmentFoldContract(stores.commitments);
+  });
+
+  it('⭐ 8000 文字の本文でも開ける（鍵が md5 でなければ落ちる）', async () => {
+    const long = 'x'.repeat(8_000);
+    expect(await stores.commitments.open(managerEntry('idx-long', long))).toEqual({
+      opened: true,
+      folded: false,
+    });
+    expect((await stores.commitments.get('idx-long'))?.body).toHaveLength(8_000);
+  });
+});
+
 /**
  * 引き受けたまま終わっていない仕事の台帳（fs 版と同じ振る舞いになることを問う）。
  */
@@ -2351,12 +2483,13 @@ describe('PgCommitmentStore', () => {
   it('同じ id で二度 open しても上書きされない（1回目の本文が残る）', async () => {
     expect(
       await stores.commitments.open(commitment('c-1', '2026-08-12T00:00:00.000Z', '最初の依頼')),
-    ).toBe(true);
+    ).toEqual({ opened: true, folded: false });
 
     // 受信箱の合図は配り直されうるので、同じ id の自動 open は普通に二度来る
     expect(
+      // **`folded` は偽である**（#1041）—— 畳んだのではなく「同じ id が既に在る」。
       await stores.commitments.open(commitment('c-1', '2026-08-14T00:00:00.000Z', '別の本文')),
-    ).toBe(false);
+    ).toEqual({ opened: false, folded: false });
 
     const entry = await stores.commitments.get('c-1');
     expect(entry?.body).toBe('最初の依頼');
@@ -2371,7 +2504,7 @@ describe('PgCommitmentStore', () => {
     // 器が落ちて合図が配り直された、を模す
     expect(
       await stores.commitments.open(commitment('c-1', '2026-08-12T00:00:00.000Z', 'PR を出す')),
-    ).toBe(false);
+    ).toEqual({ opened: false, folded: false });
 
     expect(await stores.commitments.list()).toEqual({
       entries: [],
@@ -2433,8 +2566,12 @@ describe('PgCommitmentStore', () => {
       stores.commitments.open(commitment('c-1', '2026-08-12T00:00:02.000Z', '三度目')),
     ]);
 
-    // 「いま自分が開いた」と言えるのは1本だけ
-    expect(results.filter(Boolean)).toHaveLength(1);
+    // 「いま自分が開いた」と言えるのは1本だけ。**`filter(Boolean)` で数えないこと**
+    // （#1041）—— `open` の戻りはオブジェクトになったので、開けなかった回も truthy
+    // である。数えるのは `opened` そのものでなければならない。
+    expect(results.filter((result) => result.opened)).toHaveLength(1);
+    // 同じ id の衝突は「畳んだ」ではない（畳み込みは本文で決まる）
+    expect(results.filter((result) => result.folded)).toHaveLength(0);
     const rows = (await stores.commitments.list()).entries;
     expect(rows).toHaveLength(1);
     // 後から来たものが先の行を上書きしていない（上書きすると片付いた仕事が蘇る）
