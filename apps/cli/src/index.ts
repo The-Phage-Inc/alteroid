@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
+import { REMOVE_MANY_LIMIT_DEFAULT, REMOVE_MANY_LIMIT_MAX } from '@alteroid/core';
 import { initWorkspace } from '@alteroid/storage-fs';
 import { Command } from 'commander';
 
@@ -11,6 +12,7 @@ import { chatCommand } from './chat.js';
 import { conversationsListCommand, conversationsShowCommand } from './conversations.js';
 import * as daemon from './daemon.js';
 import { droppedCommand } from './dropped.js';
+import { inboxRemoveCommand } from './inbox.js';
 import { loginCommand, logoutCommand, whoamiCommand } from './login.js';
 import {
   memoryEditCommand,
@@ -220,6 +222,51 @@ program
   .action(async () => {
     await droppedCommand();
   });
+
+/**
+ * 受信箱（`inbox_events`。まだ処理し終えていない合図の器）。issue #972。
+ *
+ * いまは `remove` の1本だけ——絞り込んでまとめて畳む（消す）人間の入口
+ * （`POST /inbox/remove`、PR #1007）を CLI から叩く。既定は試算（dryRun）で
+ * 1件も消さない。詳しい経緯・設計は `apps/cli/src/inbox.ts` の doc を見ること。
+ */
+const inboxCommand = program
+  .command('inbox')
+  .description('受信箱（inbox_events）— 未処理の合図の器');
+
+inboxCommand
+  .command('remove')
+  .description(
+    '受信箱の未読を、絞り込んでまとめて畳む（消す）。既定は試算（dryRun）で1件も消さない',
+  )
+  .requiredOption(
+    '--types <種類>',
+    '消す対象の種類（カンマ区切り。human_message,human_answer,distill,timer,external,' +
+      'self_initiative,manager_message から選ぶ。在る7種類全部を並べた呼びは断られる）',
+  )
+  .option('--sources <送信元>', '送信元での絞り込み（完全一致、カンマ区切り）')
+  .option('--before <ISO8601>', 'この時刻より古い行だけを対象にする')
+  .requiredOption('--reason <理由>', '日誌に残す理由')
+  .option('--execute', '試算ではなく実際に消す（既定は試算）')
+  // 既定・上限は `@alteroid/core` の定数から組む（`usage` / `conversations` の
+  // `--limit` / `--scan` が既定と最大をヘルプに書いているのと同じ慣習だが、
+  // 数を書き写すと腐るので値そのものを参照する）。
+  .option(
+    '--limit <N>',
+    `1回で消す上限（デーモンの既定 ${REMOVE_MANY_LIMIT_DEFAULT}、最大 ${REMOVE_MANY_LIMIT_MAX}）`,
+  )
+  .action(
+    async (options: {
+      types: string;
+      sources?: string;
+      before?: string;
+      reason: string;
+      execute?: boolean;
+      limit?: string;
+    }) => {
+      await inboxRemoveCommand(options);
+    },
+  );
 
 /**
  * ログイン。**手元のデーモンには不要**（状態ファイルを読める＝実行環境の持ち主
