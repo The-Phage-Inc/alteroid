@@ -64,6 +64,7 @@ import type {
 } from './schema.js';
 import type { Stores } from './store.js';
 import { withSystemErrorNote } from './system-error.js';
+import { matchNoticeResetAgainstPool, type NoticeResetMatch } from './token-reset-match.js';
 import {
   describeUsageNotice,
   limitRecoveryOf,
@@ -71,6 +72,7 @@ import {
   usageTransitionOf,
   withRecoveryNote,
   type RateLimitFacts,
+  type UsageLimitNotice,
 } from './usage-limits.js';
 import type { TokenRotatorObservation } from './token-rotator.js';
 import { usageDate } from './usage.js';
@@ -617,6 +619,29 @@ export interface ManagerSummary {
    * ときにしか意味を持たない材料である。
    */
   tokenGenerationUnknownReason?: TokenGenerationUnknownReason;
+  /**
+   * **429の文言の`resets`時刻を、プールの各鍵の`cooldownUntil`と突き合わせた
+   * 結果**（Issue #914 オーナー提案(2)。判定は{@link matchNoticeResetAgainstPool}）。
+   *
+   * **`tokenGeneration`（世代番号の直接比較。提案1）とは独立の材料である。**
+   * あちらは daemon のプロセス内記憶（この委譲へ最後に撒いた世代）が前提だが、
+   * こちらは429の文言そのもの（SDKの生の事実）と`TokenPoolStore`（DB正本）
+   * だけを見る——`tokenGenerationUnknownReason`が立つ場面（bookkeeping が
+   * まだ・もう無い）でも、これは独立に判定できる。
+   *
+   * - `'stale'`: 文言のresets時刻が**現役ではない**鍵の`cooldownUntil`と一致
+   *   ——このセッションは古い鍵を掴んだまま走っている（世代ずれ）
+   * - `'active'`: 文言のresets時刻が**現役**の鍵の`cooldownUntil`と一致
+   *   ——待てば戻る（世代ずれではない）
+   * - **欄ごと消える**: 最新の`reached`通知がまだ届いていない、またはどちら
+   *   とも一致しない・文言が読めない（「判定できない」を「世代ずれではない」
+   *   へ倒さない——`undefined`は「一致しなかった」であって「健全」ではない）
+   *
+   * **枠で止まっている間だけ意味を持つ。** `usageStoppedAt`が下りる時点
+   * （自力でターンを終えた・枠で止まった委譲が起こし直された）で一緒に消える
+   * ——古い判定が次の当たりに貼り付かないようにするため。
+   */
+  resetTimeSkewMatch?: NoticeResetMatch;
 }
 
 /**
@@ -3354,6 +3379,27 @@ class Pool implements ManagerPool {
    */
   readonly #tokenIdentities = new Map<string, { tokenId: string; generation: number }>();
   /**
+   * 429の文言のresets時刻を、プールの各鍵のcooldownUntilと突き合わせた結果
+   * （managerId → 判定。Issue #914 オーナー提案(2)。doc は
+   * {@link ManagerSummary.resetTimeSkewMatch}）。
+   *
+   * **`#tokenIdentities` とは別の材料源から埋まる。** あちらは daemon が
+   * 撒いた世代の記憶（プロセス内）だが、こちらは`case 'usage_notice'`が
+   * `reached`を受け取るたびに`this.#stores.tokens`（DB正本）を読み直して
+   * 計算する——だから `#tokenIdentities` が空でも（bookkeeping が
+   * まだ・もう無い構成でも）ここは独立に埋まりうる。
+   *
+   * **枠で止まった印（`#usageStopped` / `Job.usageStoppedAt`）と寿命を揃える。**
+   * `#clearUsageStoppedMark` と、`case 'report'` の自力完走の枝で一緒に
+   * 下ろす——古い判定が次の当たりに貼り付かないようにするため。
+   *
+   * **揮発する。** デーモンを作り直すと消える。台帳には写さない——
+   * `usageStoppedAt` と違い、これは「起こし直す対象を忘れない」ための
+   * 印ではなく**計器**（次の`reached`が来れば作り直せる）なので、
+   * 永続化の理由（Issue #914 段2）が当てはまらない。
+   */
+  readonly #resetTimeSkewMatches = new Map<string, NoticeResetMatch>();
+  /**
    * 種類ごとに、**もうクローンへ配った上限の文言**と、配らずに畳んだ件数。
    *
    * **同じ知らせで受信箱を埋めないため**にある。通知はターンごとに繰り返し届きうる
@@ -3744,6 +3790,7 @@ class Pool implements ManagerPool {
       this.#tokenIdentities.get(record.job.id)?.generation,
       this.#tokenIdentity?.()?.generation,
       this.#tokenIdentity !== undefined,
+      this.#resetTimeSkewMatches.get(record.job.id),
     );
   }
 
@@ -4186,6 +4233,7 @@ class Pool implements ManagerPool {
           this.#tokenIdentities.get(record.job.id)?.generation,
           activeTokenGeneration,
           tokenGenerationPoolWired,
+          this.#resetTimeSkewMatches.get(record.job.id),
         ),
       );
     }
@@ -4214,6 +4262,7 @@ class Pool implements ManagerPool {
           this.#tokenIdentities.get(job.id)?.generation,
           activeTokenGeneration,
           tokenGenerationPoolWired,
+          this.#resetTimeSkewMatches.get(job.id),
         ),
       );
     }
@@ -5040,6 +5089,54 @@ class Pool implements ManagerPool {
   }
 
   /**
+   * **429 の文言の `resets` 時刻を、プールの各鍵の `cooldownUntil` と突き合わせて
+   * 覚える**（Issue #914 オーナー提案(2)。判定は {@link matchNoticeResetAgainstPool}、
+   * 置き場は {@link Pool.#resetTimeSkewMatches}）。
+   *
+   * **材料は `#tokenIdentity`（プロセス内記憶）ではなく `this.#stores.tokens`
+   * （DB 正本）から読む。** `tokenGeneration` が `undefined` になる3つの理由
+   * （プール未配線・未観測・再起動をまたいだ引き取り）のどれでも、こちらは独立に
+   * 判定できるようにするため——bookkeeping が追いついていない場面ほど、この計器の
+   * 価値が高い。
+   *
+   * **⚠️ 呼ぶ位置は `case 'usage_notice'` の最後である。速さの都合ではない。**
+   * 同じ `case` の冒頭の doc が書いているとおり、`usage_notice` と `report` は
+   * `void this.#onEvent(event)` で**並行に走る**——この handler に `await` を
+   * 1つ足すと、後から届いた `report` 側との勝ち負けが変わり、**配達の順そのものが
+   * 動く。** 実際、この読みを `#observeForTokenRotation` の手前に置いていたときは、
+   * 合流窓が知らせと報告を1本に畳み、`runner-failure.test.ts` の「assistant.error が
+   * 付いた本文は報告に混ぜず、失敗として包んで上げる」が落ちた。⟹ **読み取り専用の
+   * 計器は、配達の臨界路の後ろへ置く。**
+   *
+   * **失敗しても投げない。** 落ちたら「今回は判定できなかった」に落ちるだけでよい
+   * ——`#resetTimeSkewMatches` の欄は `undefined` で消える（`undefined` は
+   * 「世代ずれではない」ではなく「判定できなかった」である。doc は
+   * {@link ManagerSummary.resetTimeSkewMatch}）。
+   */
+  async #rememberResetTimeSkew(event: {
+    managerId: string;
+    notice: UsageLimitNotice;
+  }): Promise<void> {
+    if (event.notice.kind !== 'reached') return;
+    try {
+      const [active, pool] = await Promise.all([
+        this.#stores.tokens.readActive(),
+        this.#stores.tokens.list(),
+      ]);
+      const match = matchNoticeResetAgainstPool(event.notice.text, active?.tokenId, pool, {
+        at: this.#now(),
+      });
+      if (match === undefined) {
+        this.#resetTimeSkewMatches.delete(event.managerId);
+      } else {
+        this.#resetTimeSkewMatches.set(event.managerId, match);
+      }
+    } catch (error) {
+      noteDroppedRecord('resets時刻の突き合わせ', `managerId=${event.managerId}`, error);
+    }
+  }
+
+  /**
    * 枠で止まった印を、プロセス内の `Set`（`#usageStopped`）と台帳の写し
    * （`Job.usageStoppedAt`）の両方から下ろす（Issue #914 段2）。
    *
@@ -5063,6 +5160,10 @@ class Pool implements ManagerPool {
    */
   async #clearUsageStoppedMark(managerId: string): Promise<void> {
     this.#usageStopped.delete(managerId);
+    // **`#resetTimeSkewMatches` も同じ寿命で下ろす**（Issue #914 提案(2)。
+    // `#resetTimeSkewMatches` の doc）。古い判定が次の当たりに貼り付かない
+    // ようにするため——枠で止まっていない委譲にこの欄が残る形を作らない。
+    this.#resetTimeSkewMatches.delete(managerId);
     try {
       const record = this.#records.get(managerId) ?? (await this.#load(managerId));
       if (record === null) return;
@@ -5303,6 +5404,7 @@ class Pool implements ManagerPool {
             this.#tokenIdentities.get(record.job.id)?.generation,
             this.#tokenIdentity?.()?.generation,
             this.#tokenIdentity !== undefined,
+            this.#resetTimeSkewMatches.get(record.job.id),
           ),
         );
         continue;
@@ -5410,6 +5512,7 @@ class Pool implements ManagerPool {
             this.#tokenIdentities.get(record.job.id)?.generation,
             this.#tokenIdentity?.()?.generation,
             this.#tokenIdentity !== undefined,
+            this.#resetTimeSkewMatches.get(record.job.id),
           ),
         );
       } catch (error) {
@@ -7240,6 +7343,9 @@ class Pool implements ManagerPool {
            * たい相手そのものである。
            */
           this.#usageStopped.delete(event.managerId);
+          // **`#resetTimeSkewMatches` も同じ枝で下ろす（Issue #914 提案(2)）。**
+          // `#clearUsageStoppedMark` と同じ理由——古い判定を残さない。
+          this.#resetTimeSkewMatches.delete(event.managerId);
           // **台帳の写しも同じ枝で下ろす（Issue #914 段2）。** この少し下に
           // `await this.#persist(record)` が控えているので、そこへ乗せる——
           // 専用のヘルパー（`#clearUsageStoppedMark`）を呼ぶと二重に書き込む
@@ -8069,6 +8175,9 @@ class Pool implements ManagerPool {
               `[${event.managerId}] （配達済みの知らせなので受信箱へは回さない。` +
               `この種類で ${memory.folded} 件目）${text}`,
           });
+          // **畳んだ回も計器は回す**（配達しないだけで、枠に当たった事実は同じ）。
+          // 位置が配達より後ろである理由は、下のもう一方の呼び出しの doc に在る。
+          await this.#rememberResetTimeSkew(event);
           return;
         }
         memory.delivered.set(event.notice.text, true);
@@ -8094,6 +8203,14 @@ class Pool implements ManagerPool {
             : `${text}\n（前にこの種類を知らせてから、配達済みの同じ文言を ` +
                 `${folded} 件畳んでいる。全件は日誌に残っている。）`,
         );
+        // **計器（#914 提案(2)）はここで最後に回す。配達より後ろである。**
+        // 理由はこの `case` の冒頭の doc と同じ——`usage_notice` と `report` は
+        // 並行に走るので、**この handler に `await` を1つ足すと配達の順そのものが
+        // 動く。** 実際、この読みを配達の手前に置いていたときは
+        // `runner-failure.test.ts` の「assistant.error が付いた本文は報告に混ぜず、
+        // 失敗として包んで上げる」が落ちた（合流窓が知らせと報告を1本に畳んだ）。
+        // ⟹ **読み取り専用の計器を、配達の臨界路へ置かない。**
+        await this.#rememberResetTimeSkew(event);
         return;
       }
 
@@ -10090,6 +10207,10 @@ function summaryOf(
   // かは `this.#tokenIdentity !== undefined` でしか分からず、`record` からは
   // 読めないプロセス内の状態なので、呼ぶ側に必ず書かせる。
   tokenGenerationPoolWired: boolean,
+  // **`live` と同じ作法で引数にする（Issue #914 提案(2)）。** 材料は
+  // `#resetTimeSkewMatches`——`record` からは読めないプロセス内の状態なので、
+  // 呼ぶ側に必ず書かせる。
+  resetTimeSkewMatch: NoticeResetMatch | undefined,
 ): ManagerSummary {
   const { job } = record;
   const tokenGenerationUnknownReason = tokenGenerationUnknownReasonOf(
@@ -10209,5 +10330,10 @@ function summaryOf(
           tokenGeneration,
           ...(activeTokenGeneration === undefined ? {} : { activeTokenGeneration }),
         }),
+    // **`live` と同じ引数の作法で運ぶ（Issue #914 提案(2)）。** 材料は
+    // `#resetTimeSkewMatches`——`record` からは読めないプロセス内の状態なので、
+    // 引数で受ける。`undefined`（判定できなかった／通知がまだ届いていない）
+    // では欄ごと消す——`tokenGeneration` と同じ作法。
+    ...(resetTimeSkewMatch === undefined ? {} : { resetTimeSkewMatch }),
   };
 }
