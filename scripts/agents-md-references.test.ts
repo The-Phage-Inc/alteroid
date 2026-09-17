@@ -350,8 +350,22 @@ export const FENCE_COVERAGE_MAX_DROPPED_RATIO = 0.4;
  */
 export const FENCE_COVERAGE_MIN_DROPPED_LINES = 40;
 
-/** ⭐ いまは0件（実測。閾値を超えるファイルが1つも無い）。1件でも足すなら理由つきで。 */
-export const FENCE_COVERAGE_EXEMPTIONS: readonly FenceCoverageExemption[] = [];
+/**
+ * ⭐ 2026-09-17 に2件。どちらも `AGENTS.md` から**逐語のまま切り出した**節で、
+ * 切り出した対象がまさに「生の実測コマンドと出力」だったために、フェンスの割合が
+ * 元ファイル（18.54%）より高く出ている。**(a) フェンスの対応ずれではないことを確かめた**
+ * —— どちらもフェンス記号の数が偶数で、落とした区間の開始行がすべて開きフェンスに一致する。
+ */
+export const FENCE_COVERAGE_EXEMPTIONS: readonly FenceCoverageExemption[] = [
+  {
+    file: '.claude/skills/grep-counting/SKILL.md',
+    why: 'AGENTS.md「grep が静かに取りこぼす形は6つある」を逐語で移設した先（2026-09-17）。6形のうち5形が shim / GNU grep / rg の出力を並べて見せる形なので、本文がフェンスで占められる。フェンス記号10本＝5対で対応は揃っており、落とした区間の開始行はすべて開きフェンスである（(a) の形ではない）。',
+  },
+  {
+    file: '.claude/skills/pr-green/SKILL.md',
+    why: 'AGENTS.md「statusCheckRollup」〜「draft の run が conclusion: success を名乗る」を逐語で移設した先（2026-09-17）。check-runs / actions/runs / jobs の生の応答を世代ごとに並べて比べる節なので、本文がフェンスで占められる。フェンス記号16本＝8対で対応は揃っており、落とした区間の開始行はすべて開きフェンスである（(a) の形ではない）。',
+  },
+];
 
 // ---------------------------------------------------------------------------
 // 旧実装（#796 より前）との食い違い（#786 残り）—— 「被覆の歯が
@@ -868,8 +882,15 @@ describe('AGENTS.md の参照の形（#369）', () => {
   it('本文がフェンスの中身を含まない（この歯が何を見ているかの確認）', () => {
     // フェンスの中にしか無い逐語。落ちたら proseLines が壊れている＝下の3本が
     // 「見ていないから0件」になりうるので、先にここで止める。
-    expect(agentsMd).toContain('error occurred in dts build');
-    expect(prose.map((l) => l.text).join('\n')).not.toContain('error occurred in dts build');
+    // ⚠ この逐語は 2026-09-17 に差し替えた。前は `error occurred in dts build` だったが、
+    // それを含む節（`pnpm build` の競合）が `.claude/skills/build-contention/` へ移設されて
+    // AGENTS.md から消えた ⟹ **この歯が落ちたのは正しい**（見張り役の逐語が実在しなくなった）。
+    // 差し替え先は「`gh pr merge --delete-branch`」の節の生出力で、AGENTS.md のフェンスの中に
+    // だけ在ることを確かめてある。**節ごと移設されればまた落ちる。そのときも同じ直し方をする。**
+    expect(agentsMd).toContain('Cannot change the base branch of a closed pull request');
+    expect(prose.map((l) => l.text).join('\n')).not.toContain(
+      'Cannot change the base branch of a closed pull request',
+    );
     expect(prose.length).toBeGreaterThan(100);
   });
 
