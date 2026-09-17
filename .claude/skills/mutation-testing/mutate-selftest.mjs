@@ -431,6 +431,39 @@ describe('強い歯（selftest）', () => {
 //   - 印から原文が復元できる（このシナリオでは控えもわざと使えなくして、
 //     マーカー単独での復元を裏取りする）
 //   - 印が残った状態では、測定を始めずに落ちる（baseline/run の入口チェック）
+//
+// #1138: `cmdSelftest` は戻り値を JSON.stringify して log するだけで中身を
+// 検査しない（`weak-tooth` の `assertWeakToothOutcomes` 以外は未検査だった）。
+// このシナリオの核心の主張は、上のコメントが数える3点＋αをすべて満たすこと
+// ——`assertWeakToothOutcomes` と同じ形で、`undefined`/`null`（＝測れていない）
+// も違反として落とす。
+function assertInterruptedOutcomes(result) {
+  const expected = {
+    markerPresentAfterInterruption: true,
+    statusReportedProblem: true,
+    baselineBlockedWhileMarkerPresent: true,
+    recoveredFromMarkerOnly: true,
+    restoredCorrectly: true,
+  };
+  const violations = [];
+  for (const [key, want] of Object.entries(expected)) {
+    const got = result[key] ?? null;
+    if (got !== want) {
+      violations.push(`  - ${key}: 期待 ${JSON.stringify(want)} / 実際 ${JSON.stringify(got)}`);
+    }
+  }
+  if (violations.length > 0) {
+    throw new HarnessError(
+      'interrupted: このシナリオが実演するはずの主張（印が残る・status が問題を' +
+        '報告する・印が残った状態では baseline が測定を始めずに落ちる・印だけから' +
+        '正しく復元できる）が出ていない。\n' +
+        `${violations.join('\n')}\n` +
+        'なぜ落とすか: 戻り値を検査しなければ、判定が化けても緑のまま残る（#1138。' +
+        '#1119 が weak-tooth に見つけた欠陥と同じ形——「繋いだが効いていない」）。',
+    );
+  }
+}
+
 function scenarioInterrupted() {
   section('selftest: 3. 中断（正しい順序: 印 → 変異）');
   requireNoMarker('interrupted');
@@ -512,7 +545,7 @@ function scenarioInterrupted() {
   log(`復元後の中身が原文と一致: ${restoredCorrectly}`);
   log(`復元後、印は残っているか（無いはず）: ${markerExists()}`);
 
-  return {
+  const result = {
     scenario: 'interrupted',
     order: 'correct',
     markerPresentAfterInterruption: markerPresent,
@@ -521,6 +554,8 @@ function scenarioInterrupted() {
     recoveredFromMarkerOnly,
     restoredCorrectly,
   };
+  assertInterruptedOutcomes(result);
+  return result;
 }
 
 // ── 3'. 中断（誤った順序との対比） ──────────────────────────────────
@@ -529,6 +564,33 @@ function scenarioInterrupted() {
 // を呼ばず、ここだけで直線的に「変異を先に書き、印はまだ置かない」という
 // 誤った順序を再現する。本体に順序を切り替えるフラグは無い — 抜け道は
 // 次の穴になるので置かない。
+//
+// #1138: このシナリオの核心の主張は `scenarioInterrupted` と鏡像である
+// ——誤った順序では印が残らない（＝次に来た人が復元できる材料を持たない）
+// のに、`status` はそれを「印は無い」＝問題なしと誤読する。この対比が
+// 崩れたら、このシナリオは何も実演していない。
+function assertInterruptedWrongOrderOutcomes(result) {
+  const expected = {
+    markerPresentAfterInterruption: false,
+    statusReportedNoProblem: true,
+  };
+  const violations = [];
+  for (const [key, want] of Object.entries(expected)) {
+    const got = result[key] ?? null;
+    if (got !== want) {
+      violations.push(`  - ${key}: 期待 ${JSON.stringify(want)} / 実際 ${JSON.stringify(got)}`);
+    }
+  }
+  if (violations.length > 0) {
+    throw new HarnessError(
+      'interrupted-wrong-order: このシナリオが実演するはずの対比（誤った順序では' +
+        '印が残らない・status はそれを問題なしと誤読する）が出ていない。\n' +
+        `${violations.join('\n')}\n` +
+        'なぜ落とすか: 戻り値を検査しなければ、判定が化けても緑のまま残る（#1138）。',
+    );
+  }
+}
+
 function scenarioInterruptedWrongOrder() {
   section('selftest: 3´. 中断との対比（誤った順序: 変異 → 印。ハーネス本体には存在しない経路）');
   requireNoMarker('interrupted-wrong-order');
@@ -559,15 +621,48 @@ function scenarioInterruptedWrongOrder() {
   const statusAfterCleanup = gitStatusPorcelainFor(FIXTURE_REL);
   log(`cleanup 後の git status --porcelain: ${JSON.stringify(statusAfterCleanup)}`);
 
-  return {
+  const result = {
     scenario: 'interrupted-wrong-order',
     order: 'wrong',
     markerPresentAfterInterruption: markerPresent,
     statusReportedNoProblem: /印は無い/.test(statusResult),
   };
+  assertInterruptedWrongOrderOutcomes(result);
+  return result;
 }
 
 // ── 4. 変異が成果物へ届いたか ────────────────────────────────────────
+//
+// #1138: このシナリオの核心の主張は「build 前には dist へ届いていない・
+// build 後には届く・復元後は消えている」という対比である。build/restore が
+// 途中で壊れても exit code は 0 でありうる（`buildAndCheckArtifact` は
+// build の終了コードでは判定しない設計 — [9] のログ参照）ので、戻り値の
+// 中身を実際に突き合わせないと、この対比が崩れても緑のまま残る。
+function assertDeliveryOutcomes(result) {
+  const expected = {
+    deliveredBeforeBuild: false,
+    deliveredAfterBuild: true,
+    buildExitCodeAfterBuild: 0,
+    postRestoreRebuildOk: true,
+    distCleanAfterRestore: true,
+  };
+  const violations = [];
+  for (const [key, want] of Object.entries(expected)) {
+    const got = result[key] ?? null;
+    if (got !== want) {
+      violations.push(`  - ${key}: 期待 ${JSON.stringify(want)} / 実際 ${JSON.stringify(got)}`);
+    }
+  }
+  if (violations.length > 0) {
+    throw new HarnessError(
+      'delivery: このシナリオが実演するはずの対比（build 前には届いていない・' +
+        'build 後には届く・復元後は消えている）が出ていない。\n' +
+        `${violations.join('\n')}\n` +
+        'なぜ落とすか: 戻り値を検査しなければ、判定が化けても緑のまま残る（#1138）。',
+    );
+  }
+}
+
 function scenarioDelivery() {
   section('selftest: 4. 変異が成果物へ届いたか（packages/core/src/excerpt.ts）');
   requireNoMarker('delivery');
@@ -595,37 +690,50 @@ function scenarioDelivery() {
   log('-- 4b. 変異を当てる（build はまだ呼ばない） --');
   applyMutation(spec);
 
-  log('');
-  log('-- 4c. build をまだ呼ばずに、いまの dist をもう一度読む --');
-  const distAfterMutationNoBuild = fs.existsSync(distAbs) ? fs.readFileSync(distAbs, 'utf8') : '';
-  const deliveredBeforeBuild = distAfterMutationNoBuild.includes('SELFTEST_MUTATED');
-  log(`build 前（ソースは変異済み）の dist に含まれるか: ${deliveredBeforeBuild}`);
-  log(
-    'この時点で参照できる「直近の build の exit code」は、前回 (baseline 相当) の 0 のままである。',
-  );
+  // **#1146: ここから 4e（restoreMutation）までを try/finally で包む。**
+  // `scenarioJudgementIdIntegrity` と同じ形——`applyMutation` の後で
+  // 例外が起きても（例えば 4d の build 自体が例外を投げても）、
+  // `restoreMutation()` を finally で必ず1回だけ呼ぶ。包んでいなかった
+  // ときは、ここで例外が起きると `packages/core/src/excerpt.ts`
+  // （実ソース）が変異したまま・印も残ったまま selftest プロセスが
+  // 落ちていた（再現し、報告に生ログを添えた）。
+  let artifactResult;
+  let rebuildCheck;
+  let deliveredBeforeBuild;
+  try {
+    log('');
+    log('-- 4c. build をまだ呼ばずに、いまの dist をもう一度読む --');
+    const distAfterMutationNoBuild = fs.existsSync(distAbs) ? fs.readFileSync(distAbs, 'utf8') : '';
+    deliveredBeforeBuild = distAfterMutationNoBuild.includes('SELFTEST_MUTATED');
+    log(`build 前（ソースは変異済み）の dist に含まれるか: ${deliveredBeforeBuild}`);
+    log(
+      'この時点で参照できる「直近の build の exit code」は、前回 (baseline 相当) の 0 のままである。',
+    );
 
-  log('');
-  log('-- 4d. build する --');
-  const artifactResult = buildAndCheckArtifact(spec);
+    log('');
+    log('-- 4d. build する --');
+    artifactResult = buildAndCheckArtifact(spec);
 
-  log('');
-  log(
-    `対比: build 前 exit=0(前回分) / 届いた=${deliveredBeforeBuild} — ` +
-      `build 後 exit=${artifactResult.buildExitCode} / 届いた=${artifactResult.artifactState === 'delivered'}。` +
-      'exit code はどちらも 0 でありうるが、届いたかどうかは dist を実際に読まないと分からない。',
-  );
-
-  log('');
-  log(
-    '-- 4e. 復元する。dist の再 build と検証は restoreMutation 自身が後始末として行う（手動では呼ばない） --',
-  );
-  const { rebuildCheck } = restoreMutation();
-  log(`restoreMutation が自動で行った後始末: ${rebuildCheck.reason}`);
+    log('');
+    log(
+      `対比: build 前 exit=0(前回分) / 届いた=${deliveredBeforeBuild} — ` +
+        `build 後 exit=${artifactResult.buildExitCode} / 届いた=${artifactResult.artifactState === 'delivered'}。` +
+        'exit code はどちらも 0 でありうるが、届いたかどうかは dist を実際に読まないと分からない。',
+    );
+  } finally {
+    log('');
+    log(
+      '-- 4e. 復元する（finally。ここまでの間に例外が起きていても必ず1回だけ呼ぶ）。' +
+        'dist の再 build と検証は restoreMutation 自身が後始末として行う（手動では呼ばない） --',
+    );
+    ({ rebuildCheck } = restoreMutation());
+    log(`restoreMutation が自動で行った後始末: ${rebuildCheck.reason}`);
+  }
   const distAfterRestore = fs.readFileSync(distAbs, 'utf8');
   const distMatchesRestoredSource = !distAfterRestore.includes('SELFTEST_MUTATED');
   log(`後始末後、dist に変異が残っていないか（残っていないはず）: ${distMatchesRestoredSource}`);
 
-  return {
+  const result = {
     scenario: 'delivery',
     deliveredBeforeBuild,
     deliveredAfterBuild: artifactResult.artifactState === 'delivered',
@@ -635,6 +743,8 @@ function scenarioDelivery() {
     postRestoreRebuildReason: rebuildCheck.reason,
     distCleanAfterRestore: distMatchesRestoredSource,
   };
+  assertDeliveryOutcomes(result);
+  return result;
 }
 
 // ── 5. 判定行の id 取り違えを検出する確認 ───────────────────────────
@@ -812,76 +922,101 @@ function scenarioRebuildFailure() {
   applyMutation(spec);
 
   const fakeBinDir = path.join(ROOT, '.mutation-testing', 'selftest-fake-bin');
-  fs.mkdirSync(fakeBinDir, { recursive: true });
-  const fakePnpmPath = path.join(fakeBinDir, 'pnpm');
-  fs.writeFileSync(fakePnpmPath, '#!/bin/sh\nexit 1\n');
-  fs.chmodSync(fakePnpmPath, 0o755);
-  log(`擬似 pnpm を用意した（常に exit 1）: ${fakePnpmPath}`);
-
-  log('');
-  log('-- 6b. この PATH で、実プロセスとして `mutate.mjs restore` を起こす --');
-  const poisonedEnv = { ...process.env, PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH}` };
-  const restoreResult = spawnSync(
-    'node',
-    [path.join(ROOT, '.claude/skills/mutation-testing/mutate.mjs'), 'restore'],
-    { cwd: ROOT, env: poisonedEnv, encoding: 'utf8' },
-  );
-  log(`restore の exit code: ${restoreResult.status}`);
-  log(restoreResult.stdout ?? '');
-  log(restoreResult.stderr ?? '');
-
-  const markerLeft = markerExists();
   const artifactAbs = absPath(spec.artifact.file);
-  const distStillHasMutation = fs
-    .readFileSync(artifactAbs, 'utf8')
-    .includes('REBUILDCHECK_MUTATED');
-  log(`restore が非0 で終わったか: ${restoreResult.status !== 0}`);
-  log(`印が残っているか: ${markerLeft}`);
-  log(`dist に変異がまだ残っているか: ${distStillHasMutation}`);
 
-  log('');
-  log('-- 6c. 実プロセスとして `mutate.mjs status`（通常の PATH）を起こす --');
+  // **#1146: 6a（apply）の後を、6d（本物の pnpm での後始末）までまるごと
+  // try/finally で包む。** `scenarioJudgementIdIntegrity` と同じ形——ここで
+  // 例外が起きても（擬似 pnpm の用意・spawnSync・status の呼び出しのどこで
+  // 起きても）、`restoreMutation()` を finally で必ず1回だけ呼ぶ。**6d の
+  // 呼び出しをそのまま finally へ移しただけなので、呼び出し箇所は依然として
+  // 1つだけであり、二重に呼ぶ経路は無い。**包んでいなかったときは、6b/6c の
+  // 間で（意図した擬似 pnpm の失敗とは別の理由で）例外が起きると、
+  // `packages/core/src/excerpt.ts`（実ソース）が変異したまま・印も残ったまま
+  // 落ちていた（#1146。`scenarioDelivery` と同型の欠陥）。
+  let restoreResult;
+  let markerLeft;
+  let distStillHasMutation;
   let statusOut;
   let statusExit;
+  let statusReportedProblem;
+  let statusMentionsDistStage;
+  let statusShowsCpAsPrimary;
+  let finalRestore;
+  let distCleanAfterRealRestore;
+  let gitStatusAfter;
   try {
-    statusOut = execFileSync(
+    fs.mkdirSync(fakeBinDir, { recursive: true });
+    const fakePnpmPath = path.join(fakeBinDir, 'pnpm');
+    fs.writeFileSync(fakePnpmPath, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(fakePnpmPath, 0o755);
+    log(`擬似 pnpm を用意した（常に exit 1）: ${fakePnpmPath}`);
+
+    log('');
+    log('-- 6b. この PATH で、実プロセスとして `mutate.mjs restore` を起こす --');
+    const poisonedEnv = {
+      ...process.env,
+      PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH}`,
+    };
+    restoreResult = spawnSync(
       'node',
-      [path.join(ROOT, '.claude/skills/mutation-testing/mutate.mjs'), 'status'],
-      { cwd: ROOT, encoding: 'utf8' },
-    ).toString();
-    statusExit = 0;
-  } catch (err) {
-    statusOut = err.stdout?.toString() ?? '';
-    statusExit = err.status;
+      [path.join(ROOT, '.claude/skills/mutation-testing/mutate.mjs'), 'restore'],
+      { cwd: ROOT, env: poisonedEnv, encoding: 'utf8' },
+    );
+    log(`restore の exit code: ${restoreResult.status}`);
+    log(restoreResult.stdout ?? '');
+    log(restoreResult.stderr ?? '');
+
+    markerLeft = markerExists();
+    distStillHasMutation = fs.readFileSync(artifactAbs, 'utf8').includes('REBUILDCHECK_MUTATED');
+    log(`restore が非0 で終わったか: ${restoreResult.status !== 0}`);
+    log(`印が残っているか: ${markerLeft}`);
+    log(`dist に変異がまだ残っているか: ${distStillHasMutation}`);
+
+    log('');
+    log('-- 6c. 実プロセスとして `mutate.mjs status`（通常の PATH）を起こす --');
+    try {
+      statusOut = execFileSync(
+        'node',
+        [path.join(ROOT, '.claude/skills/mutation-testing/mutate.mjs'), 'status'],
+        { cwd: ROOT, encoding: 'utf8' },
+      ).toString();
+      statusExit = 0;
+    } catch (err) {
+      statusOut = err.stdout?.toString() ?? '';
+      statusExit = err.status;
+    }
+    log(`status の exit code: ${statusExit}`);
+    log(statusOut);
+    statusReportedProblem = /変異が当たったまま/.test(statusOut);
+
+    // **段階の区別が出ているかを確かめる。** マネージャーの2回目の実測: 後始末が
+    // 落ちた時点でソース（git 管理下）は既に復元済みなのに、直さないと
+    // `status` は「ソースが変異したまま」という説明（cp/md5sum を主経路とする
+    // 手順）を出していた。次に来た人がその手順どおり cp して md5 が一致する
+    // のを見ると「直った」と誤解し、dist の変異が残ったまま印を消しかねない。
+    // ここでは、実際に dist だけが問題である段階では「ソースは既に復元済み」
+    // と明示され、cp を主経路として出していないことを確認する。
+    statusMentionsDistStage = /ソース（git 管理下）は既に復元済みである/.test(statusOut);
+    statusShowsCpAsPrimary =
+      /ハーネスを使わない復元手順:/.test(statusOut) && /\$ cp '/.test(statusOut);
+    log(
+      `status が「ソースは復元済み・dist 未確認」の段階だと明示しているか: ${statusMentionsDistStage}`,
+    );
+    log(`status が cp 手順を主経路として出しているか（出ていないはず）: ${statusShowsCpAsPrimary}`);
+  } finally {
+    log('');
+    log(
+      '-- 6d. 擬似 pnpm を片付け、本物の pnpm で復元する（finally。ここまでの間に例外が' +
+        '起きていても必ず1回だけ呼ぶ） --',
+    );
+    fs.rmSync(fakeBinDir, { recursive: true, force: true });
+    finalRestore = restoreMutation();
+    log(`後始末（本物の pnpm）: ${finalRestore.rebuildCheck.reason}`);
+    distCleanAfterRealRestore = !fs
+      .readFileSync(artifactAbs, 'utf8')
+      .includes('REBUILDCHECK_MUTATED');
+    gitStatusAfter = gitStatusPorcelainFor(spec.file);
   }
-  log(`status の exit code: ${statusExit}`);
-  log(statusOut);
-  const statusReportedProblem = /変異が当たったまま/.test(statusOut);
-
-  // **段階の区別が出ているかを確かめる。** マネージャーの2回目の実測: 後始末が
-  // 落ちた時点でソース（git 管理下）は既に復元済みなのに、直さないと
-  // `status` は「ソースが変異したまま」という説明（cp/md5sum を主経路とする
-  // 手順）を出していた。次に来た人がその手順どおり cp して md5 が一致する
-  // のを見ると「直った」と誤解し、dist の変異が残ったまま印を消しかねない。
-  // ここでは、実際に dist だけが問題である段階では「ソースは既に復元済み」
-  // と明示され、cp を主経路として出していないことを確認する。
-  const statusMentionsDistStage = /ソース（git 管理下）は既に復元済みである/.test(statusOut);
-  const statusShowsCpAsPrimary =
-    /ハーネスを使わない復元手順:/.test(statusOut) && /\$ cp '/.test(statusOut);
-  log(
-    `status が「ソースは復元済み・dist 未確認」の段階だと明示しているか: ${statusMentionsDistStage}`,
-  );
-  log(`status が cp 手順を主経路として出しているか（出ていないはず）: ${statusShowsCpAsPrimary}`);
-
-  log('');
-  log('-- 6d. 擬似 pnpm を片付け、本物の pnpm で復元する --');
-  fs.rmSync(fakeBinDir, { recursive: true, force: true });
-  const finalRestore = restoreMutation();
-  log(`後始末（本物の pnpm）: ${finalRestore.rebuildCheck.reason}`);
-  const distCleanAfterRealRestore = !fs
-    .readFileSync(artifactAbs, 'utf8')
-    .includes('REBUILDCHECK_MUTATED');
-  const gitStatusAfter = gitStatusPorcelainFor(spec.file);
 
   // ツリーは既にクリーンな状態まで戻したので、ここで投げても安全である。
   if (!statusMentionsDistStage || statusShowsCpAsPrimary) {
