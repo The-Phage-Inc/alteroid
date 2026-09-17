@@ -15,10 +15,20 @@
  *
  * 偽の `railway` を PATH の先に置いて確かめる（足場は `railway/cli-stub.ts`）。
  * ネットワークにも本物の Railway にも触らない。
+ *
+ * **`it` はプロセスを起こさない（#1100）。** かつては `it` の中で直接4回、
+ * `beforeAll` で4回、合計8回 `scale-runners.sh` を直列に起こしていた
+ * （`setup.test.ts` の #1093 と同型の問題）。いまは全部この下の1つの
+ * `beforeAll`（`prepareScenarios`）に寄せてある。`it` は出来上がった結果
+ * （`scenarios`）を引いて assert するだけで、自分では何もスポーンしない。
+ * 詳しい経緯は `prepareScenarios` の直前のコメントと `beforeAll` 呼び出し側の
+ * `PREP_TIMEOUT` のコメントを見よ。
  */
+import { cpus } from 'node:os';
+
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { type Run, runScript } from './cli-stub.js';
+import { type Run, runLimited, runScriptAsync } from './cli-stub.js';
 
 /** いま本番に在るもの（app / Postgres / runner の3つ）。 */
 const EXISTING = [
@@ -63,8 +73,15 @@ type Options = {
   allowFailure?: boolean;
 };
 
-function run(options: Options): Run {
-  return runScript({
+/**
+ * **`runScriptAsync` を使う。** `it` の中のプロセス起動を追い出した後（#1100）、
+ * この足場が組み立てる8シナリオを `prepareScenarios` が `runLimited` で並行に
+ * 走らせるためには、非同期でなければならない。⚠️ かつて在った同期版
+ * `runScript` はこの移行で呼ぶ場所が無くなり、`cli-stub.ts` から削った
+ * （逐語は `grep -Fn -- 'かつては同期版' railway/cli-stub.ts`）。
+ */
+function run(options: Options): Promise<Run> {
+  return runScriptAsync({
     script: 'scale-runners.sh',
     args: ['--yes', '--total', String(options.total), ...(options.args ?? [])],
     services: options.services ?? EXISTING,
@@ -76,10 +93,198 @@ function run(options: Options): Run {
   });
 }
 
+/** `prepareScenarios` が組み立てる、全 `it` が引く名前付きの結果表。 */
+type Scenarios = {
+  scaleUpTo3: Run;
+  memoryKeyOnRunner: Run;
+  scaleDown: Run;
+  rerunAlreadyAttached: Run;
+  rerunMissingDest: Run;
+  unresolvedVarRefs: Run;
+  dryRun: Run;
+  noRunnerService: Run;
+};
+
+let scenarios: Scenarios;
+
+/**
+ * **`it` から起動コストを追い出す、唯一の準備段（#1100）。**
+ *
+ * 直す前に実際に数えた事実: `scale-runners.sh` を起動していたのは8か所
+ * （`beforeAll` 経由が4回、`it` の中で直接が4回）。これを直列に起こすと、器が
+ * 混んでいる時間だけ `it` の所要時間が伸び、既定の `testTimeout`（5000ms）へ
+ * 近づく——`setup.test.ts`（#1093）と同じ形の問題である。
+ *
+ * 直し方も同じ2つを組み合わせている（#1093 でそのまま使えた形をここでも使う）:
+ * 1. **8回ぶんを全部ここへ集め、`it` は出来上がった結果を引くだけにする。**
+ *    ⟹ `it` の所要時間は ms 単位に落ち、器がどれだけ混んでも `testTimeout` に
+ *    触れようがなくなる
+ * 2. **直列ではなく `runLimited` で並行に走らせる。** 各実行は `mkdtempSync` で
+ *    作った自分専用のディレクトリしか触らないので（`cli-stub.ts` の
+ *    `runScriptAsync` の `prepare`）、実行どうしに共有状態は無く、並行化しても
+ *    結果は変わらない。並行度は `os.cpus().length` で頭打ちにする——無制限に
+ *    並べると器の CPU を使い切るため
+ *
+ * **この関数自体の timeout（第2引数）の根拠は、呼び出し側（下の `beforeAll`）に
+ * 逐語で書いてある。**
+ */
+async function prepareScenarios(): Promise<Scenarios> {
+  const s = {} as Scenarios;
+  const tasks: Array<() => Promise<void>> = [];
+
+  tasks.push(async () => {
+    s.scaleUpTo3 = await run({ total: 3 });
+  });
+
+  // **これは運用の間違いではなく実装のバグである。** 写して増やすと、割った意味が
+  // 消えた状態が台数ぶん増える。だから写さないだけでなく、そこで止まる
+  tasks.push(async () => {
+    s.memoryKeyOnRunner = await run({
+      total: 3,
+      runnerVars: { ...RUNNER_VARS, ALTEROID_DATABASE_URL: 'postgres://user:pw@host/db' },
+      allowFailure: true,
+    });
+  });
+
+  // 台数を減らす操作は、その器で走っているマネージャーを移送できて初めて安全になる
+  // （fencing → 移送。roadmap M5 PR4 → PR5）。**黙って何もしないのでも、勝手に
+  // 消すのでもなく、できないと言う**
+  tasks.push(async () => {
+    s.scaleDown = await run({
+      total: 1,
+      services: [
+        ...EXISTING,
+        { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
+      ],
+      allowFailure: true,
+    });
+  });
+
+  const rerunAttached = [
+    ...EXISTING,
+    { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
+    { id: 'id-runner-3', name: 'runner-3', source: { repo: 'takecchi/alteroid', image: null } },
+  ];
+  tasks.push(async () => {
+    s.rerunAlreadyAttached = await run({
+      total: 3,
+      services: rerunAttached,
+      appVars: {
+        ALTEROID_RUNNER_URLS:
+          'http://runner.railway.internal:4518,http://runner-2.railway.internal:4518,http://runner-3.railway.internal:4518',
+      },
+    });
+  });
+  tasks.push(async () => {
+    s.rerunMissingDest = await run({
+      total: 3,
+      services: rerunAttached,
+      appVars: { ALTEROID_RUNNER_URL: 'http://runner.railway.internal:4518' },
+    });
+  });
+
+  // **置いたのは `${{…}}` の参照で、解決するのは Railway である。** Service 名に
+  // ハイフンが入る（`runner-2`）ので、解決される保証は我々の側に無い。解決されなければ
+  // デーモンはその文字列をホスト名として引きに行き、名簿は繋がらない相手へ永久に挑み
+  // 続ける（回数では諦めない）。**症状は「増やしたのに委譲が来ない」という沈黙**なので、
+  // 置いた側が検算しないと、器のログを追う作業になる
+  const unresolvedAttached = [
+    ...EXISTING,
+    { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
+    { id: 'id-runner-3', name: 'runner-3', source: { repo: 'takecchi/alteroid', image: null } },
+  ];
+  // 読み返しても `${{` が残っている（Railway が解決していない）状態
+  const unresolved = {
+    ALTEROID_RUNNER_URLS: [
+      'http://${{runner.RAILWAY_PRIVATE_DOMAIN}}:4518',
+      'http://${{runner-2.RAILWAY_PRIVATE_DOMAIN}}:4518',
+      'http://${{runner-3.RAILWAY_PRIVATE_DOMAIN}}:4518',
+    ].join(','),
+  };
+  tasks.push(async () => {
+    s.unresolvedVarRefs = await run({
+      total: 3,
+      services: unresolvedAttached,
+      appVars: unresolved,
+      allowFailure: true,
+    });
+  });
+
+  tasks.push(async () => {
+    s.dryRun = await run({ total: 3, args: ['--dry-run'] });
+  });
+
+  tasks.push(async () => {
+    s.noRunnerService = await run({
+      total: 3,
+      services: EXISTING.filter((svc) => svc.name !== 'runner'),
+      allowFailure: true,
+    });
+  });
+
+  await runLimited(tasks, cpus().length, (task) => task());
+  return s;
+}
+
+/**
+ * **`PREP_TIMEOUT` の根拠（勘で置いていない）。**
+ *
+ * `beforeAll(fn, timeout)` の第2引数は「`it` の timeout を伸ばす」のとは別物
+ * である——`it` からは時間依存を追い出した後なので、ここで伸ばしているのは
+ * *残った準備段*（`prepareScenarios`。8回の実プロセス起動を `runLimited` で
+ * `os.cpus().length` 本まで並行に走らせる）であり、根拠は実測した最悪値の
+ * 倍数で書ける。
+ *
+ * **実測（この器、32 vCPU、2026-09-16T21:18〜21:25Z）**: `beforeAll` の所要時間を
+ * 4条件で測った（それぞれ2回、`Date.now()` の差分。`setup.test.ts` の
+ * `PREP_TIMEOUT` の実測と同じ条件・同じ手順で、このファイル向けに測り
+ * 直した——このファイルは34回だった #1098 より軽い8回なので、数字はそちらの
+ * 流用ではなくここで取り直した値である）。
+ *
+ * | 条件                                     | 実測                  |
+ * | ----------------------------------------- | --------------------- |
+ * | 無負荷                                     | 1873ms / 1825ms       |
+ * | `nproc`（32本）の CPU busy-loop を掛けた状態 | 4181ms / 5011ms       |
+ * | `taskset -c 0,1`（2芯に絞った状態）        | 3523ms / 3531ms       |
+ * | 2×`nproc`（64本）の busy-loop を掛けた状態  | 6613ms / **13848ms**  |
+ *
+ * 自分で測った**最悪値は 13848ms**（2×nproc busy-loop）。`taskset -c 0,1` は
+ * `os.cpus()` が返す論理コア数を変えない（affinity だけを絞るため）ので、
+ * `runLimited` は2芯の器でも32本ぶん並行に投げにいく——**芯数が少ない器ほど
+ * 「並行度を実コア数より高く見積もって溢れる」側の最悪ケースに近い**、という点で
+ * 上の4条件のうち最も実運用の悪条件に近いと考えている（`setup.test.ts` と同じ
+ * 考え方）。8回しか起こさないこのファイルは、34回起こす #1098 より最悪値が軽く、
+ * `PREP_TIMEOUT` もそのぶん小さい値に落ちる——「#1098 と同じだから60000」では
+ * なく、実測から素直に出した値である。
+ *
+ * **⚠️ ただしこの器は自分専有ではない。** 同じ木で並行して作業していた
+ * マネージャーが独立に測った値では、自前の busy-loop を足さない「そのまま」の
+ * 状態（他のマネージャー・作業者が乗せている ambient load だけ、`uptime` の
+ * load average 44〜111）で **17730ms** を観測している（2×nproc は「これ以上
+ * 負荷を足すと同じ器の他人のテストを time out させる」ため意図的に測っていない、
+ * との申告付き）。**これは自分の4条件の中の最悪値（13848ms）より重い**——
+ * 合成した busy-loop よりも、実際に同居している他プロセスの ambient load の
+ * ほうが悪条件になりうるということである。**この食い違いは消さず、両方を採用の
+ * 根拠に使う**: 最悪値は自分の13848msではなく、観測された中の最大値である
+ * 17730ms を採る（18000ms に切り上げ）。
+ *
+ * **倍率は最悪値の約2.5倍。** 18000ms × 2.5 = 45000ms。単発の測定はどちらも
+ * ばらつきが大きく（自分の4条件だけでも同条件で6613〜13848msの幅、マネージャーの
+ * 観測はそれをさらに上回る）、その振れ幅を考えると2.5倍は「もう1段階悪い器」を
+ * 吸収できる程度の余裕として選んだ——時間を無限に伸ばして問題を隠す発想ではなく、
+ * 実測した最悪値（複数観測者ぶんを含む）を起点にしている（`setup.test.ts` の
+ * `PREP_TIMEOUT` と同じ倍率を採用）。
+ */
+const PREP_TIMEOUT = 45_000;
+
+beforeAll(async () => {
+  scenarios = await prepareScenarios();
+}, PREP_TIMEOUT);
+
 describe('1台から3台へ増やすとき', () => {
   let r: Run;
   beforeAll(() => {
-    r = run({ total: 3 });
+    r = scenarios.scaleUpTo3;
   });
 
   it('成功したら 0 で終わる', () => {
@@ -180,6 +385,22 @@ describe('1台から3台へ増やすとき', () => {
     expect(r.apiLog).not.toContain('"startCommand":"alteroidd"');
   });
 
+  it('set_config_file の呼び出しは、GraphQL の埋め込み改行があっても1要素のまま割れない（#1101 の回帰）', () => {
+    // lib.sh の set_config_file は `railway api '<複数行の GraphQL>'` を投げる
+    // （引数の中にリテラルな改行を含む）。割れていれば「api mutation($serviceId」と
+    // 「serviceInstanceUpdate(serviceId」は別々の calls[] 要素に分かれ、同じ要素の
+    // 中に両方が現れることは無い——`some(...)` / `includes(...)` 系の歯は、割れていても
+    // 素通りする（各断片だけを見れば「含む」が言えてしまう）。ここは1要素の中に
+    // 両方が揃っているかを見ることで、割れを直接測る。
+    const configCalls = r.calls.filter(
+      (c) => c.includes('api mutation($serviceId') && c.includes('serviceInstanceUpdate(serviceId'),
+    );
+    // 写した2台（runner-2 / runner-3）ぶん、それぞれ1要素ずつ
+    expect(configCalls).toHaveLength(2);
+    expect(configCalls.some((c) => c.includes('raw-var serviceId=id-runner-2'))).toBe(true);
+    expect(configCalls.some((c) => c.includes('raw-var serviceId=id-runner-3'))).toBe(true);
+  });
+
   it('繋ぐ枝は release/prod（1台だけ main を見ると、そこだけマージで畳まれる）', () => {
     const connects = r.calls.filter((c) => c.includes('source connect'));
     expect(connects).toHaveLength(2);
@@ -199,11 +420,7 @@ describe('記憶ストアの鍵が runner に在ったとき', () => {
   // 消えた状態が台数ぶん増える。だから写さないだけでなく、そこで止まる
   let r: Run;
   beforeAll(() => {
-    r = run({
-      total: 3,
-      runnerVars: { ...RUNNER_VARS, ALTEROID_DATABASE_URL: 'postgres://user:pw@host/db' },
-      allowFailure: true,
-    });
+    r = scenarios.memoryKeyOnRunner;
   });
 
   it('非0で終わる', () => {
@@ -225,14 +442,7 @@ describe('減らそうとしたとき', () => {
   // 消すのでもなく、できないと言う**
   let r: Run;
   beforeAll(() => {
-    r = run({
-      total: 1,
-      services: [
-        ...EXISTING,
-        { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
-      ],
-      allowFailure: true,
-    });
+    r = scenarios.scaleDown;
   });
 
   it('非0で終わり、何も投入しない', () => {
@@ -247,24 +457,11 @@ describe('減らそうとしたとき', () => {
 });
 
 describe('もう3台あるとき（回し直し）', () => {
-  const attached = [
-    ...EXISTING,
-    { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
-    { id: 'id-runner-3', name: 'runner-3', source: { repo: 'takecchi/alteroid', image: null } },
-  ];
-
   it('app が既に3台を宛先にしているなら、上げ直さない', () => {
     // **回し直しても app を入れ替えない。** このスクリプトは「新しい器が上がらなかった
     // ら app に触らずに終わる」形なので、直して回し直すのが普通の使い方である。
     // 突き合わせるのは解決済みの値（`${{…}}` は展開されて返ってくる）
-    const r = run({
-      total: 3,
-      services: attached,
-      appVars: {
-        ALTEROID_RUNNER_URLS:
-          'http://runner.railway.internal:4518,http://runner-2.railway.internal:4518,http://runner-3.railway.internal:4518',
-      },
-    });
+    const r = scenarios.rerunAlreadyAttached;
     expect(r.exitCode).toBe(0);
     expect(r.calls.some((c) => c.startsWith('add'))).toBe(false);
     expect(r.calls.some((c) => c.includes('VariableCollectionUpsert'))).toBe(false);
@@ -273,11 +470,7 @@ describe('もう3台あるとき（回し直し）', () => {
 
   it('宛先が足りていなければ、器は作らず宛先だけ直す', () => {
     // 前回 app の手前で落ちた場合がこれである（器は3台在るのに宛先が1台のまま）
-    const r = run({
-      total: 3,
-      services: attached,
-      appVars: { ALTEROID_RUNNER_URL: 'http://runner.railway.internal:4518' },
-    });
+    const r = scenarios.rerunMissingDest;
     expect(r.exitCode).toBe(0);
     expect(r.calls.some((c) => c.startsWith('add'))).toBe(false);
     expect(r.vars('id-app').ALTEROID_RUNNER_URLS.split(',')).toHaveLength(3);
@@ -291,23 +484,9 @@ describe('置いた宛先の変数参照が解決されなかったとき', () =
   // デーモンはその文字列をホスト名として引きに行き、名簿は繋がらない相手へ永久に挑み
   // 続ける（回数では諦めない）。**症状は「増やしたのに委譲が来ない」という沈黙**なので、
   // 置いた側が検算しないと、器のログを追う作業になる
-  const attached = [
-    ...EXISTING,
-    { id: 'id-runner-2', name: 'runner-2', source: { repo: 'takecchi/alteroid', image: null } },
-    { id: 'id-runner-3', name: 'runner-3', source: { repo: 'takecchi/alteroid', image: null } },
-  ];
-  // 読み返しても `${{` が残っている（Railway が解決していない）状態
-  const unresolved = {
-    ALTEROID_RUNNER_URLS: [
-      'http://${{runner.RAILWAY_PRIVATE_DOMAIN}}:4518',
-      'http://${{runner-2.RAILWAY_PRIVATE_DOMAIN}}:4518',
-      'http://${{runner-3.RAILWAY_PRIVATE_DOMAIN}}:4518',
-    ].join(','),
-  };
-
   let r: Run;
   beforeAll(() => {
-    r = run({ total: 3, services: attached, appVars: unresolved, allowFailure: true });
+    r = scenarios.unresolvedVarRefs;
   });
 
   it('非0で終わり、app を上げ直さない（届かない宛先で器を入れ替えない）', () => {
@@ -328,7 +507,7 @@ describe('置いた宛先の変数参照が解決されなかったとき', () =
 
 describe('--dry-run', () => {
   it('何も作らず、何をするかだけ出す', () => {
-    const r = run({ total: 3, args: ['--dry-run'] });
+    const r = scenarios.dryRun;
     expect(r.exitCode).toBe(0);
     expect(r.calls.some((c) => c.startsWith('add'))).toBe(false);
     expect(r.calls.some((c) => c.includes('VariableCollectionUpsert'))).toBe(false);
@@ -341,11 +520,7 @@ describe('--dry-run', () => {
 
 describe('runner Service が無いプロジェクトで回したとき', () => {
   it('setup.sh を使えと言って止まる（勝手に建てない）', () => {
-    const r = run({
-      total: 3,
-      services: EXISTING.filter((s) => s.name !== 'runner'),
-      allowFailure: true,
-    });
+    const r = scenarios.noRunnerService;
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('setup.sh');
     expect(r.calls.some((c) => c.startsWith('add'))).toBe(false);

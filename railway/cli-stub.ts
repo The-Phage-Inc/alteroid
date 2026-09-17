@@ -9,7 +9,7 @@
  * （既存に足す）は同じ `railway` を叩くので、偽物を2つ持つと片方だけが本物の
  * 応答の形に追いつく。追いつけていない側は**緑のまま嘘を確かめる**。
  */
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -30,7 +30,13 @@ const path = require('path');
 const T = process.env.FAKE_STATE;
 const args = process.argv.slice(2);
 const at = (f) => path.join(T, f);
-fs.appendFileSync(at('calls.log'), args.join(' ') + '\\n');
+// **1行1呼び出しの JSONL で書く（argv をそのまま）。** かつては
+// \`args.join(' ') + '\\n'\` で書いていたが、引数にリテラルな改行が入ると
+// （\`railway api '<複数行の GraphQL>'\` がそれである）1回の呼び出しが複数行に
+// 割れ、読む側の \`split('\\n')\` が呼び出し回数を実際より多く数えていた（#1101）。
+// JSON.stringify は改行を \`\\n\`（2文字）へエスケープするので、1呼び出しは
+// 必ず1行になる。
+fs.appendFileSync(at('calls.log'), JSON.stringify(args) + '\\n');
 
 const services = () => {
   try {
@@ -93,7 +99,10 @@ switch (args[0]) {
   case 'api': {
     const v = args.find((a) => a.startsWith('@'));
     if (v) fs.appendFileSync(at('payloads.jsonl'), fs.readFileSync(v.slice(1), 'utf8') + '\\n');
-    fs.appendFileSync(at('api.log'), args.join(' ') + '\\n');
+    // api.log も calls.log と同じ理由・同じ形で JSONL にする（#1101 —
+    // \`args.join(' ') + '\\n'\` のままでは、ここに来る GraphQL の埋め込み改行が
+    // 同じように行を割る）。
+    fs.appendFileSync(at('api.log'), JSON.stringify(args) + '\\n');
     // ワークスペース一覧の問い合わせ。**既定は1つ**（テストが明示しない限り、
     // 複数ワークスペースの分岐に無関係なテストを巻き込まない）
     if (args.some((a) => a.includes('workspaces'))) {
@@ -168,6 +177,18 @@ export type Run = {
   upsertedServices: string[];
   /** `railway ssh -- alteroid credential set` で置かれた順（`set_credential`）。 */
   credentials: { service: string | undefined; name: string | undefined; value: string }[];
+  /**
+   * 呼び出しごとに1要素（`args.join(' ')`）。**1要素＝1回の CLI 起動**で、
+   * 引数にリテラルな改行が入っていても割れない。
+   *
+   * ⚠️ **かつては違った（#1101）。** 偽 CLI が `calls.log` を `args.join(' ') + '\n'`
+   * で書き、読む側が `split('\n')` するだけだったため、`railway api '<GraphQL>'` の
+   * ように引数の中に改行を含む呼び出し（`lib.sh` の `set_config_file`）が複数行に
+   * 割れ、`calls` の件数が実際の起動回数より多く出ていた（実測: 32行 / 実際28回）。
+   * いまは偽 CLI 側が JSONL（`JSON.stringify(args) + '\n'`）で書き、ここで1行＝1回
+   * として読み直すので、要素の文字列自体は以前と1バイトも変わらない
+   * （`args.join(' ')`）まま、割れなくなった。
+   */
   calls: string[];
   apiLog: string;
   stderr: string;
@@ -231,9 +252,11 @@ type Prepared = {
 };
 
 /**
- * `runScript` / `runScriptAsync` に共通する下ごしらえ（一時ディレクトリ・偽 CLI・
- * `.env`・引き継ぐ環境）。**プロセスをどう起こすか（同期 `spawnSync` か非同期
- * `spawn` か）だけが両者で違う**ので、それ以外はここと下の `finish` に寄せてある。
+ * `runScriptAsync` の下ごしらえ（一時ディレクトリ・偽 CLI・`.env`・引き継ぐ環境）。
+ * ⚠️ **かつては同期版 `runScript`（`spawnSync`）ともここを共有していた**——
+ * プロセスをどう起こすかだけが両者で違う形にしてあったが、同期版は #1100 の後で
+ * 呼ぶ場所が無くなり削った（`runScriptAsync` の直前のコメントに詳しい）。
+ * `finish`（下）と合わせて、いまは1つの呼び出し元しか無い。
  */
 function prepare(options: RunOptions): Prepared {
   const dir = mkdtempSync(join(tmpdir(), 'alteroid-railway-test.'));
@@ -264,8 +287,10 @@ function prepare(options: RunOptions): Prepared {
 }
 
 /**
- * 子プロセスが終わった後、投げられた入力と終了状態を `Run` へ組み立てる
- * （`runScript` / `runScriptAsync` 共通）。
+ * 子プロセスが終わった後、投げられた入力と終了状態を `Run` へ組み立てる。
+ * ⚠️ かつては `runScript`（同期版）とも共有していたが、その関数自体を
+ * 削った（`runScriptAsync` の直前のコメント）ので、いまの呼び出し元は
+ * `runScriptAsync` だけである。
  */
 function finish(options: RunOptions, prepared: Prepared, exitCode: number, stderr: string): Run {
   options.onEnvFile?.(prepared.envFile);
@@ -308,47 +333,45 @@ function finish(options: RunOptions, prepared: Prepared, exitCode: number, stder
     touched: (serviceId) => payloads.some((p) => p.serviceId === serviceId),
     upsertedServices: payloads.map((p) => p.serviceId),
     credentials,
-    calls: read('calls.log').split('\n').filter(Boolean),
-    apiLog: read('api.log'),
+    // JSONL（1行1呼び出し）を読み戻す。各要素の文字列は旧形式（`args.join(' ')`）と
+    // 1バイトも変わらない——変わるのは「改行を含む呼び出しでも割れない」ことだけ
+    // （上の `calls` の doc コメント、#1101）。
+    calls: read('calls.log')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => (JSON.parse(line) as string[]).join(' ')),
+    // `apiLog` は `toContain` / `match` で丸ごと1つの文字列として使われているので、
+    // 復元した中身は旧形式（各呼び出しを `args.join(' ')` にして `\n` で繋ぎ、
+    // 空でなければ末尾に `\n`）と1バイトも変わらないようにする。
+    apiLog: (() => {
+      const records = read('api.log')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => (JSON.parse(line) as string[]).join(' '));
+      return records.length > 0 ? records.join('\n') + '\n' : '';
+    })(),
     stderr,
     exitCode,
   };
 }
 
 /**
- * スクリプトを1回走らせ、投げられた入力と終了状態を返す（同期）。
+ * スクリプトを1回走らせ、投げられた入力と終了状態を返す（非同期、`spawn`）。
  *
- * ⚠️ **`scale-runners.test.ts` はこちらを使い続けている。** 非同期版
- * （`runScriptAsync`、下）を足したのは `setup.test.ts` の準備段を並行化するため
- * で、同期版を無くす理由にはならない——呼び出し側を書き換えるのはそちら側の
- * 仕事であって、この足場の役目ではない。
- */
-export function runScript(options: RunOptions): Run {
-  const prepared = prepare(options);
-
-  // **`spawnSync` である（`execFileSync` ではない）。** `execFileSync` は成功したときに
-  // stdout しか返さず、stderr は例外の中にしか入らない。この2つのスクリプトは進捗も
-  // 警告も**全部 stderr へ出す**（値を `$(…)` で受けるため）ので、成功した実行の
-  // stderr が取れないと「何をすると言ったか」を確かめるテストが**空文字と比べて
-  // 静かに通る**（`--dry-run` が何も出していなくても緑になる、が実際に出た）
-  const result = spawnSync('bash', [join(RAILWAY_DIR, options.script), ...options.args], {
-    env: prepared.env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    encoding: 'utf8',
-  });
-
-  if (result.error) throw result.error;
-  return finish(options, prepared, result.status ?? 1, result.stderr ?? '');
-}
-
-/**
- * `runScript` の非同期版（`spawn`）。**足した理由は `setup.test.ts` の準備段（28回
- * ぶんの `setup.sh` 実行）を直列ではなく並行に走らせるため**である（#1093 —
- * 直列に起こすと、器が混んでいる時間だけ `it` の所要時間が伸びて
- * `testTimeout` を超える）。
+ * **足した理由は `setup.test.ts` の準備段（28回ぶんの `setup.sh` 実行）を
+ * 直列ではなく並行に走らせるため**である（#1093 — 直列に起こすと、器が
+ * 混んでいる時間だけ `it` の所要時間が伸びて `testTimeout` を超える）。
  *
- * 下ごしらえ（`prepare`）と結果の組み立て（`finish`）は同期版と共有する。
- * 違うのは子プロセスをどう待つかだけである。
+ * ⚠️ **かつては同期版（旧 `runScript`、`spawnSync` を使うもの）も在った。**
+ * `scale-runners.test.ts` が `it` の中で直接スクリプトを起こしていた間は
+ * そちらを使い続けていたが、#1100 でその呼び出しを全部 `prepareScenarios`
+ * （`runLimited` による並行実行）へ寄せたことで、**同期版を呼ぶ箇所が
+ * リポジトリ全体から無くなった**（削る直前の実測 2026-09-16: 呼び出し側の
+ * 検索は0件、当たったのは定義行そのものだけだった）。使う側が無いまま残すと
+ * 「使われている」という嘘の手がかりを次に読む人へ渡すことになるので、ここで
+ * 削った。**下ごしらえ（`prepare`）と結果の組み立て（`finish`）は元から同期版と
+ * 非同期版で共有していたヘルパーで、削ったのは `spawnSync` を呼ぶ薄い皮だけ
+ * である**——挙動の変更は無い。
  */
 export function runScriptAsync(options: RunOptions): Promise<Run> {
   const prepared = prepare(options);
