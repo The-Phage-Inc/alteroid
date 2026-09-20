@@ -6200,6 +6200,242 @@ describe('クローン — ターンの失敗の跡', () => {
   });
 });
 
+/**
+ * **枠（利用上限）に当たり続けて1度も成功しないセッションは、文脈窓のときと
+ * 同じ手当てで畳んで作り直す**（Issue #1240）。
+ *
+ * ## 何が壊れていたか
+ *
+ * `#usageBlocked` が立っている間、新しい合図（tick 等）が届くたびに保持分を
+ * 1回だけ再試行する設計そのもの（`post()` の「1合図につき1試行」）は直して
+ * いない。**壊れていたのは、その再試行が同じ理由（枠）で失敗し続けても、
+ * 資源の持ち越し（`composeTurnInputText` の8本＝配り直し・上書き・鮮度・
+ * 切り詰め・未了の台帳・いまの全体の状況の断り書き＋本文）が無条件に同じ
+ * セッションへ積み上がり続けていたことである。** 文脈窓で落ちたとき専用の
+ * 畳み直し（`#noteContextWindowFold` / #553）は失敗メッセージの文言分類
+ * （`classifyContextWindowFailure`）を待つが、枠が閉じている間は
+ * compaction 自体が API 呼び出しなので、「長すぎる」と教えてくれる合成
+ * メッセージ自体が429で生成できず、実測が来ないまま持ち越しが伸び続ける。
+ *
+ * ## 直した後
+ *
+ * `#usageBlockedAccumulatedChars`（このセッションで1度も答えを返さないまま
+ * `#pushInput` へ積んだ文字数の合計）が既定の閾値
+ * （`UNPRODUCTIVE_USAGE_BLOCK_FOLD_CHAR_THRESHOLD`。実装は 200,000）に
+ * 達したら、`#noteContextWindowFold` と同じ `#recycleForContextWindow` を
+ * 使って畳む——文脈窓の実測を待たない。
+ *
+ * ## なぜ回数ではなく文字数で駆動するか
+ *
+ * **最初の版は「連続で当たった回数」で閾値を決めていて、既存の回帰テスト
+ * （`クローン — 枠で保持している間、中身を持たない合図で在庫を作らない` の
+ * 歯2・歯3、`クローン — 枠で保持している間、人間へ返す1行を積み上げない` の
+ * 歯1〜3）を壊した。** それらは「小さい本文の合図が3〜5回届いても、同じ
+ * セッションが受け切り続ける」ことを固定した歯である。回数で畳むと、その
+ * 小さい再試行数と本物の事故の再試行数が同じ桁になり、閾値をテストが壊れ
+ * ない大きさまで上げると本物の事故を1回も捕まえられなくなる。**⟹ 文字数へ
+ * 直した。** 大きな本文（`BIG_BODY`。1本 90,000 文字）を使って、**この
+ * describe が測りたいものだけ**を踏む。
+ */
+describe('クローン — 枠に当たり続けたセッションは畳んで作り直す（Issue #1240）', () => {
+  const spendLimitMessage = "You've hit your individual spend limit for this account.";
+
+  /**
+   * 1本 90,000 文字。**閾値（200,000）に対して選んだ大きさ**——2本
+   * （起点＋再試行1回。180,000文字）では届かず、3本（起点＋再試行2回。
+   * 270,000文字）で確実に超える。実際に積まれるのはこれに断り書き（`redelivery`
+   * 等）が足された分なのでもっと大きいが、逆方向の余裕（2本で届いてしまう）
+   * は無い——断り書きぶんは無視できるほど小さい。
+   */
+  const BIG_BODY = 'x'.repeat(90_000);
+
+  /** 「枠の解除を試す」旨の日誌の行数（＝解除を試した回数そのもの）。 */
+  async function releaseAttemptCount(stores: Stores): Promise<number> {
+    const rows = (await stores.journal.list({ types: ['exchange'] })) as { text: string }[];
+    return rows.filter((entry) => entry.text.includes('枠の解除を試す')).length;
+  }
+
+  async function waitForReleaseAttempts(stores: Stores, expected: number): Promise<void> {
+    await waitFor(
+      async () => (await releaseAttemptCount(stores)) === expected,
+      `解除の試行が${String(expected)}回になる`,
+    );
+  }
+
+  /** 発意 tick を1本作る。中身は無く、届いたこと自体が再試行を誘発する。 */
+  function tick(id: string): InboxEvent {
+    return { type: 'self_initiative', id, at: new Date().toISOString(), reason: 'テスト用tick' };
+  }
+
+  /**
+   * 「`BIG_BODY` の発言 → 枠に当たる（1本ぶん）→ tick → 再試行して枠に当たる
+   * （2本ぶん。まだ閾値未満）」まで進める共通の下ごしらえ。**3本目
+   * （閾値超え）は呼び出し側が明示的に足す**——「2本では畳まない」ことを
+   * 確かめる歯と共有するための切り方である。
+   */
+  async function driveToTwoAccumulations(stores: Stores, s: Setup): Promise<void> {
+    s.clone.post(humanMessage(BIG_BODY));
+    await waitFor(() => s.clone.usageBlocked, '1回目で枠に当たって保持される');
+
+    s.clone.post(tick('evt-si-1'));
+    await waitForReleaseAttempts(stores, 1);
+    await waitFor(() => s.clone.usageBlocked, '再試行1回目もまた枠に当たる');
+  }
+
+  it('2本ぶん（180,000文字。閾値未満）までは畳まない。resume 素材は残る', async () => {
+    const stores = createMemoryStores();
+    const s = setup(undefined, stores, {
+      resultSubtype: 'error_during_execution',
+      resultText: spendLimitMessage,
+    });
+
+    // **⭐ ここが直す前は赤くならない対照——閾値未満では畳まれない。**
+    await driveToTwoAccumulations(stores, s);
+    expect(await stores.sessions.getCloneSessionId()).not.toBeNull();
+
+    await s.clone.stop();
+  });
+
+  it('3本ぶん（270,000文字。閾値超え）で、resume 素材を捨てて次は新しいセッションで走る', async () => {
+    const stores = createMemoryStores();
+    const s = setup(undefined, stores, {
+      resultSubtype: 'error_during_execution',
+      resultText: spendLimitMessage,
+    });
+
+    await driveToTwoAccumulations(stores, s);
+
+    // 3本目（270,000文字 ⟹ 閾値 200,000 を超える）。
+    s.clone.post(tick('evt-si-2'));
+    await waitForReleaseAttempts(stores, 2);
+
+    // **⭐ ここが本体。** 積算が閾値を超えた時点で、次の境界のために resume
+    // 素材が捨てられている（畳んだ後ではなく、印と同時——`#noteContextWindowFold`
+    // と同じ形）。
+    await waitFor(
+      async () => (await stores.sessions.getCloneSessionId()) === null,
+      '積算が閾値を超え、resume 素材が捨てられる',
+    );
+
+    // 次のターンは新しいセッションで走る（`calls.length` が増える）。
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    s.clone.post(tick('evt-si-3'));
+    await waitFor(() => s.calls.length > 1, '新しいセッションが開くこと');
+    await s.clone.stop();
+
+    expect(s.calls.length).toBeGreaterThan(1);
+  });
+
+  /**
+   * **成功したら積算は0へ戻る**（`#usageBlockedAccumulatedChars` の doc）。
+   *
+   * ## この歯が居ないと何が起きるか（変異試験で確かめた。段4 に生出力を残す）
+   *
+   * `turn_ended` の成功枝で積算を戻す1行を消す変異を手で当てたところ、
+   * **他の365本は1本も落ちなかった**（この歯を足す前は366本中0本がここを
+   * 守っていた）。理由は単純で、既存の回帰テストはどれも「枠に当たり続ける
+   * だけ」か「最初から成功し続ける」かのどちらかで、**「一度成功してから
+   * また枠に当たる」を跨ぐテストが1本も無かった**——このリポジトリの流儀
+   * （AGENTS.md「Issue の『確かめていないこと』は…仕事の指定である」）に
+   * ならい、見つかった穴をここで埋める。
+   */
+  it('成功すると積算は0へ戻る——前の枠当たりの分を次の枠当たりへ持ち越さない', async () => {
+    const stores = createMemoryStores();
+    // **回数ではなく可変フラグで駆動する**（歯2「中身を持つ合図…」と同じ形）。
+    // `resultFor` は本セッションのターンだけでなく `sideQuery`（蒸留）からも
+    // 呼ばれうる（`fakeSdk` は文字列プロンプトでは常に `turnIndex=0` で呼ぶ）
+    // ので、通し番号で「何本目か」を数えると側道の呼び出しに数字がずれる。
+    // フラグなら、成功させたい1回の直前だけ立てて直後に降ろせるので、side
+    // query が紛れ込んでも影響しない。
+    let succeedNow = false;
+    const s = setup(undefined, stores, {
+      resultFor: () =>
+        succeedNow
+          ? { subtype: 'success', text: 'わかった' }
+          : { subtype: 'error_during_execution', text: spendLimitMessage },
+    });
+
+    // 1本目の枠当たり: 180,000文字ぶん積む（まだ閾値未満）。
+    await driveToTwoAccumulations(stores, s);
+    const inputsSoFar = (s.calls[0] as FakeCall).inputs.length;
+
+    // 解除させる（保持していた1本目の発言＝`BIG_BODY` が再試行され、
+    // `succeedNow` が真なのでそれは成功する。**再試行の中身がどう転んでも
+    // 構わない**——`succeedNow` が真のあいだは何が来ても成功するので、
+    // 「1度でも成功が挟まったら積算が0へ戻るか」だけを測れる作りである。
+    succeedNow = true;
+    s.clone.post(tick('evt-si-2'));
+    await waitFor(() => !s.clone.usageBlocked, '解除された発言が成功し、枠が解ける');
+    // 成功の帰結（`#usageBlocked === null`）が届いた直後は、まだ同じ受信箱の
+    // 反復のうちに残った合図（tick 自身の内部ターンなど）が処理され続けて
+    // いることがある。**次の枠当たりを起こす前に、静まるまで少し待つ**
+    // ——でないと、いま数えたいのとは別の要因で `s.calls[0].inputs` が
+    // 動き続け、次の測定の基準がぶれる。
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    succeedNow = false;
+    expect(await stores.sessions.getCloneSessionId()).not.toBeNull();
+
+    // 2本目の枠当たり: 新しい `BIG_BODY`（90,000文字）だけを持つ発言を送る。
+    // **リセットされていれば、これ単独（約90,000文字）はまだ閾値
+    // 200,000未満のはず。** 直す前の変異（成功でリセットしない）なら、
+    // 1本目の 180,000文字余り（＋解除の途中で積まれた分）にこれが上乗せ
+    // され、**この1本の失敗の時点で**閾値を超えて畳まれてしまう
+    // （畳みの判定は `#noteUsageNotice` の中、そのターンの失敗の瞬間に
+    // 行われる——`#noteUnproductiveUsageBlockFold` の doc）。
+    s.clone.post(humanMessage(BIG_BODY));
+    await waitFor(() => s.clone.usageBlocked, '2本目の枠当たり: 新しい発言だけで枠に当たる');
+
+    // **⭐ ここが本体。** リセットされていれば、この1本（約90,000文字）だけ
+    // では畳まれていない（resume 素材が残っている）。
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(await stores.sessions.getCloneSessionId()).not.toBeNull();
+    // 参考: 実際に新しい入力が積まれたことも確かめる（測定が空振りでない証拠）。
+    expect((s.calls[0] as FakeCall).inputs.length).toBeGreaterThan(inputsSoFar);
+
+    await s.clone.stop();
+  });
+
+  it('畳んだ理由を「枠」だと人間へ言う（文脈窓だとは言わない。記録は消えたと言わない）', async () => {
+    const stores = createMemoryStores();
+    const s = setup(undefined, stores, {
+      resultSubtype: 'error_during_execution',
+      resultText: spendLimitMessage,
+    });
+
+    await driveToTwoAccumulations(stores, s);
+    s.clone.post(tick('evt-si-2'));
+    await waitForReleaseAttempts(stores, 2);
+    await waitFor(
+      async () => (await stores.sessions.getCloneSessionId()) === null,
+      '積算が閾値を超え、resume 素材が捨てられる',
+    );
+
+    const rows = (await stores.journal.list({ types: ['exchange'], with: ['human'] })) as {
+      role: string;
+      text: string;
+    }[];
+    // **`#reportFailure` が書く1行だけを採る**（`with: 'human'` の outbound には
+    // ターン失敗前に出ていた本文の控えも載るので、それと混同しない——
+    // 「文脈窓で落ちたら…」の `lastToHuman` と同じ絞り方）。
+    // **`journal.list()` は新しい順（降順）で返す** —— 直前の走査で確かめた
+    // （最初に受理した発言の inbound 行が配列の最後に出る）。⟹ 最新の
+    // 1件は `[0]` である。
+    const outbound = rows.filter(
+      (row) => row.role === 'outbound' && row.text.startsWith('いま利用上限に当たっているので'),
+    );
+    const last = outbound[0];
+    await s.clone.stop();
+
+    expect(last?.text).toContain('次の発言から新しく開き直す');
+    // **原因は枠であって長さではない——文脈窓の断り書きを流用しない。**
+    expect(last?.text).toContain('枠（利用上限）');
+    // **⛔ 消えていないものを消えたことにしない**（`CONTEXT_WINDOW_FOLD_NOTICE`
+    // と同じ約束）。
+    expect(last?.text).toContain('消えていない');
+    expect(last?.text).not.toContain('失われ');
+  });
+});
+
 describe('クローン — 考えている合図（thinking）', () => {
   /**
    * `fakeSdk` は assistant(text) → result の1本道しか流せず、tool_use /
