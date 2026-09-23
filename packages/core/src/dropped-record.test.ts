@@ -526,14 +526,36 @@ describe('落とした記録の跡', () => {
       text: secret,
     });
 
-    expect(shape).toBe(
-      'token_rotation event=recovered signal=reached reason=turn_succeeded ' +
-        'freshness=current tokenId=ap-1 ' +
-        'fromTokenId=mgr-1 generation=3 earliestAt=2026-08-20T00:00:00.000Z ' +
-        'cooldownSource=quota_reset ' +
-        `recoveredSource=account_probe label.chars=${labelValue.length} ` +
-        `noticeText.chars=${noticeValue.length} chars=${secret.length}`,
-    );
+    // 13欄それぞれを独立した `expect.soft` にする（#1397 の c27-1）。元は
+    // 1本の `toBe` が13欄すべての保証を単独で持っていた——ある1欄だけが
+    // 壊れても、落ちる歯は常にこの1本だけで、どの欄が壊れたかは diff を
+    // 読むまで分からなかった。
+    //
+    // **元の `toBe` の保証は1つも落とさない。** 跡を空白で区切り、先頭の型名と
+    // 13欄を**位置ごとに** `toBe` で見て、区切った数も1本で固定する。
+    // ⟹ 「各位置が一致し、かつ数が一致する」は「全体が一致する」と同値である
+    // （欄の並び順・余分な断片・空白の重複も、元の `toBe` と同じく赤くなる）。
+    // そのうえで、1欄の値だけが壊れれば、その位置の1本だけが赤くなる。
+    //
+    // `expect`（fail-fast）ではなく `expect.soft` を使う——fail-fast だと
+    // 先頭に近い欄が壊れたとき後続の `expect` が実行されず、「他の欄は緑」を
+    // 確かめられない。値は元の `toBe` から機械的に写した。
+    const parts = shape.split(' ');
+    expect.soft(parts).toHaveLength(14);
+    expect.soft(parts[0]).toBe('token_rotation');
+    expect.soft(parts[1]).toBe('event=recovered');
+    expect.soft(parts[2]).toBe('signal=reached');
+    expect.soft(parts[3]).toBe('reason=turn_succeeded');
+    expect.soft(parts[4]).toBe('freshness=current');
+    expect.soft(parts[5]).toBe('tokenId=ap-1');
+    expect.soft(parts[6]).toBe('fromTokenId=mgr-1');
+    expect.soft(parts[7]).toBe('generation=3');
+    expect.soft(parts[8]).toBe('earliestAt=2026-08-20T00:00:00.000Z');
+    expect.soft(parts[9]).toBe('cooldownSource=quota_reset');
+    expect.soft(parts[10]).toBe('recoveredSource=account_probe');
+    expect.soft(parts[11]).toBe(`label.chars=${labelValue.length}`);
+    expect.soft(parts[12]).toBe(`noticeText.chars=${noticeValue.length}`);
+    expect.soft(parts[13]).toBe(`chars=${secret.length}`);
     // 自由文欄に入れた値そのものは跡に現れない
     expect(shape).not.toContain(labelValue);
     expect(shape).not.toContain(noticeValue);
@@ -1163,14 +1185,25 @@ describe('droppedTraceLedgerSince（帳面が数え始めた時刻）', () => {
  *    辿る仕組みではない。** 自動で辿る形にしなかったのは #981 の選択肢
  *    (B)（門を再帰的に掛ける）を採らなかったのと同じ理由——新しい欄が
  *    「黙って出る」側へ倒れる形を作らないためである。
- * 3. **13欄すべての保証は、いまも既存の `toBe` 1本が単独で持っている。**
- *    `token_rotation` の3つの変異（`recoveredSource` / `generation` /
- *    `noticeText` を落とす）で赤くなったのは、足場の印に反応した歯を差し引くと
- *    **同じ1本だけ**だった——`落とした記録の跡 > token_rotation は tag 欄と
- *    size 欄が混在し、全欄が載ると跡もそれを反映する`。**単独で殺せる歯が1本で、
- *    群でしか落ちない歯は0本である。** ⟹ **この名簿の歯は、そこを肩代わりしない**
- *    （名簿が見るのは目印が出るかまでで、13欄が*その順で・その値で*出ることは
- *    見ていない）。**この `toBe` が緩められた日に、13欄の保証が同時に消える。**
+ * 3. **（このPRで直した。#1397 の c27-1）13欄すべての保証は、かつて既存の
+ *    `toBe` 1本が単独で持っていた。** `token_rotation` の3つの変異
+ *    （`recoveredSource` / `generation` / `noticeText` を落とす）で赤くなった
+ *    のは、足場の印に反応した歯を差し引くと**同じ1本だけ**だった——`落とした
+ *    記録の跡 > token_rotation は tag 欄と size 欄が混在し、全欄が載ると跡も
+ *    それを反映する`。**単独で殺せる歯が1本で、群でしか落ちない歯は0本
+ *    だった。** ⟹ 「歯が足りない」ではなく「歯の集中」だったので、数を
+ *    増やすのではなく、この1本の `toBe` を、跡を空白で区切った**位置ごとの**
+ *    `expect.soft(parts[i]).toBe(...)`（直下の `it` 本体）と、区切った数を
+ *    固定する1本へ分割した——値は元の `toBe` から機械的に写しており、
+ *    「各位置が一致し、かつ数が一致する」は元の「全体が一致する」と同値
+ *    である（欄の並び順・余分な断片も、元と同じく赤くなる）。
+ *    `expect`（fail-fast）ではなく `expect.soft` を使うのは、先頭に近い欄が
+ *    壊れたときに後続の `expect` が実行されなくなる（＝「他の欄は緑」と
+ *    言えなくなる）ことを避けるため。**いまは、13欄それぞれが単独で殺せる
+ *    歯になっている**（1欄の値だけを壊す変異を当てると、その位置の
+ *    `expect.soft` 1本だけが赤くなる——生の実行結果は PR 本文にある）。
+ *    ⟹ **この名簿の歯は、いまもそこを肩代わりしない**（名簿が見るのは目印が
+ *    出るかまでで、13欄が*その順で・その値で*出ることは見ていない）。
  * 4. **`size-unnamed` の判定（`/(?:^| )chars=\d+/u`）は、`tag()` を通した
  *    別の欄の値がたまたま（または実行時検査を通らない壊れた値として）
  *    `chars=<数字>` という文字列を運んでいると、それを本物の `size-unnamed`
