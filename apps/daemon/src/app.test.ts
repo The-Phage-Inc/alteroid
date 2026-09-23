@@ -46,7 +46,11 @@ import { createApp, parseAllowedOrigins } from './app.js';
 import { encodeCursor } from './cursor.js';
 import type { AuthPlan } from './auth.js';
 import { createJournalBus, type JournalBus } from './journal-bus.js';
-import { scheduleStatusSchema } from './openapi.js';
+import {
+  practiceListResponseSchema,
+  practiceReadResponseSchema,
+  scheduleStatusSchema,
+} from './openapi.js';
 import { startUsagePolling } from './usage-poller.js';
 
 /** クローンの代わり。HTTP 層だけを検証する。 */
@@ -608,6 +612,142 @@ describe('HTTP API', () => {
 
   it('存在しない記憶は 404', async () => {
     expect((await app.request('/memory/nope')).status).toBe(404);
+  });
+
+  /**
+   * 仕事のやり方（PracticeStore、#1055 段3③）。`記憶` の HTTP 口
+   * （`GET`/`PUT`/`DELETE /memory(/:slug)`）と対をなす、人間の3つ目の入口。
+   *
+   * **⛔ `apply` / `enforce` に当たる経路は無い。** 読み書き一覧の3操作
+   * （list/read/write/remove）しか無いことを、この一群のテストで踏む。
+   */
+  it('やり方を API から読んで書き換えられる（人間の3入口の1つ）', async () => {
+    await stores.practices.write({
+      slug: 'daily-report',
+      kind: '日報',
+      title: 'もとの題',
+      content: 'もとの内容',
+    });
+
+    const list = await app.request('/practices');
+    expect(await list.json()).toMatchObject({
+      practices: [{ slug: 'daily-report', kind: '日報', title: 'もとの題' }],
+    });
+
+    const put = await app.request('/practices/daily-report', {
+      ...json({ kind: '日報', title: '書き直した題', content: '人間が API から書き換えた' }),
+      method: 'PUT',
+    });
+    expect(put.status).toBe(200);
+
+    const read = await app.request('/practices/daily-report');
+    const body = (await read.json()) as { practice: { content: string; title: string } };
+    expect(body.practice.content).toContain('人間が API から書き換えた');
+    expect(body.practice.title).toBe('書き直した題');
+
+    // 人間による書き換えも日誌に残る（`practice_write` クローンの道具と
+    // 同じ type: 'decision' に揃えてある——PracticeStore は memory の
+    // `markHumanTouched` に当たる保護状態を持たないため）。
+    const entries = await stores.journal.list({ types: ['decision'] });
+    expect(entries[0]).toMatchObject({
+      decision: expect.stringContaining('daily-report') as unknown as string,
+      grounds: expect.stringContaining('人間が直接 API から') as unknown as string,
+    });
+  });
+
+  it('PUT /practices/:slug は無ければ作る（全文置換）', async () => {
+    const put = await app.request('/practices/new-one', {
+      ...json({ kind: '調査', title: '新しいやり方', content: '本文' }),
+      method: 'PUT',
+    });
+    expect(put.status).toBe(200);
+
+    const read = await app.request('/practices/new-one');
+    expect(await read.json()).toMatchObject({
+      practice: { slug: 'new-one', kind: '調査', title: '新しいやり方', content: '本文\n' },
+    });
+  });
+
+  it('kind が空だと 400（practiceKindSchema の min(1)）', async () => {
+    const put = await app.request('/practices/bad-kind', {
+      ...json({ kind: '', title: '題', content: '本文' }),
+      method: 'PUT',
+    });
+    expect(put.status).toBe(400);
+  });
+
+  /**
+   * **`GET /practices` / `GET /practices/:slug` の応答が、`describeRoute` へ
+   * 渡した OpenAPI 応答スキーマの形と実際に一致することを検算する。**
+   *
+   * ⚠️ この2つのハンドラは（`memory` の GET と同じく）応答を作る前に
+   * `practiceListResponseSchema.parse()` / `practiceReadResponseSchema.parse()`
+   * を通していない——`hono-openapi` の `resolver()` は spec 生成にしか使われず、
+   * 実行時の応答を検証しない。⟹ `openapi.ts` 側の宣言スキーマからフィールドを
+   * 落としても（例: `practiceReadResponseSchema` を `practiceSchema` から
+   * `practiceMetaSchema` へ差し替えて `content` を落とす）、ハンドラの実際の
+   * 応答は1文字も変わらないので、他のどのテストも落ちない
+   * （変異試験で確認済み——`.parse()` を通さない GET の宣言スキーマは
+   * ノーガードだった）。**このテストが無い状態では、その差し替えは緑のまま
+   * 通っていた。**
+   */
+  it('GET /practices(/:slug) の実際の応答は、宣言した OpenAPI 応答スキーマの形と一致する', async () => {
+    await stores.practices.write({
+      slug: 'shape-check',
+      kind: '実装',
+      title: '形の検算用',
+      content: '本文',
+    });
+
+    const list = await app.request('/practices');
+    const parsedList = practiceListResponseSchema.parse(await list.json());
+    expect(parsedList.practices[0]).toMatchObject({ slug: 'shape-check' });
+
+    const read = await app.request('/practices/shape-check');
+    const parsedRead = practiceReadResponseSchema.parse(await read.json());
+    // **ここが本題。** `.parse()` は宣言していない余剰フィールドを黙って
+    // 落とすので（zod の既定挙動）、`practiceReadResponseSchema` が
+    // `practiceMetaSchema`（`content` を持たない）に差し替わっていても
+    // `.parse()` 自体は例外を投げない——投げないことではなく、パース後の
+    // 値に `content` が生き残っているかで検算する。
+    expect(parsedRead.practice.content).toBe('本文\n');
+  });
+
+  it('不正な slug は 400', async () => {
+    const put = await app.request('/practices/Not_Valid_SLUG!', {
+      ...json({ kind: '実装', title: '題', content: '本文' }),
+      method: 'PUT',
+    });
+    expect(put.status).toBe(400);
+  });
+
+  it('存在しないやり方は 404', async () => {
+    expect((await app.request('/practices/nope')).status).toBe(404);
+  });
+
+  it('DELETE /practices/:slug で消せて、日誌に残る', async () => {
+    await stores.practices.write({
+      slug: 'to-remove',
+      kind: '実装',
+      title: '消される予定',
+      content: '本文',
+    });
+
+    const del = await app.request('/practices/to-remove', { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect(await del.json()).toEqual({ ok: true, slug: 'to-remove' });
+
+    expect((await app.request('/practices/to-remove')).status).toBe(404);
+
+    const entries = await stores.journal.list({ types: ['decision'] });
+    expect(entries[0]).toMatchObject({
+      decision: expect.stringContaining('to-remove') as unknown as string,
+      grounds: '人間が直接 API からやり方を消した',
+    });
+  });
+
+  it('やり方が無い状態での DELETE は 404（クローンの道具の冪等とは違う——HTTP は memory と同じ形）', async () => {
+    expect((await app.request('/practices/never-existed', { method: 'DELETE' })).status).toBe(404);
   });
 
   it('日誌を読める（可観測性の中段）', async () => {
