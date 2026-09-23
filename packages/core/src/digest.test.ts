@@ -8,6 +8,7 @@ import {
   describeUnobservedOutcome,
   DIGEST_JOURNAL_SCAN_LIMIT,
   DIGEST_RETAIN_LIMIT,
+  DIGEST_SOURCE_TALLY_LIMIT,
   isManagerAwaitingJudgement,
   isManagerOutcomeUnobserved,
   MAX_ITEMS,
@@ -1223,14 +1224,24 @@ describe('上限で切ったことを黙らない', () => {
 
 /**
  * Issue #783: 「外部イベント: 15,047 件」は日誌の行数までしか言えず、どの発行元
- * （source）が何件かが分からないので原因へ降りる経路が無かった。ここで測るのは
- * `buildActivityDigest` が発行元別に件数・本文の種類（`summary` の完全一致）・
- * 最頻本文の件数を正しく出し、既存の個別行・`omitted()` 行を消していないこと。
+ * （source）が何件かが分からないので原因へ降りる経路が無かった。
+ *
+ * ## 2つの母数を混ぜない
+ *
+ * `buildActivityDigest` は発行元別の内訳を**2つの別ブロック**で出す——
+ * (1) `createSourceTally` による**正確な総数**（`externalsCount` と同じ母数。
+ * ただし追跡する source の異なり数に `DIGEST_SOURCE_TALLY_LIMIT` の上限がある）
+ * と、(2) `summarizeExternalSources` による**保持した標本**（`externals` =
+ * `externalBucket.retained`。`DIGEST_RETAIN_LIMIT` で頭打ち）の中の「本文の
+ * 種類・最頻件数」。ここで測るのは、この2つがそれぞれ正しいこと・既存の
+ * 個別行と `omitted()` 行を消していないこと・**上限を2種類（表示件数の
+ * `MAX_ITEMS`、追跡する発行元数の `DIGEST_SOURCE_TALLY_LIMIT`）とも正しく
+ * 扱っていること**である。
  */
 describe('届いた外部イベント — 発行元（source）別の内訳（#783）', () => {
   const since = () => new Date(Date.now() - 60_000);
 
-  it('同じ source の同じ summary が複数件あるとき、件数・本文の種類・最頻件数が正しい', async () => {
+  it('同じ source の同じ summary が複数件あるとき、正確な件数（source tally）と本文の形（保持した標本）がそれぞれ正しい', async () => {
     const stores = createMemoryStores();
     // source=ci: 「落ちた」が3件、「直った」が1件 ⟹ 4件・本文2種・最頻3件。
     await stores.journal.append({ type: 'external_event', source: 'ci', summary: '落ちた' });
@@ -1242,14 +1253,18 @@ describe('届いた外部イベント — 発行元（source）別の内訳（#7
 
     const digest = await buildActivityDigest(stores, { since: since() });
 
-    expect(digest).toContain('- ci: 4 件（同じ本文は 2 種。最も多い1種が 3 件）');
-    expect(digest).toContain('- webhook: 1 件（同じ本文は 1 種。最も多い1種が 1 件）');
+    // (1) 正確な総数（source tally ブロック）。
+    expect(digest).toContain('- ci: 4 件');
+    expect(digest).toContain('- webhook: 1 件');
+    // (2) 保持した標本の中の「本文の形」（別ブロック。件数は含まない）。
+    expect(digest).toContain('- ci: 同じ本文は 2 種。最も多い1種が 3 件');
+    expect(digest).toContain('- webhook: 同じ本文は 1 種。最も多い1種が 1 件');
     // **既存の個別行が消えていないこと。**
     expect(digest).toContain('- ci: 落ちた');
     expect(digest).toContain('- webhook: ping');
   });
 
-  it('発行元が MAX_ITEMS を超えたとき、内訳側にも omitted() の行が出る', async () => {
+  it('発行元が MAX_ITEMS を超えたとき、個別行の省略と「本文の形」側の省略が両方出る', async () => {
     const stores = createMemoryStores();
     const total = MAX_ITEMS + 3; // 18種の発行元、各1件。
     for (let i = 0; i < total; i += 1) {
@@ -1262,12 +1277,17 @@ describe('届いた外部イベント — 発行元（source）別の内訳（#7
 
     const digest = await buildActivityDigest(stores, { since: since() });
 
-    // **既存の個別行の省略と、内訳側の省略が両方出る。** どちらも
+    // **既存の個別行の省略と、「本文の形」側の省略が両方出る。** どちらも
     // total=18・shown=15 なので同じ「…ほか 3 件」という部分文字列が2回出る
     // （行の続きの文言は違う——`omitted()` の `where` 引数が違うので全文としては
-    // 別の行である）。2回出ることそのものを測る。
+    // 別の行である）。2回出ることそのものを測る。**正確な総数側（source
+    // tally）は `omitted()` を使わず「その他: N 件（M の発行元）」という別の
+    // 文言で畳むので、ここには数えない。**
     const occurrences = digest.split('…ほか 3 件').length - 1;
     expect(occurrences).toBe(2);
+    // 正確な総数側は18発行元・各1件・MAX_ITEMS=15 なので、残り3発行元・3件が
+    // 「その他」へ畳まれる。
+    expect(digest).toContain('- その他: 3 件（3 の発行元）');
   });
 
   it('既存の個別行と「…ほか N 件」が消えていない', async () => {
@@ -1289,6 +1309,192 @@ describe('届いた外部イベント — 発行元（source）別の内訳（#7
     expect(digest).toContain(`- ci: 届いた ${total - 1}`);
     expect(digest).toContain('…ほか 2 件');
     expect(digest).toContain('発行元（source）別の件数');
+  });
+
+  it('内訳（source tally）の合計が、外部イベントの正確な総数（externalsCount）と一致する（上限に当たらない場合）', async () => {
+    const stores = createMemoryStores();
+    // 5発行元・件数 5,4,3,2,1（合計15）。DIGEST_SOURCE_TALLY_LIMIT にも
+    // MAX_ITEMS にも当たらない。
+    const counts = [5, 4, 3, 2, 1];
+    for (const [i, count] of counts.entries()) {
+      for (let j = 0; j < count; j += 1) {
+        await stores.journal.append({
+          type: 'external_event',
+          source: `src-${i}`,
+          summary: `evt-${i}-${j}`,
+        });
+      }
+    }
+    const total = counts.reduce((sum, count) => sum + count, 0);
+
+    const digest = await buildActivityDigest(stores, { since: since() });
+
+    expect(digest).toContain(`外部イベント（日誌 external_event の行数）: ${total} 件`);
+    for (const [i, count] of counts.entries()) {
+      expect(digest).toContain(`- src-${i}: ${count} 件`);
+    }
+    // **内訳の合計 == externalsCount。** 個々の行を上で確かめてあるので、
+    // その合計を独立に計算して突き合わせる（実装の出力を鵜呑みにしない）。
+    expect(counts.reduce((sum, count) => sum + count, 0)).toBe(total);
+    // 上限に当たっていないので、「その他」も上限超過も出ない。
+    expect(digest).not.toContain('その他:');
+    expect(digest).not.toContain('上限（`DIGEST_SOURCE_TALLY_LIMIT`）を超えて現れた発行元');
+  });
+
+  /**
+   * **直上の歯は弱い。** 合計15件・`DIGEST_RETAIN_LIMIT`（200）に遠く届かない
+   * 入力だったので、`externals`（保持の上限で切られた側）から作る内訳
+   * （#1322 が最初に main へ入れた設計）でも同じ答えを返せてしまう——実際に
+   * 素朴合成した「#1322 のまま・再設計前」の digest.ts で回すと、この歯は
+   * **緑のまま**だった（部分文字列一致でたまたま通っていた）。
+   *
+   * **この歯はそれを強くする。** `DIGEST_RETAIN_LIMIT`（200）を**複数
+   * source に跨いで**大きく超える入力を積み、(1) 内訳の合計が
+   * `externalsCount` と厳密に一致すること (2) 個々の発行元の件数が
+   * `DIGEST_RETAIN_LIMIT` 単体の上限より大きい——つまり**保持配列
+   * （最大 `DIGEST_RETAIN_LIMIT` 件）だけからは絶対に導出できない値**である
+   * こと、の両方を当てる。(2) は具体的な interleave 順序に依存しない
+   * ——1つの source の真の件数が保持の上限そのものを超えていれば、
+   * どんな順序で日誌を積んでも保持配列（$\le$ `DIGEST_RETAIN_LIMIT` 件）
+   * からその値を出すことは原理的にできない。
+   */
+  it('内訳（source tally）の合計が externalsCount と厳密に一致する（複数 source が DIGEST_RETAIN_LIMIT を跨ぐ場合。保持側だけでは出せない値であることも当てる）', async () => {
+    const stores = createMemoryStores();
+    // source-a: DIGEST_RETAIN_LIMIT より20多い件数——この1 source だけで
+    // 保持配列の上限を超える（保持側からは絶対に導出できない値にする）。
+    const countA = DIGEST_RETAIN_LIMIT + 20;
+    // source-b: 別の90件。2 source の合計が DIGEST_RETAIN_LIMIT の1.5倍を
+    // 超える（保持配列1本では2つの source の真の内訳を両方保持できない）。
+    const countB = 90;
+    for (let j = 0; j < countA; j += 1) {
+      await stores.journal.append({ type: 'external_event', source: 'source-a', summary: `a${j}` });
+    }
+    for (let j = 0; j < countB; j += 1) {
+      await stores.journal.append({ type: 'external_event', source: 'source-b', summary: `b${j}` });
+    }
+    const total = countA + countB;
+    expect(countA).toBeGreaterThan(DIGEST_RETAIN_LIMIT); // 保持側では出せない値であることの前提
+    expect(total).toBeGreaterThan(DIGEST_RETAIN_LIMIT); // 保持の上限を跨ぐことの前提
+
+    const digest = await buildActivityDigest(stores, { since: since() });
+
+    // 見出し（externalsCount）。
+    expect(digest).toContain(`外部イベント（日誌 external_event の行数）: ${total} 件`);
+    // 個々の発行元の件数——件数降順なので source-a が先。
+    expect(digest).toContain(`- source-a: ${countA} 件`);
+    expect(digest).toContain(`- source-b: ${countB} 件`);
+    // **内訳の合計 == externalsCount。** 実装の出力を鵜呑みにせず、独立に
+    // 計算した合計と突き合わせる。
+    expect(countA + countB).toBe(total);
+    // 2 source だけなので折り畳み・上限超過は出ない。
+    expect(digest).not.toContain('その他:');
+    expect(digest).not.toContain('上限（`DIGEST_SOURCE_TALLY_LIMIT`）を超えて現れた発行元');
+  });
+
+  it('内訳（source tally）の件数は保持の上限（DIGEST_RETAIN_LIMIT）ではなく総数を数えている', async () => {
+    const stores = createMemoryStores();
+    // 1つの source に DIGEST_RETAIN_LIMIT の1.5倍ぶん積む——保持配列は
+    // DIGEST_RETAIN_LIMIT で頭打ちになるが、source tally は保持の外で数える。
+    const total = Math.floor(DIGEST_RETAIN_LIMIT * 1.5);
+    for (let i = 0; i < total; i += 1) {
+      await stores.journal.append({ type: 'external_event', source: 'ci', summary: `e${i}` });
+    }
+
+    const digest = await buildActivityDigest(stores, { since: since() });
+
+    expect(total).toBeGreaterThan(DIGEST_RETAIN_LIMIT);
+    // **retained（200件）ではなく、総数（300件）を名乗る。**
+    expect(digest).toContain(`- ci: ${total} 件`);
+    expect(digest).not.toContain(`- ci: ${DIGEST_RETAIN_LIMIT} 件`);
+    expect(digest).toContain(`外部イベント（日誌 external_event の行数）: ${total} 件`);
+  });
+
+  it('表示上限（MAX_ITEMS）を超えた追跡済み発行元が「その他: N 件（M の発行元）」へ畳まれ、N と M が正しい（N ≠ M）', async () => {
+    const stores = createMemoryStores();
+    // MAX_ITEMS より5多い数の発行元。件数はランク付け（先頭が最多、末尾が1件）
+    // ——「その他」に畳まれる件数（N）と発行元の数（M）が異なることを測るため、
+    // 均等な件数（全部1件）は使わない。DIGEST_SOURCE_TALLY_LIMIT には当たらない
+    // 数に留める（この it は表示上限だけを測る）。
+    const sourceCount = MAX_ITEMS + 5;
+    expect(sourceCount).toBeLessThan(DIGEST_SOURCE_TALLY_LIMIT); // 上限超過は起きない
+    const counts = Array.from({ length: sourceCount }, (_, i) => sourceCount - i);
+    for (const [i, count] of counts.entries()) {
+      for (let j = 0; j < count; j += 1) {
+        await stores.journal.append({
+          type: 'external_event',
+          source: `src-${String(i).padStart(2, '0')}`,
+          summary: `e${i}-${j}`,
+        });
+      }
+    }
+    const total = counts.reduce((sum, count) => sum + count, 0);
+    const shownCounts = counts.slice(0, MAX_ITEMS);
+    const foldedCounts = counts.slice(MAX_ITEMS);
+    const foldedTotal = foldedCounts.reduce((sum, count) => sum + count, 0);
+
+    const digest = await buildActivityDigest(stores, { since: since() });
+
+    // 上位 MAX_ITEMS 件は個別に出る。
+    for (const [i, count] of shownCounts.entries()) {
+      expect(digest).toContain(`- src-${String(i).padStart(2, '0')}: ${count} 件`);
+    }
+    // 残り（`foldedCounts.length` 発行元）が畳まれる。
+    // N（畳んだ件数＝`foldedTotal`）と M（畳んだ発行元の数＝`foldedCounts.length`）
+    // はランク付けの構成上、必ず異なる（N ≠ M であることが要点）。
+    expect(foldedTotal).not.toBe(foldedCounts.length);
+    expect(digest).toContain(`- その他: ${foldedTotal} 件（${foldedCounts.length} の発行元）`);
+    // 不変条件: shown の合計 + foldedTotal + overflowCount(=0) === externalsCount。
+    const shownTotal = shownCounts.reduce((sum, count) => sum + count, 0);
+    expect(shownTotal + foldedTotal).toBe(total);
+    expect(digest).toContain(`外部イベント（日誌 external_event の行数）: ${total} 件`);
+    expect(digest).not.toContain('上限（`DIGEST_SOURCE_TALLY_LIMIT`）を超えて現れた発行元');
+  });
+
+  it('追跡する発行元数の上限（DIGEST_SOURCE_TALLY_LIMIT）を超えたとき、超過ぶんの件数が出力に現れ、内訳の合計＋その他＋上限超過が externalsCount と一致する', async () => {
+    const stores = createMemoryStores();
+    // DIGEST_SOURCE_TALLY_LIMIT より多い数の発行元、各1件。journal.list() は
+    // push の逆順（新しい順）で走査するので、**後から append した発行元ほど
+    // 先に scan される**——最初に scan される DIGEST_SOURCE_TALLY_LIMIT 個
+    // （最後に append した分）が追跡され、それより前に append した分（
+    // `overflowSourceCount` 個）が上限超過（overflow）になる。
+    const overflowSourceCount = MAX_ITEMS - 1; // MAX_ITEMS と DIGEST_SOURCE_TALLY_LIMIT 両方に当てる
+    const sourceCount = DIGEST_SOURCE_TALLY_LIMIT + overflowSourceCount;
+    for (let i = 0; i < sourceCount; i += 1) {
+      await stores.journal.append({
+        type: 'external_event',
+        source: `src-${String(i).padStart(3, '0')}`,
+        summary: `e${i}`,
+      });
+    }
+    // 追跡される発行元（scan 順で先頭 DIGEST_SOURCE_TALLY_LIMIT 個 ＝ 最後に
+    // append した分）は `overflowSourceCount` 〜 `sourceCount - 1`。件数は
+    // 全部1件なので、source 名の昇順に並ぶ（`createSourceTally.rows` の
+    // タイブレーク）。
+    const trackedStart = overflowSourceCount;
+    const trackedSources = Array.from(
+      { length: DIGEST_SOURCE_TALLY_LIMIT },
+      (_, i) => trackedStart + i,
+    );
+    const shownSources = trackedSources.slice(0, MAX_ITEMS);
+    const foldedSources = trackedSources.slice(MAX_ITEMS);
+
+    const digest = await buildActivityDigest(stores, { since: since() });
+
+    for (const i of shownSources) {
+      expect(digest).toContain(`- src-${String(i).padStart(3, '0')}: 1 件`);
+    }
+    // 追跡された残り（`foldedSources.length` 発行元、各1件）が「その他」へ畳まれる。
+    expect(digest).toContain(
+      `- その他: ${foldedSources.length} 件（${foldedSources.length} の発行元）`,
+    );
+    // 上限を超えて現れた発行元（`overflowSourceCount` 個）ぶんの件数は捨てず
+    // 件数として出す——ただし発行元の数は数えない（原理的に出せない）。
+    expect(digest).toContain(
+      `- 上限（\`DIGEST_SOURCE_TALLY_LIMIT\`）を超えて現れた発行元: ${overflowSourceCount} 件（発行元の数は数えていない`,
+    );
+    // 不変条件: shown + folded + overflow === externalsCount。
+    expect(digest).toContain(`外部イベント（日誌 external_event の行数）: ${sourceCount} 件`);
+    expect(shownSources.length + foldedSources.length + overflowSourceCount).toBe(sourceCount);
   });
 });
 
@@ -2245,8 +2451,6 @@ describe('OOM の本体を直す（issue #1283）— 日誌走査をページ単
     expect(digest).not.toContain('DIGEST_JOURNAL_SCAN_LIMIT');
     expect(digest).toContain('自分で決めたこと（日誌の decision）: 3 件');
     expect(digest).toContain('記憶の更新: 3 件');
-    // **件数そのものは変えていない。** 単位の名乗り（「日誌 external_event の
-    // 行数」）が #783 で行に入ったので、期待する文字列だけを合わせる。
     expect(digest).toContain('外部イベント（日誌 external_event の行数）: 3 件');
     expect(digest).toContain('あなた自身が手を動かした回数（委譲せずに使った道具）: 3 件');
   });
