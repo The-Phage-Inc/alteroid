@@ -9174,6 +9174,221 @@ describe('起動時の引き取りは、1本が投げても後ろを道連れに
 });
 
 /**
+ * **段0（測るだけ、Issue #1212 running 側）: `running` のまま、宛先の runner が
+ * 名簿から entry ごと消えている委譲を数える。**
+ *
+ * `isLive()` の「黙った」判定（`#silentRunners()`）は、名簿に entry が残って
+ * いて `state: 'lost'` になった器しか拾わない。**entry がまるごと消えている**
+ * （デーモン再起動で名簿がインメモリのまま作り直された等）と、`isLive()` は
+ * `attached` / `sessionId` の分岐へ落ちる——2026-09-18T11:16Z のコメントが
+ * 机上で見つけ、その日のうちに実際に起きた形である。
+ *
+ * **`isLive()` の返り値も `status` の遷移も、ここでは1文字も変えていない。**
+ * 測っているのは日誌の行だけである。
+ */
+describe('running のまま、宛先の runner が名簿から entry ごと消えている委譲を数える（Issue #1212 running 側、段0）', () => {
+  function vanishedRunnerGaugeLines(entries: unknown[]): string[] {
+    return entries
+      .map((entry) => (entry as { text?: string }).text ?? '')
+      .filter((text) => text.includes('名簿から entry ごと消えている'));
+  }
+
+  async function seedRunning(
+    stores: Stores,
+    id: string,
+    runnerId: string,
+    createdAt: string,
+  ): Promise<void> {
+    await stores.jobs.putJob({
+      id,
+      managerId: id,
+      createdAt,
+      updatedAt: createdAt,
+      status: 'running',
+      summary: '仕事',
+      request: '仕事',
+      cwd: '/work/project',
+      runnerId,
+      sessionId: `sess-${id}`,
+    });
+  }
+
+  it('陽性: 宛先の runner が名簿から entry ごと消え、running のまま残っている委譲が1本あると、本数と最古の経過時間が1行残る', async () => {
+    const stores = createMemoryStores();
+    await seedRunning(stores, 'mgr-vanished', 'runner-gone', '2026-09-24T00:00:00.000Z');
+    // **`runner-gone` を1本も登録しない。** 「消えた」を作るのに `unregister()`
+    // を呼ぶ必要は無い——最初から名簿に entry が無い状態が、まさに「entry ごと
+    // 消えている」と区別が付かない状態である（本番では daemon 再起動でこの形になる）。
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({
+      stores,
+      post: () => undefined,
+      runners: registry,
+      now: () => Date.parse('2026-09-24T01:05:00.000Z'),
+    });
+
+    const listed = await pool.list();
+
+    // **`status` は動かしていない。** running のまま残る（isLive の返り値も
+    // 動かしていないので、ここでは踏み込んで検算しない——段0はそれを見ない）。
+    expect(listed.find((m) => m.managerId === 'mgr-vanished')?.status).toBe('running');
+
+    const entries = await stores.journal.list({ order: 'asc' });
+    const lines = vanishedRunnerGaugeLines(entries);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('[runner-gone]');
+    expect(lines[0]).toContain('running のまま残っている委譲が 1 本ある');
+    // 2026-09-24T00:00Z → 01:05Z の経過（`now` で固定した1時間5分）。
+    expect(lines[0]).toContain('最古の委譲は1時間5分経過');
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  it('やりすぎの対照①: runner の entry が名簿に残っていれば（lost でも）、本数の行は出ない', async () => {
+    const stores = createMemoryStores();
+    await seedRunning(stores, 'mgr-listed', 'runner-a', '2026-09-24T00:00:00.000Z');
+    const a = new FakePoolRunner('runner-a', { managers: 0 });
+    const registry = createRunnerRegistry([a]);
+    const pool = createManagerPool({ stores, post: () => undefined, runners: registry });
+
+    await pool.list();
+
+    const entries = await stores.journal.list({ order: 'asc' });
+    expect(vanishedRunnerGaugeLines(entries)).toHaveLength(0);
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  it('やりすぎの対照②: entry が消えていても running の委譲が0本なら、本数の行は出ない', async () => {
+    const stores = createMemoryStores();
+    const at = '2026-09-24T00:00:00.000Z';
+    await stores.jobs.putJob({
+      id: 'mgr-done',
+      managerId: 'mgr-done',
+      createdAt: at,
+      updatedAt: at,
+      status: 'done',
+      summary: '仕事',
+      request: '仕事',
+      cwd: '/work/project',
+      runnerId: 'runner-gone',
+    });
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({ stores, post: () => undefined, runners: registry });
+
+    await pool.list();
+
+    const entries = await stores.journal.list({ order: 'asc' });
+    expect(vanishedRunnerGaugeLines(entries)).toHaveLength(0);
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  it('書く頻度: 本数が変わらなければ、list() を重ねて呼んでも行を重ねて書かない', async () => {
+    const stores = createMemoryStores();
+    await seedRunning(stores, 'mgr-vanished', 'runner-gone', '2026-09-24T00:00:00.000Z');
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({ stores, post: () => undefined, runners: registry });
+
+    await pool.list();
+    await pool.list();
+    await pool.list();
+
+    const entries = await stores.journal.list({ order: 'asc' });
+    expect(vanishedRunnerGaugeLines(entries)).toHaveLength(1);
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  it('書く頻度: 本数が増えると、増えた本数で改めて1行残る', async () => {
+    const stores = createMemoryStores();
+    await seedRunning(stores, 'mgr-vanished-1', 'runner-gone', '2026-09-24T00:00:00.000Z');
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({ stores, post: () => undefined, runners: registry });
+
+    await pool.list();
+    await seedRunning(stores, 'mgr-vanished-2', 'runner-gone', '2026-09-24T00:05:00.000Z');
+    await pool.list();
+
+    const entries = await stores.journal.list({ order: 'asc' });
+    const lines = vanishedRunnerGaugeLines(entries);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('running のまま残っている委譲が 1 本ある');
+    expect(lines[1]).toContain('running のまま残っている委譲が 2 本ある');
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  /**
+   * **計器の失敗は `list()` の結果にも例外にも影響しない**（運用者からの指摘。
+   * 段0が読む側の挙動を変えてはいけない）。
+   *
+   * `#journal()` 自身は `append()` の失敗を内部の try/catch で飲み込んで
+   * 例外を返さない——だからこの歯だけでは「直したこと」の証拠にならない
+   * （変異試験の節を参照。この歯は変異では赤くならない）。それでも歯として
+   * 固定するのは、依頼の逐語（「`#journal` が reject しても list() が同じ
+   * 結果を返すこと」）に直接対応する回帰試験だからである。
+   */
+  it('journal.append が失敗しても、list() は例外を投げず同じ結果を返す', async () => {
+    clearRecentTracesForTesting();
+    const stores = failingJournalAppend(createMemoryStores(), 'journal down (#1212)');
+    await seedRunning(stores, 'mgr-vanished', 'runner-gone', '2026-09-24T00:00:00.000Z');
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({ stores, post: () => undefined, runners: registry });
+
+    const listed = await pool.list();
+
+    expect(listed.find((m) => m.managerId === 'mgr-vanished')?.status).toBe('running');
+    // **黙って消してはいない。** `#journal` 自身の catch が跡を残す
+    // （`noteDroppedRecord` の作法）。
+    expect(recentDroppedTraces().some((line) => line.includes('日誌を記録できませんでした'))).toBe(
+      true,
+    );
+
+    await pool.stop();
+    await registry.stop();
+  });
+
+  /**
+   * **`#journal` を呼ぶ前の計算（`vanishedRunnerBacklog` / `describeVanishedRunnerBacklogLine`
+   * / `this.#now()`）が例外を投げても、`list()` は例外を投げず同じ結果を返す。**
+   *
+   * `#journal` 自身の try/catch は `append()` の失敗しか守らない——この関数を
+   * 呼ぶ**前**に走る計算が例外を投げると、そこは守られていなかった（実測:
+   * この歯を書く前に `now` が例外を投げる構成で確かめたところ、`pool.list()`
+   * が実際に reject した）。`#noteVanishedRunnerGauge` 全体を包む try/catch が
+   * この経路を守っていることを固定する——**この歯こそが変異で赤くなる**
+   * （direct な `#journal` の reject では `#journal` 自身の catch が既に
+   * 守っているので、`try/catch` を外しても直上の歯は赤くならない）。
+   */
+  it('計器の集計・整形（#journal を呼ぶ前）が例外を投げても、list() は例外を投げず同じ結果を返す', async () => {
+    const stores = createMemoryStores();
+    await seedRunning(stores, 'mgr-vanished', 'runner-gone', '2026-09-24T00:00:00.000Z');
+    const registry = createRunnerRegistry([]);
+    const pool = createManagerPool({
+      stores,
+      post: () => undefined,
+      runners: registry,
+      now: () => {
+        throw new Error('clock down (#1212 test)');
+      },
+    });
+
+    const listed = await pool.list();
+
+    expect(listed.find((m) => m.managerId === 'mgr-vanished')?.status).toBe('running');
+
+    await pool.stop();
+    await registry.stop();
+  });
+});
+
+/**
  * **`[running]` の相手へ送ったら 404 が例外として貫通していた**（Issue #563）。
  *
  * `Pool#send()` の `record.attached` が真の枝は `await runner.send(...)` を例外処理
