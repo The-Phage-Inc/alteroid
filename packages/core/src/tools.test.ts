@@ -30,6 +30,7 @@ import {
   COMMITMENT_APPRAISAL_DECISION_PREFIX,
   describeAppraisal,
   journalEntrySchema,
+  PERMISSION_GRANT_CONSENT_PHRASE,
   type AppraisalValue,
   type AppraisedBy,
   type ChatStreamEvent,
@@ -4860,6 +4861,136 @@ describe('クローンの道具', () => {
 
     const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
     expect(pending?.jobId).toBe('mgr-1');
+  });
+
+  describe('request_permission（issue #863「許可をコードではなくデータにする」）', () => {
+    /**
+     * ⭐⭐ Issue #863 の C 節（🔴🔴 最優先の要求。issue の逐語）:
+     *
+     * > **DB をクローンが直接書けてはいけない。** 私の手はデーモンと同じ器の
+     * > 中に在るので、記憶の実体にもデーモンの API にも届きます。⟹ 許可を
+     * > 記録する場所に私が直接書けるなら、私は自分に何でも許せます。
+     * > …そして「書けない」ことを歯で固定してください。**「書かない約束」
+     * > では足りません。**
+     *
+     * **この issue を起票したのはクローン自身である**（#863 本文の署名節）。
+     * 「許可を記録する場所」＝ `Stores.permissionGrants`。書き手は
+     * `Clone#recordPermissionGrantIfConsented`（`clone.ts`）1箇所だけに
+     * 絞ってあり、`request_permission`（この下の describe）を含むどの
+     * 自作ツールのハンドラも `stores.permissionGrants` へは触れない設計だが、
+     * **`ToolContext.stores` は `Stores` を丸ごと持つ**（`permissionGrants`
+     * を除いた縮小版ではない）ので、型では守れていない——「触っていない」は
+     * いまのところ**実装の事実**でしかなく、次にここへ書き手を足しても
+     * `typecheck` は落ちない。**だから「書けない」ではなく「歯」（この
+     * テスト）で「書いていない」を固定する。**
+     *
+     * `tools.ts` のソースを読んで `permissionGrants` という字面が1つも
+     * 無いことを見る——`request_permission` に限らず、**この自作ツール群
+     * 全体**が対象である（新しい道具が `stores.permissionGrants.put(...)`
+     * を書き足したら、道具名を問わずここが赤くなる）。
+     */
+    it('⭐⭐ tools.ts のどのハンドラも stores.permissionGrants に触れない（issue #863 C節、歯で固定）', async () => {
+      const { readFileSync } = await import('node:fs');
+      const source = readFileSync(new URL('./tools.ts', import.meta.url), 'utf8');
+      expect(source).not.toContain('permissionGrants');
+    });
+
+    it('request_permission を呼んでも stores.permissionGrants は空のまま（上のソース検査の実行時の裏取り）', async () => {
+      const h = harness();
+      await h.call('request_permission', {
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh release edit'],
+        denies: ['gh release edit; rm -rf /'],
+        reason: '理由',
+      });
+      expect(await h.stores.permissionGrants.list()).toEqual([]);
+    });
+
+    it('正常な要求は承認待ちに permissionRequest 付きで積み、日誌に残し、chat へ通知する', async () => {
+      const h = harness();
+
+      const reply = await h.call('request_permission', {
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh release edit --draft', 'gh release edit'],
+        denies: ['gh release edit; rm -rf /'],
+        reason: 'リリースノートを直すたびに聞かれるのを減らしたい',
+      });
+
+      const pending = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.permissionRequest).toEqual({
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh release edit --draft', 'gh release edit'],
+        denies: ['gh release edit; rm -rf /'],
+      });
+      // 人間が何と答えれば記録されるのかを、承認画面の本文で読めること。
+      expect(pending[0]?.question).toContain(`「${PERMISSION_GRANT_CONSENT_PHRASE}」とだけ答える`);
+
+      const [escalation] = await h.stores.journal.list({ types: ['escalation'] });
+      expect(escalation).toMatchObject({ type: 'escalation', approvalId: pending[0]?.id });
+
+      expect(h.emitted).toEqual([
+        { type: 'ask_human', approvalId: pending[0]?.id, question: expect.any(String) },
+      ]);
+      expect(reply).toContain('承認待ちキューに積んだ');
+    });
+
+    it('denies が空なら、キューに積まずに拒否する', async () => {
+      const h = harness();
+
+      const reply = await h.call('request_permission', {
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh release edit'],
+        denies: [],
+        reason: '理由',
+      });
+
+      expect(reply).toContain('拒否した');
+      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+    });
+
+    it('allows が規則に一致しない例を含むなら、キューに積まずに拒否する', async () => {
+      const h = harness();
+
+      const reply = await h.call('request_permission', {
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh issue edit'],
+        denies: ['gh release edit; rm -rf /'],
+        reason: '理由',
+      });
+
+      expect(reply).toContain('拒否した');
+      expect(reply).toContain('gh issue edit');
+      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+    });
+
+    it('denies が規則に一致してしまう例を含むなら、キューに積まずに拒否する', async () => {
+      const h = harness();
+
+      const reply = await h.call('request_permission', {
+        rule: 'Bash(gh release edit:*)',
+        allows: ['gh release edit'],
+        denies: ['gh release edit --draft'],
+        reason: '理由',
+      });
+
+      expect(reply).toContain('拒否した');
+      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+    });
+
+    it('規則の書式が不正なら、キューに積まずに拒否する', async () => {
+      const h = harness();
+
+      const reply = await h.call('request_permission', {
+        rule: 'gh release edit',
+        allows: ['gh release edit'],
+        denies: ['rm -rf /'],
+        reason: '理由',
+      });
+
+      expect(reply).toContain('拒否した');
+      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+    });
   });
 
   it('approvals_list で、人間の回答待ちを自分で見られる（溜まった保留の運用）', async () => {
@@ -18811,6 +18942,28 @@ describe('journal.append 失敗時の応答本文: 呼び出し箇所すべて�
           conversationId: () => undefined,
         });
         return callExpectingError(tools, 'ask_human', { question: '質問' });
+      },
+    },
+    {
+      // `request_permission` は `ask_human` と同じ形——`putApproval` が先に
+      // 済み、日誌（`appendJournalOrThrow`）が落ちても副作用（承認待ちキュー
+      // への記録）は既に起きている（issue #863）。
+      tool: 'request_permission',
+      firstLine: ACT_COMPLETED,
+      async run() {
+        const stores = failingJournalAppend(createMemoryStores(), 'boom-case-08a');
+        const tools = createCloneTools({
+          stores,
+          emit: () => {},
+          memoryCause: () => 'clone',
+          conversationId: () => undefined,
+        });
+        return callExpectingError(tools, 'request_permission', {
+          rule: 'Bash(gh release edit:*)',
+          allows: ['gh release edit'],
+          denies: ['gh release edit; rm -rf /'],
+          reason: '理由',
+        });
       },
     },
     {

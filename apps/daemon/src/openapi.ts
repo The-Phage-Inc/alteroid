@@ -14,6 +14,7 @@ import {
   mcpServersSchema,
   memoryDocumentSchema,
   pendingApprovalSchema,
+  permissionGrantSchema,
   practiceMetaSchema,
   practiceSchema,
   practiceVersionMetaSchema,
@@ -435,6 +436,14 @@ export const okResponseSchema = z.object({ ok: z.literal(true) });
  */
 export const cloneInterruptResponseSchema = z.object({
   outcome: z.enum(['interrupted', 'idle', 'unsupported']),
+});
+
+// ---------------------------------------------------------------------------
+// 許可の記録（/permission-grants。Issue #863）
+// ---------------------------------------------------------------------------
+
+export const permissionGrantsResponseSchema = z.object({
+  grants: z.array(permissionGrantSchema),
 });
 
 // ---------------------------------------------------------------------------
@@ -2049,6 +2058,13 @@ export const openApiDocumentation: GenerateSpecOptions['documentation'] = {
     { name: 'journal', description: '日誌（追記専用の記録）。可観測性の中段' },
     { name: 'reports', description: '日報。可観測性の最上段（人間の普段の接点はほぼこれだけ）' },
     { name: 'approvals', description: '承認待ちキュー（`ask_human` の応答口）' },
+    {
+      name: 'permission-grants',
+      description:
+        '人間が承認した Bash 許可の記録（Issue #863）。`request_permission` の要求に' +
+        '許可されたアカウントが定型文で答えたときだけ記録され、以降 Bash 呼び出しを' +
+        '自動で通す（クローン本セッションだけ）。取り消しは即座に（次の呼び出しから）効く',
+    },
     { name: 'events', description: '外部イベントの入口（仕事の起点③）' },
     { name: 'schedule', description: '時間起点のジョブ（起点②④）の一覧と手動起動' },
     {
