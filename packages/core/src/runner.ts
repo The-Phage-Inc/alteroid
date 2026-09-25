@@ -12,6 +12,7 @@ import type {
   SessionKey,
   SessionStore,
   SessionStoreEntry,
+  SpawnedProcess,
 } from '@anthropic-ai/claude-agent-sdk';
 
 import type {
@@ -345,6 +346,12 @@ export interface RunnerHostOptions {
    * 渡す。**
    */
   enforceLease?: boolean;
+  /**
+   * `spawnClaudeCodeProcess` の実体をテストから差し替える（#1334 段1）。
+   * **主にテスト用**（`queryFn` と同じ理由）。既定は本物（`spawnAsUser`）。
+   * `RunnerSessionOptions.spawnClaudeCodeProcessFn` の doc を見よ。
+   */
+  spawnClaudeCodeProcessFn?: (options: SpawnClaudeCodeProcessOptions) => DelegationProcessHandle;
 }
 
 export interface RunnerHost {
@@ -421,7 +428,52 @@ export interface RunnerHost {
    * （＝自己失効が機能しなくなる）。
    */
   noteDaemonContact(): void;
+  /**
+   * 委譲の Claude Code プロセスの pid（#1334 段1。孤児の回収が「どのセッションが
+   * 生きているか」を判定する材料）。
+   *
+   * - `live`: **このプロセス自身**がいま生きている（起きて、まだ `exit`/`error`
+   *   が来ていない）pid
+   * - `knownTerminated`: **その pid を起こした委譲（`managerId`）自身が、いま
+   *   この runner に生きたセッションとして残っていない** pid
+   *
+   * **⚠️ 2026-09（レビュー指摘・#1334）で意味を直した。** 直す前は「このプロセスが
+   * `exit` した」＝即 `knownTerminated` だった。だがプロセスの寿命とセッションの
+   * 寿命は一致しない —— マネージャーがターンを終えて次の指示を待つ（`done`）間も
+   * その CLI プロセスは生き続ける一方、**作業者（並列で走る委譲）の1回の
+   * 呼び出しは、その委譲自身がまだ生きていても普通にプロセスを終える。** 旧い
+   * 定義だと、後者の pid が終わった瞬間に、その孫（`nohup` で起こしたサーバ等）
+   * まで「終端済み」として撃ってよい対象に化けていた——**委譲そのものは
+   * 何も終わっていないのに**、である。
+   *
+   * **いまは「そのプロセスを spawn したときの `managerId` が、いま `#sessions`
+   * に居るか」だけで判定する**（`delegationSessionPids()` の実装）。**判定は
+   * 呼ぶたびにその場で行う**——固定された「終端済み」集合を持たないので、
+   * 一度こう判定されても、その `managerId` が resume で `#sessions` へ戻れば
+   * 次の呼び出しからは `knownTerminated` に出なくなる（resume で同じ委譲に
+   * 新しいプロセスが立っても、古いプロセスの孤児を誤って撃たないため）。
+   *
+   * **どちらも「このrunnerプロセスが自分で起こした」ものだけを持つ。** 器の
+   * 作り直し（runner プロセスの再起動）を跨いでは持ち越さない——起動直後は
+   * 両方とも空集合である。
+   */
+  delegationSessionPids(): { live: ReadonlySet<number>; knownTerminated: ReadonlySet<number> };
 }
+
+/**
+ * {@link RunnerHost.delegationSessionPids} が pid の所有者（`managerId`）を
+ * 覚えておく件数の上限。**無限には覚えない**——長時間走る runner が委譲を
+ * 何千回起こしても、メモリが際限なく育たないようにする。超えたら古いもの
+ * （`Map` の挿入順で先頭）から忘れる。
+ *
+ * **忘れた分は「不明」側へ倒れる。** 所有者が分からなければ
+ * `delegationSessionPids()` はその pid を `knownTerminated` に入れない
+ * （`apps/runner/src/tasks.ts` の `reapDecisionFor` は「終端済みと分かっている」
+ * ものだけを撃ってよいとする）ので、忘れたセッションの残骸は（生きた委譲が
+ * 0本という条件が別に成り立たない限り）撃たれずに残り続ける——保守的な側へ
+ * 倒れる欠落であって、誤って撃つ側の欠落ではない。
+ */
+const PID_OWNER_MANAGER_ID_CAP = 4096;
 
 /**
  * 回るとセッションの畳み直しの引き金になる鍵の名前。
@@ -498,6 +550,20 @@ class Host implements RunnerHost {
   #lastDaemonContact = Date.now();
   /** 貸し出し期限の自己失効を見張る1本。**`shutdown()` で必ず畳む。** */
   #leaseWatcher: ReturnType<typeof setInterval> | null = null;
+  /**
+   * 委譲の Claude Code プロセスの pid 帳（#1334 段1）。
+   * {@link RunnerHost.delegationSessionPids} の doc を見よ。
+   *
+   * `#pidOwnerManagerId` は「その pid を spawn したのはどの `managerId` か」を
+   * 覚える帳——`knownTerminated` はここから**呼ばれるたびに**導く（固定した
+   * 集合として持たない）。持てば「一度終端した」を覚え続けることになり、
+   * resume で同じ `managerId` の委譲が `#sessions` へ戻っても古い pid が
+   * 「終端済み」のままになる（レビュー指摘）。
+   */
+  readonly #liveDelegationPids = new Set<number>();
+  readonly #pidOwnerManagerId = new Map<number, string>();
+  readonly #spawnClaudeCodeProcessFn:
+    ((options: SpawnClaudeCodeProcessOptions) => DelegationProcessHandle) | undefined;
 
   constructor(options: RunnerHostOptions) {
     this.runnerId = options.runnerId;
@@ -510,6 +576,7 @@ class Host implements RunnerHost {
     this.#credentials = options.credentials;
     this.#permissionMode = options.permissionMode ?? resolvePermissionMode(this.#env);
     this.#enforceLease = options.enforceLease ?? false;
+    this.#spawnClaudeCodeProcessFn = options.spawnClaudeCodeProcessFn;
     if (this.#enforceLease) {
       const watcher = setInterval(() => this.#checkLeaseExpiry(), LEASE_WATCH_INTERVAL_MS);
       // 見張りでプロセスの終了を引き延ばさない（このリポジトリの既存のタイマーが
@@ -541,6 +608,60 @@ class Host implements RunnerHost {
   /** 制御面から接触があった。貸し出し期限の自己失効の時計を進める。 */
   noteDaemonContact(): void {
     this.#lastDaemonContact = Date.now();
+  }
+
+  delegationSessionPids(): { live: ReadonlySet<number>; knownTerminated: ReadonlySet<number> } {
+    // **呼び出し元へは写しを返す。** `apps/runner/src/tasks.ts` はこれを
+    // `reclaim.reap.liveSessionPidsOf()` 等から毎回呼び直すだけの想定で、
+    // 書き換える理由は無いはずだが、内部の集合そのものへの参照を渡すと
+    // 「渡した後に書き換えられない」という前提が呼び出し側の実装に依存してしまう。
+    //
+    // **`knownTerminated` はここで毎回、その場で導く。** pid 自身が `exit` した
+    // かどうかではなく、**その pid を spawn した `managerId` が、いまこの
+    // `#sessions`（＝生きた委譲のマップ）に残っているか**だけで決める——
+    // 残っていれば（`done` でターンの間に挟まっているだけ・resume で戻ってきた
+    // 等）、その pid が指す委譲は終端していないので `knownTerminated` には
+    // 入れない。`live` にまだ在る pid はここでは弾く必要が無い——弾かなくても
+    // 「所有者は `#sessions` に居る」がほぼ必ず成り立つが、念のため二重に見る。
+    const knownTerminated = new Set<number>();
+    for (const [pid, managerId] of this.#pidOwnerManagerId) {
+      if (this.#liveDelegationPids.has(pid)) continue;
+      if (this.#sessions.has(managerId)) continue;
+      knownTerminated.add(pid);
+    }
+    return {
+      live: new Set(this.#liveDelegationPids),
+      knownTerminated,
+    };
+  }
+
+  /** 委譲の Claude Code プロセスが起きた（{@link RunnerSessionOptions.onDelegationProcessSpawned}）。 */
+  #noteDelegationProcessSpawned(pid: number, managerId: string): void {
+    this.#liveDelegationPids.add(pid);
+    // **挿入順を今に更新してから覚える**（`Map` は挿入順を保つ——`delete` して
+    // からの `set` で「いま覚えた」扱いに更新する。pid が再利用された場合の
+    // 所有者の付け替えも兼ねる）。
+    this.#pidOwnerManagerId.delete(pid);
+    this.#pidOwnerManagerId.set(pid, managerId);
+    // **上限を超えたら、挿入順で古いものから忘れる**（`Map` は挿入順を保つ）。
+    // 忘れた分の帰結は {@link PID_OWNER_MANAGER_ID_CAP} の doc を見よ。
+    while (this.#pidOwnerManagerId.size > PID_OWNER_MANAGER_ID_CAP) {
+      const oldestPid = this.#pidOwnerManagerId.keys().next().value;
+      if (oldestPid === undefined) break;
+      this.#pidOwnerManagerId.delete(oldestPid);
+    }
+  }
+
+  /** 委譲の Claude Code プロセスが終わった（{@link RunnerSessionOptions.onDelegationProcessExited}）。 */
+  #noteDelegationProcessExited(pid: number): void {
+    this.#liveDelegationPids.delete(pid);
+    // **ここでは `knownTerminated` 側を1文字も触らない。** そちらは
+    // `delegationSessionPids()` が呼ばれるたびに、pid の所有者（`managerId`）が
+    // いま `#sessions` に居るかどうかから導く——**このプロセス自身が終わった
+    // ことは、その委譲そのものが終端したことを意味しない**（レビュー指摘。
+    // `RunnerHost.delegationSessionPids` の doc）。所有者の記録
+    // （`#pidOwnerManagerId`）は消さずに残す——消すと、後でこの委譲が本当に
+    // 終端したときに、この pid を `knownTerminated` へ回す手がかりが無くなる。
   }
 
   /**
@@ -694,6 +815,11 @@ class Host implements RunnerHost {
       profileEnv: () => this.#profile?.env() ?? {},
       mcpServers: () => this.#mcpServers?.servers,
       onClosed: () => this.#sessions.delete(managerId),
+      onDelegationProcessSpawned: (pid) => this.#noteDelegationProcessSpawned(pid, managerId),
+      onDelegationProcessExited: (pid) => this.#noteDelegationProcessExited(pid),
+      ...(this.#spawnClaudeCodeProcessFn === undefined
+        ? {}
+        : { spawnClaudeCodeProcessFn: this.#spawnClaudeCodeProcessFn }),
     });
     this.#sessions.set(managerId, session);
     return session;
@@ -992,6 +1118,27 @@ interface PendingRequest {
   result: Promise<PermissionResult>;
 }
 
+/** `spawnClaudeCodeProcess`（SDK の型 `SpawnOptions`）と同じ形。ここだけで書き写す理由は `spawnAsUser` の doc を見よ。 */
+type SpawnClaudeCodeProcessOptions = {
+  command: string;
+  args: string[];
+  cwd?: string;
+  env: Record<string, string | undefined>;
+  signal: AbortSignal;
+};
+
+/**
+ * `spawnClaudeCodeProcess` が返す実体（#1334 段1）。
+ *
+ * **SDK の `SpawnedProcess` 型そのものは `pid` を持たない**（呼び出し側が
+ * プロセスの素性を覗く経路にしないため、と読める）。だがここでは「起きた／
+ * 終わったこと」を pid で追跡する必要があるので、**本物の実装（`spawnAsUser`
+ * が返す Node の `ChildProcess`）が実際に持っている `pid` を、型の側でも
+ * 見えるようにしておく**——`SpawnedProcess` の約束（`stdin` / `stdout` / `kill`
+ * / `on` / `once` / `off`）はそのまま引き継ぐ交差型である。
+ */
+type DelegationProcessHandle = SpawnedProcess & { pid?: number };
+
 interface RunnerSessionOptions {
   managerId: string;
   request: string;
@@ -1018,6 +1165,26 @@ interface RunnerSessionOptions {
    */
   mcpServers: () => McpServers | undefined;
   onClosed: () => void;
+  /**
+   * 委譲の Claude Code プロセス（`spawnClaudeCodeProcess`）が起きた／終わった
+   * ことを知らせる（#1334 段1）。**`childUser` が無ければ呼ばれない**——
+   * `spawnClaudeCodeProcess` 自体が SDK へ渡らないため（`#buildOptions` の
+   * `childUser === undefined` 分岐）。孤児の回収（`apps/runner/src/tasks.ts`）が
+   * 「このセッション pid は生きた委譲のものか、終端した委譲のものか」を判定する
+   * 材料は、ここで届く pid だけである。
+   */
+  onDelegationProcessSpawned?: (pid: number) => void;
+  onDelegationProcessExited?: (pid: number) => void;
+  /**
+   * `spawnClaudeCodeProcess` の実体をテストから差し替える（#1334 段1）。
+   *
+   * **主にテスト用。** 既定は本物の `spawnAsUser`（`detached: true`＝新しい
+   * セッションの長として起こす）。本物は特権（UID を降ろす）を要る実プロセス
+   * 生成なので、CI のテストからは直接固定できない——差し替え口を挟むことで、
+   * 「起きた／終わった」をこの層の外へ知らせる配線（pid 追跡）だけを、実
+   * プロセス無しで固定できるようにしてある。
+   */
+  spawnClaudeCodeProcessFn?: (options: SpawnClaudeCodeProcessOptions) => DelegationProcessHandle;
 }
 
 class RunnerSession {
@@ -1034,6 +1201,11 @@ class RunnerSession {
   readonly #profileEnv: () => Record<string, string>;
   readonly #mcpServers: () => McpServers | undefined;
   readonly #onClosed: () => void;
+  readonly #onDelegationProcessSpawned: (pid: number) => void;
+  readonly #onDelegationProcessExited: (pid: number) => void;
+  readonly #spawnClaudeCodeProcessFn: (
+    options: SpawnClaudeCodeProcessOptions,
+  ) => DelegationProcessHandle;
 
   readonly #input: SDKUserMessage[] = [];
   readonly #pending: PendingRequest[] = [];
@@ -1517,6 +1689,12 @@ class RunnerSession {
     this.#profileEnv = options.profileEnv;
     this.#mcpServers = options.mcpServers;
     this.#onClosed = options.onClosed;
+    this.#onDelegationProcessSpawned = options.onDelegationProcessSpawned ?? (() => undefined);
+    this.#onDelegationProcessExited = options.onDelegationProcessExited ?? (() => undefined);
+    this.#spawnClaudeCodeProcessFn =
+      options.spawnClaudeCodeProcessFn ??
+      ((spawnOptions) =>
+        spawnAsUser(this.#childUser as RunnerChildUser, { ...spawnOptions, detached: true }));
   }
 
   /** 見張り（`Host#checkLeaseExpiry`）が読む、いまの貸し出し期限。 */
@@ -1884,7 +2062,7 @@ class RunnerSession {
       // そのままで、変えるのは実行する主体だけである（実行環境の境界）。
       ...(this.#childUser === undefined
         ? {}
-        : { spawnClaudeCodeProcess: (options) => this.#spawnAsChildUser(options) }),
+        : { spawnClaudeCodeProcess: (options) => this.#spawnDelegationProcess(options) }),
       canUseTool: (toolName, input, extra) => this.#onPermission(toolName, input, extra),
       // **上の5本と違い、これだけが実際にブロックする**（#894 段1・案(A)）。
       // 理由は `#onPreToolUse` の doc を見よ。
@@ -1944,6 +2122,37 @@ class RunnerSession {
     signal: AbortSignal;
   }) {
     return spawnAsUser(this.#childUser as RunnerChildUser, options);
+  }
+
+  /**
+   * **委譲の Claude Code プロセスを起こし、pid を控える（#1334 段1）。**
+   *
+   * `#spawnAsChildUser`（プロファイル評価・`unpushedWork` の `git` 起動と共有）
+   * とは別の口にしてあるのは、`detached: true`（新しいセッションの長にする）と
+   * pid 追跡（`onDelegationProcessSpawned` / `onDelegationProcessExited`）の
+   * どちらも、**委譲そのものの起動経路にだけ**効かせたいからである——他の2つは
+   * 「委譲のセッション」ではないので、対象を広げない。
+   *
+   * **`spawnClaudeCodeProcess` は、SDK が1つの `RunnerSession` の寿命の中で
+   * 複数回呼びうる**（マネージャー本体に加えて、並列で走る作業者ごとに1回ずつ）。
+   * だから pid 追跡は「セッションが1本開いた／閉じた」ではなく「委譲プロセスが
+   * 1本起きた／終わった」の粒度で行う——`runner-2` で観測された「3本並列の作業者」
+   * のような形でも、それぞれが独立したセッション ID を持つようにするためである。
+   */
+  #spawnDelegationProcess(options: SpawnClaudeCodeProcessOptions): DelegationProcessHandle {
+    const child = this.#spawnClaudeCodeProcessFn(options);
+    const pid = child.pid;
+    if (pid !== undefined) {
+      this.#onDelegationProcessSpawned(pid);
+      const noteExited = (): void => this.#onDelegationProcessExited(pid);
+      // **`exit` と `error`（起動そのものの失敗）の両方を見る。** どちらでも
+      // このプロセスはもう「生きている委譲」ではない——`error` のときに `exit`
+      // が来るかは環境依存なので、どちらか片方だけに頼らない
+      // （`noteExited` が2回呼ばれても、`Host` 側の集合操作は冪等である）。
+      child.once('exit', noteExited);
+      child.once('error', noteExited);
+    }
+    return child;
   }
 
   /**
@@ -5158,6 +5367,23 @@ function spawnAsUser(
     cwd?: string;
     env: Record<string, string | undefined>;
     signal: AbortSignal;
+    /**
+     * **新しいセッション（と process group）の長にして起こす（`setsid` 相当。
+     * #1334）。既定は `false`（従来どおり）。**
+     *
+     * 立てると、この子プロセス自身の pid がそのままセッション ID になる。
+     * 子孫が自分から `setsid` しない限り、`ppid` が `1`（tini）へ付け替わっても
+     * セッション ID はこの起源プロセスの pid のまま残る——孤児の回収（段1）が
+     * 「どの委譲の残骸か」を、名前やパスを読まずに突き合わせられるのはこれが
+     * 理由である（`apps/runner/src/tasks.ts` の `ReclaimReapOptions` の doc）。
+     *
+     * **既定を `false` にしたまま呼び出し側で選べるようにしてあるのは、
+     * 影響を委譲プロセスの起動経路だけに絞るため**——`Host#spawnAsChildUser`
+     * （実行環境プロファイルの評価）や `RunnerSession#unpushedWork`（`git` の
+     * 起動）は、この器の同じ低レベル関数を共有しているが、どちらも「委譲の
+     * セッション」ではないので、対象を広げない。
+     */
+    detached?: boolean;
   },
 ) {
   return spawn(options.command, options.args, {
@@ -5170,5 +5396,6 @@ function spawnAsUser(
     stdio: ['pipe', 'pipe', 'pipe'],
     uid: user.uid,
     gid: user.gid,
+    ...(options.detached === true ? { detached: true } : {}),
   });
 }
