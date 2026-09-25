@@ -12,6 +12,7 @@ import type {
   SpawnedProcess,
   SpawnOptions,
   StopHookInput,
+  SubagentStopHookInput,
   UserPromptSubmitHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 
@@ -24,11 +25,13 @@ import type {
 } from './agent-events.js';
 import type { AgentProvider } from './agent-ports.js';
 import type {
+  AgentContextHook,
   AgentObservationHook,
   AgentPreCompactRecord,
   AgentPreToolHook,
   AgentPreToolRecord,
   AgentStopRecord,
+  AgentSubagentStopRecord,
   AgentToolAuditFailureRecord,
   AgentToolAuditRecord,
   AgentUserPromptSubmitRecord,
@@ -178,12 +181,19 @@ function toAgentUserPromptSubmitRecord(input: unknown): AgentUserPromptSubmitRec
 
 /** `Stop` の生入力を {@link AgentStopRecord} へ写す。無い欄は省く。 */
 function toAgentStopRecord(input: unknown): AgentStopRecord {
-  const raw = input as Partial<StopHookInput> | null | undefined;
-  return {
-    ...(Array.isArray(raw?.background_tasks) ? { backgroundTasks: raw.background_tasks } : {}),
-    ...(Array.isArray(raw?.session_crons) ? { sessionCrons: raw.session_crons } : {}),
-    ...(typeof raw?.stop_hook_active === 'boolean' ? { stopHookActive: raw.stop_hook_active } : {}),
-  };
+  // **読み取りの失敗は投げずに `readError` で運ぶ**（`AgentStopRecord.readError` の doc）。
+  try {
+    const raw = input as Partial<StopHookInput> | null | undefined;
+    return {
+      ...(Array.isArray(raw?.background_tasks) ? { backgroundTasks: raw.background_tasks } : {}),
+      ...(Array.isArray(raw?.session_crons) ? { sessionCrons: raw.session_crons } : {}),
+      ...(typeof raw?.stop_hook_active === 'boolean'
+        ? { stopHookActive: raw.stop_hook_active }
+        : {}),
+    };
+  } catch (error: unknown) {
+    return { readError: error };
+  }
 }
 
 /**
@@ -280,6 +290,91 @@ function wrapPreToolHook(hook: AgentPreToolHook): HookCallback {
           'PreToolUse の中立な判断の包み直し',
           '',
           new Error(`未知の AgentPreToolDecision.kind が渡った: ${JSON.stringify(unreachable)}`),
+        );
+        return { continue: true };
+      }
+    }
+  };
+}
+
+/**
+ * `SubagentStop` の生入力を {@link AgentSubagentStopRecord} へ写す。無い欄は
+ * 省く（他の `toAgent*Record` と同じ作法）。
+ *
+ * **読み方は `runner.ts` の `#onSubagentStop` が今日読んでいる形と揃える。**
+ * `backgroundTasks` / `sessionCrons` は配列でなければ省き、`stopHookActive`
+ * は真偽値でなければ省く（`toAgentStopRecord` と同じ作法。SDK の型
+ * （`SubagentStopHookInput`）ではどちらも必須だが、`#onSubagentStop` は
+ * 「入力は防御的に読む」の方針で `as` で受けて型を仮定しない——ここも同じ
+ * 方針を保つ）。**`agentId` / `agentType` は他の `toAgent*Record`
+ * （`toAgentPreToolRecord` 等）と揃えて `typeof === 'string'` で絞る** ——
+ * `#onSubagentStop` 自身はこの2欄を素通しで信頼していたが、SDK の型は
+ * どちらも必須の `string` なので実質は変わらない。**万一値が崩れていても
+ * 安全側に倒れる**——`agentId` が省かれれば `#onSubagentStop` は
+ * `mine.length === 0` の枝（「当人が起こしたものが無い」と同じ扱い）へ
+ * 落ち、何も起こし直さない。
+ */
+function toAgentSubagentStopRecord(input: unknown): AgentSubagentStopRecord {
+  // **読み取りの失敗は投げずに `readError` で運ぶ**（`AgentSubagentStopRecord.readError` の doc）。
+  try {
+    const raw = input as Partial<SubagentStopHookInput> | null | undefined;
+    return {
+      ...(Array.isArray(raw?.background_tasks) ? { backgroundTasks: raw.background_tasks } : {}),
+      ...(Array.isArray(raw?.session_crons) ? { sessionCrons: raw.session_crons } : {}),
+      ...(typeof raw?.agent_id === 'string' ? { agentId: raw.agent_id } : {}),
+      ...(typeof raw?.agent_type === 'string' ? { agentType: raw.agent_type } : {}),
+      ...(typeof raw?.stop_hook_active === 'boolean'
+        ? { stopHookActive: raw.stop_hook_active }
+        : {}),
+    };
+  } catch (error: unknown) {
+    return { readError: error };
+  }
+}
+
+/**
+ * 中立の {@link AgentContextHook} を SDK の `HookCallback` へ包み直す
+ * （#486 中立の口の4本目）。`ManagerSessionOptionsRequest.onPostToolUse`
+ * （記録は {@link AgentToolAuditRecord}）と `.onSubagentStop`（記録は
+ * {@link AgentSubagentStopRecord}）の両方がこの関数を通す——`hookEventName` /
+ * `toRecord` だけを呼び出し側から渡し分ける。
+ *
+ * **`continue` → `{ continue: true }`、`addContext` → 同じ `hookEventName` を
+ * 持つ `hookSpecificOutput.additionalContext`。** `runner.ts` の
+ * `#onPostToolUse`（#901）・`#onSubagentStop`（#357 / #570）が今日すでに
+ * 返している形と1文字も変えていない（`runner-subagent-stop.test.ts` の
+ * 既存の歯がこれを固定している）。
+ *
+ * **`never` で網羅性を検査する。** `wrapPreToolHook` と同じ形——
+ * `AgentContextOutcome` に3つ目の `kind` が増えたら、この `switch` の
+ * `default` 節で `tsc` が落ちる。**ただし投げない**——理由も同じ
+ * （このフックはツール実行・作業者継続の経路に載っており、ここで例外を
+ * 投げるとそのターン・作業者のターンが壊れる）。実行時にここへ来るのは
+ * 型で弾かれたはずの値が渡ったときだけなので、安全側
+ * （`{ continue: true }` ＝ 何も注がない）へ倒し、`noteBackgroundFailure` で
+ * 跡だけ残す。
+ */
+function wrapContextHook<T>(
+  hookEventName: 'PostToolUse' | 'SubagentStop',
+  hook: AgentContextHook<T>,
+  toRecord: (input: unknown) => T,
+): HookCallback {
+  return async (input) => {
+    const outcome = await hook(toRecord(input));
+    switch (outcome.kind) {
+      case 'continue':
+        return { continue: true };
+      case 'addContext':
+        return {
+          continue: true,
+          hookSpecificOutput: { hookEventName, additionalContext: outcome.text },
+        };
+      default: {
+        const unreachable: never = outcome;
+        noteBackgroundFailure(
+          `${hookEventName} の中立な文脈の包み直し`,
+          '',
+          new Error(`未知の AgentContextOutcome.kind が渡った: ${JSON.stringify(unreachable)}`),
         );
         return { continue: true };
       }
@@ -576,18 +671,16 @@ export interface ManagerSessionOptionsRequest {
   spawnClaudeCodeProcess?: (options: SpawnOptions) => SpawnedProcess;
   canUseTool: CanUseTool;
   /**
-   * **中立の型に載せていない（`HookCallback` のまま）。** `runner.ts` の
-   * `#onPostToolUse` は観測（日誌・所有者控え）に加えて、`#901` の打ち切り
-   * 注記を `hookSpecificOutput.additionalContext` として返す経路を持つ——
-   * これは「起きたことをただ記録する」を超えた判断であり、いまの
-   * `AgentObservationHook`（`void` しか返せない）には載らない。**クローン側
-   * の `onPostToolUse`（`CloneSessionOptionsRequest` / `CloneDistillOptionsRequest`）
-   * は常に `{ continue: true }` だけを返すことを実装で確認しており、そちらは
-   * 中立の型へ移してある。** この欄を中立化するのは、`AgentObservationHook`
-   * に返り値を持たせる（または専用の型を別に起こす）判断とセットで次の PR に
-   * 送る（#486）。
+   * **`AgentObservationHook` ではなく `AgentContextHook` に載せる（#486 中立の口の
+   * 4本目）。** `runner.ts` の `#onPostToolUse` は観測（日誌・所有者控え）に
+   * 加えて、`#901` の打ち切り注記を追加の文脈として返す経路を持つ——`void`
+   * しか返せない `AgentObservationHook` には載らない。返すのは `continue` か
+   * `addContext` だけで、`wrapContextHook` が SDK の
+   * `hookSpecificOutput.additionalContext` へ包み直す。**クローン側の
+   * `onPostToolUse`（`CloneSessionOptionsRequest` / `CloneDistillOptionsRequest`）
+   * は常に `{ continue: true }` だけを返すので `AgentObservationHook` のまま。**
    */
-  onPostToolUse: HookCallback;
+  onPostToolUse: AgentContextHook<AgentToolAuditRecord>;
   /**
    * 失敗・中断した道具呼び出し（`PostToolUse` と排他）。Issue #929
    * （クローン側の同じ形は `onPostToolUse` の doc の `buildCloneSessionOptions`
@@ -621,23 +714,17 @@ export interface ManagerSessionOptionsRequest {
    * 作業者セッションが停止した瞬間の背景処理の在り高を観測する専用フック
    * （#357 の実測口）。
    *
-   * **中立の型に載せていない（`HookCallback` のまま）。** `runner.ts` の
+   * **`AgentContextHook` に載せる（#486 中立の口の4本目）。** `runner.ts` の
    * `#onSubagentStop` は、当人が起こした背景処理が残っていて通し上限・
-   * 1本あたりの上限のどちらも超えていない回に、作業者を起こし直す
-   * `hookSpecificOutput.additionalContext` を返す——これは「起きたことを
-   * ただ記録する」を超えた判断であり、いまの `AgentObservationHook`
-   * （`void` しか返せない）には載らない。**⚠️ 同ファイルの doc・呼び出し側の
-   * コメントは「観測専用」と名乗っているが、これは PR #594 時点の記述が
-   * 後続の PR（起こし直しを足した側）で更新されないまま残ったものである
-   * （`agent-hooks.ts` のファイル doc「⚠️ ここは観測専用ではない」の節）。
-   * ⟹ この欄を中立化するには `onPostToolUse` と同様、`AgentObservationHook`
-   * に返り値を持たせる（または専用の型を別に起こす）判断とセットで次の PR に
-   * 送る（#486）。** optional にしない。理由は直上の `onUserPromptSubmit` と
+   * 1本あたりの上限のどちらも超えていない回に、作業者を起こし直す文脈を
+   * 返す（`addContext`）——「起きたことをただ記録する」を超えた判断なので
+   * `AgentObservationHook` には載らない。`wrapContextHook` が SDK の
+   * `hookSpecificOutput.additionalContext` へ包み直す。optional にしない。理由は直上の `onUserPromptSubmit` と
    * 同じ——省略できる形にすると、provider を足す側が「渡さない」ことで観測を
    * 静かに落とせる（可観測性は要件である。PRD「可観測性」）。中身は
    * `runner.ts` の `#onSubagentStop` の doc を見よ。
    */
-  onSubagentStop: HookCallback;
+  onSubagentStop: AgentContextHook<AgentSubagentStopRecord>;
   /**
    * **マネージャー自身のターンが閉じる瞬間**の背景処理の在り高を観測する専用
    * フック（#861 の実測口）。
@@ -838,9 +925,12 @@ export function buildManagerSessionOptions(request: ManagerSessionOptionsRequest
       // `#onPreToolUse` の doc を見よ。`wrapPreToolHook` が中立の判断を
       // SDK の `HookCallback` へ包み直す。
       PreToolUse: [{ hooks: [wrapPreToolHook(onPreToolUse)] }],
-      // **`HookCallback` のまま渡す**（`ManagerSessionOptionsRequest.onPostToolUse`
-      // の doc）。中立の口を経由しないので、ここでは包み直さない。
-      PostToolUse: [{ hooks: [onPostToolUse] }],
+      // 観測に加えて #901 の打ち切り注記を追加の文脈として返しうる
+      // （`ManagerSessionOptionsRequest.onPostToolUse` の doc）。`wrapContextHook` が
+      // 中立の `continue` / `addContext` を SDK の形へ包み直す。
+      PostToolUse: [
+        { hooks: [wrapContextHook('PostToolUse', onPostToolUse, toAgentToolAuditRecord)] },
+      ],
       // **`PostToolUse` とは排他で発火する**（Issue #924 が出荷済みの SDK
       // 実行体を実測して確認した排他分岐。`buildCloneSessionOptions` の
       // `PostToolUseFailure` の doc と同じ）。⟹ 道具呼び出し1回につきどちらか
@@ -854,9 +944,11 @@ export function buildManagerSessionOptions(request: ManagerSessionOptionsRequest
       // ブロックしない。理由は `runner.ts` の `#onUserPromptSubmit` の doc を見よ。
       UserPromptSubmit: [{ hooks: [wrapUserPromptSubmitHook(onUserPromptSubmit)] }],
       // **観測専用ではない**（#357）。当人が起こした背景処理が残っていれば
-      // 起こし直しの `additionalContext` を返すことがある——`HookCallback` の
-      // まま渡す（`ManagerSessionOptionsRequest.onSubagentStop` の doc）。
-      SubagentStop: [{ hooks: [onSubagentStop] }],
+      // 起こし直しの文脈を返すことがある（`ManagerSessionOptionsRequest.onSubagentStop`
+      // の doc）。`wrapContextHook` が SDK の形へ包み直す。
+      SubagentStop: [
+        { hooks: [wrapContextHook('SubagentStop', onSubagentStop, toAgentSubagentStopRecord)] },
+      ],
       // **観測専用**（#861）。`{ continue: true }` を返すだけで、`decision` も
       // `hookSpecificOutput` も返さない —— 直上の `SubagentStop` は起こし直し
       // （`additionalContext`）を返す側へ変わっているが、**こちらは記録だけで
