@@ -160,7 +160,25 @@ export type TokenReconsiderReason =
    * の実装注記）。回すのは `unusable`（probe が観測した失敗）か `stranded`
    * （記録の上で通らない）だけである。
    */
-  | 'turn_succeeded';
+  | 'turn_succeeded'
+  /**
+   * **ダメ元の試し**（Issue #1501。`apps/daemon/src/token-trial-watch.ts`）が、
+   * **現役以外**の冷却中の候補を通ったと確かめ、その行の冷却の記録を
+   * `markTokenUsable` で消した直後に呼ぶ契機。
+   *
+   * **他の状態系の契機（`pool_changed` 等）と同じ扱いである。** `current` は
+   * 渡さない —— 通したのは「記録の上でその候補が `ready` になった」という
+   * 事実そのものであって、`turn_succeeded` のような世代付きの観測ではない
+   * （試した相手は現役ではないので、世代を照合する理由が無い）。この後の
+   * 通常の状態判定（現役が通らないのに `ready` な候補が在る）がそのまま拾い、
+   * `rotated` を出す。
+   *
+   * **現役自身が試しで通ったときは、こちらではなく `turn_succeeded` を使う**
+   * （本当に1ターン通った観測なので、`current` に
+   * `origin: { source: 'turn_success' }` を添えて渡す —— ダメ元の試しでも、
+   * 通った事実そのものは嘘ではない）。
+   */
+  | 'trial_succeeded';
 
 /**
  * {@link TokenRotator.reconsider} の `current` が運ぶ判定の**出所**（#681 (1)）。
@@ -616,6 +634,26 @@ export interface TokenRotator {
     reason: TokenReconsiderReason;
     current?: { verdict: TokenCandidateVerdict; origin: TokenVerdictOrigin };
   }): Promise<TokenRotationOutcome>;
+  /**
+   * **ダメ元の試し（Issue #1501）の結果を、その行の記録へ写す。回さない。撒かない。**
+   *
+   * - `usable`: 冷却の記録を消す（`markTokenUsable`）。回すのは呼ぶ側が続けて
+   *   呼ぶ {@link TokenRotator.reconsider}（`reason: 'trial_succeeded'`）である
+   * - `unusable` で `retryAt` が在り、記録と違う: 権威ある期限（`quota_reset`）で
+   *   冷却を書き直す
+   * - それ以外: 何も書かない（`unchanged`）
+   *
+   * ## なぜ回し手の中に置くか
+   *
+   * **書く操作はすべて1本の列（`serial`）を通る**（このファイルの冒頭の doc）。
+   * 見張りが自分で `stores.tokens.replace` を打つと、同じ瞬間に `observe` が
+   * 書いた冷却を、読んだ時点の古い一覧で丸ごと踏み消しうる（プール全体を
+   * 置き換える口なので、無関係な行まで巻き戻る）。
+   */
+  recordTrialVerdict(input: {
+    tokenId: string;
+    verdict: TokenCandidateVerdict;
+  }): Promise<'written' | 'unchanged' | 'missing'>;
   /**
    * **起動時に1度だけ**、記憶ストアが「現役」と言っているトークンを撒き直す。
    *
@@ -1707,6 +1745,36 @@ export function createTokenRotator(options: TokenRotatorOptions): TokenRotator {
           freshness,
           whyHead: decision.why,
         });
+      }),
+
+    recordTrialVerdict: (input: { tokenId: string; verdict: TokenCandidateVerdict }) =>
+      serial(async () => {
+        const tokens = await stores.tokens.list();
+        const row = tokens.find((token) => token.id === input.tokenId);
+        if (row === undefined) return 'missing' as const;
+        const at = now().toISOString();
+        let next: AgentToken;
+        const { verdict } = input;
+        if (verdict.verdict === 'usable') {
+          if (row.cooldownUntil === undefined && row.lastRejectedAt === undefined) {
+            return 'unchanged' as const;
+          }
+          next = markTokenUsable(row, at);
+        } else if (verdict.verdict === 'unusable' && verdict.retryAt !== undefined) {
+          // **書く必要が無ければ書かない**（同じ期限なら `updatedAt` も動かさない）。
+          if (row.cooldownUntil === verdict.retryAt) return 'unchanged' as const;
+          const settings = await stores.tokens.readSettings();
+          next = markTokenUnusable(row, {
+            at,
+            message: verdict.reason,
+            resets: { at: verdict.retryAt, source: 'quota_reset' },
+            fallbackCooldownMs: settings.cooldownMs,
+          });
+        } else {
+          return 'unchanged' as const;
+        }
+        await stores.tokens.replace(tokens.map((token) => (token.id === row.id ? next : token)));
+        return 'written' as const;
       }),
 
     reconsider: (input: {
