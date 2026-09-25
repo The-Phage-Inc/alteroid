@@ -45,9 +45,16 @@ import {
   describeRunnerEntries,
   isFencedRunnerError,
   isRetryableRunnerError,
+  RUNNER_CAPABILITY_AWAITING_BACKGROUND_SIGNAL,
   RunnerHttpError,
   RunnerMcpServersUnsupportedError,
 } from './runner-protocol.js';
+import {
+  describeAutoFoldUnpushedWorkProbe,
+  evaluateAutoFoldUnpushedWork,
+  isPidsUnderPressure,
+} from './manager-auto-fold.js';
+import { isManagerFoldCandidate } from './manager-fold-candidate.js';
 import type {
   RunnerClient,
   RunnerCredentialFingerprint,
@@ -1234,6 +1241,41 @@ export interface RunnerFleetOverview {
    * 聞けていない」が意味を持たないので無い）。
    */
   daemonRevision: RunnerRevisionReport;
+  /**
+   * **Issue #1394 段④⑥⑦ — この呼び出しの中で自動で畳んだ（または、畳む候補
+   * だったが見送った）委譲。** `resources: true` を渡し、かつどれかの runner の
+   * pids が逼迫していた（{@link isPidsUnderPressure}）ときだけ計算する。
+   * **逼迫していなければ、この欄そのものが省かれる**（0件と「見なかった」を
+   * 区別する。AGENTS.md「取れない軸に0の行を作る」と同じ形）。
+   *
+   * **この呼び出しの応答（`runners[].managers` の状態）は、ここで畳んだ分を
+   * 反映していないことがある。** `managers`（`list()` の像）は resources を
+   * 聞きに行く前に確定させているため、同じ呼び出しの中で畳んだ委譲は
+   * `status: 'done'` のまま出る——次に `manager_list` / `runner_list` を
+   * 呼んだときに `stopped` へ更新される。この欄が「実際に何をしたか」の
+   * 唯一の正しい情報源である。
+   */
+  autoFolded?: readonly AutoFoldOutcome[];
+}
+
+/**
+ * {@link RunnerFleetOverview.autoFolded} の1行。
+ *
+ * - `'folded'`: 実際に畳んだ（`ManagerPool.abort()` が `outcome: 'stopped'`
+ *   を返した）
+ * - `'blocked-unpushed-work'`: 畳む候補だったが、未 push の安全弁
+ *   （{@link evaluateAutoFoldUnpushedWork}）が `'blocked'` を返したので見送った
+ * - `'raced'`: 候補と判定した時点より後、実際に畳もうとする直前に状態を
+ *   読み直したら既に `done` ではなくなっていた（誰か・何かが先に触った）ので
+ *   安全側に倒して何もしなかった
+ * - `'not-stopped'` / `'unknown'`: `abort()` を呼んだが、`stopped` 以外の
+ *   outcome が返った（runner に確認が取れない等）
+ */
+export interface AutoFoldOutcome {
+  readonly managerId: string;
+  readonly runnerId: string;
+  readonly outcome: 'folded' | 'blocked-unpushed-work' | 'raced' | 'not-stopped' | 'unknown';
+  readonly detail: string;
 }
 
 /**
@@ -1399,8 +1441,14 @@ export interface ManagerSendOptions {
  * クローンのターンを1回消費する（実測: 7本畳んで7ターン）。**`by === 'human'`
  * は今までどおり配る** — 人間が止めた事実はクローンにとって外から来た
  * 出来事で、他に知る手段が無いため。
+ *
+ * **`'auto-fold'`（Issue #1394 段④⑥⑦）はデーモン自身が pids 逼迫を理由に
+ * 自動で畳んだときの値である。** `by !== 'clone'` の側に落ちるので、
+ * `'human'` と同じく受信箱へも配られる——人間が止めたときと同じ理由（外から
+ * 来た出来事で、クローンには他に知る手段が無い）がそのまま当てはまる。
+ * `who`（`abort()` 内）は3値それぞれで別の文言を出す。
  */
-export type ManagerStopActor = 'human' | 'clone';
+export type ManagerStopActor = 'human' | 'clone' | 'auto-fold';
 
 /**
  * 「止めた」を4値で言う（PR #137 で持ち込んだ「成功 / 明確な失敗 / 不明」の語彙に、
@@ -5189,7 +5237,7 @@ class Pool implements ManagerPool {
           )
         : undefined;
 
-    const runners = await Promise.all(
+    const placed = await Promise.all(
       entries.map(async (entry) => {
         const client = entry.runnerId === undefined ? undefined : open?.get(entry.runnerId);
         const pushHealth =
@@ -5257,9 +5305,36 @@ class Pool implements ManagerPool {
           // opt-in にする理由が無い。
           ...(pushHealth === undefined ? {} : { pushHealth }),
         };
-        return overview;
+
+        // **Issue #1394 段④ — 契機はここ。** `resources()` の結果として pids を
+        // 実際に受け取った、まさにこの時点を使う——新しい周期処理は足していない
+        // （このコメントの上、直近30行の `resources` はこの呼び出しが
+        // `options.resources` 付きで呼ばれたときにしか払わない往復であり、
+        // それは既存の opt-in のままである）。
+        // **`undefined` ＝ この runner の pids は見ていない（`resources` を
+        // 訊けなかった・pids が読めなかった・逼迫していなかった）。`[]` ＝
+        // 見たが候補が無かった（または全部見送った）。この2つを混ぜない**
+        // （AGENTS.md「取れない軸に0の行を作る」）——`autoFolded.length===0`
+        // で畳んだ結果全体を測ろうとすると、「逼迫していたが候補が0件だった」
+        // 回と「そもそも逼迫を見なかった」回が同じ形に潰れる。
+        const autoFolded: AutoFoldOutcome[] | undefined =
+          entry.runnerId !== undefined && resources?.pids !== undefined
+            ? await this.#autoFoldIdleOnRunnerIfUnderPressure(
+                entry.runnerId,
+                resources.pids,
+                managers,
+              )
+            : undefined;
+
+        return { overview, autoFolded };
       }),
     );
+    const runners = placed.map((p) => p.overview);
+    // **1台でも「見た」なら欄を出す。** 全台が `undefined`（誰も逼迫を見て
+    // いない）のときだけ欄そのものを省く——`autoFolded` の doc の3値
+    // （見なかった／見て0件／見て畳んだ・見送った）をここで潰さない。
+    const autoFoldedChecked = placed.some((p) => p.autoFolded !== undefined);
+    const autoFolded = placed.flatMap((p) => p.autoFolded ?? []);
 
     // デーモン自身の版。**自分のことなので取りに行く必要が無い**——runner のように
     // ネットワーク越しに訊く経路が無く、`resolveBuildRevision()` を直に呼べば
@@ -5267,7 +5342,153 @@ class Pool implements ManagerPool {
     // なく `unknown` として出る）。
     const daemonRevision = reportRunnerRevision(resolveBuildRevision());
 
-    return { runners, unassigned, daemonRevision };
+    return {
+      runners,
+      unassigned,
+      daemonRevision,
+      ...(autoFoldedChecked ? { autoFolded } : {}),
+    };
+  }
+
+  /**
+   * Issue #1394 段④ 契機の門。`runnerId` の pids が逼迫していなければ、
+   * 候補すら見ない——`undefined` を返すだけで、`managers` を1回も読まない。
+   * **`undefined`（見ていない）と `[]`（見たが0件）を区別する**
+   * （呼び出し元 `runners()` の doc）。
+   *
+   * 逼迫していれば、その runner に割り当てられた委譲だけを対象に、段⑤の
+   * 判定（`isManagerFoldCandidate`）を通し、候補になったものだけ
+   * {@link #autoFoldOne} へ渡す。
+   */
+  async #autoFoldIdleOnRunnerIfUnderPressure(
+    runnerId: string,
+    pids: { readonly current: number; readonly max: number },
+    managers: readonly ManagerSummary[],
+  ): Promise<AutoFoldOutcome[] | undefined> {
+    if (!isPidsUnderPressure(pids)) return undefined;
+
+    const now = new Date(this.#now());
+    // **段⑤と同じ判定を1回だけ計算する。** `runnerHasCapability` は runnerId
+    // ごとに変わらないので、対象委譲のループの外で1回読めば足りる。
+    const capabilityConfirmed = this.runnerHasCapability(
+      runnerId,
+      RUNNER_CAPABILITY_AWAITING_BACKGROUND_SIGNAL,
+    );
+    const outcomes: AutoFoldOutcome[] = [];
+    for (const manager of managers) {
+      if (manager.runnerId !== runnerId) continue;
+      const isCandidate = isManagerFoldCandidate(
+        {
+          status: manager.status,
+          hasAwaitingBackgroundSignal: manager.awaitingBackground !== undefined,
+          awaitingBackgroundSignalVersionConfirmed: capabilityConfirmed,
+          // **`managerActivityInputOf`（`tools.ts`）と同じ field 選択を、
+          // import せずにここでも行う。** 循環 import を避けるため
+          // （`manager-auto-fold.ts` 冒頭の doc と同じ理由——ただしあちらは
+          // 型、こちらは値そのものの重複である。5行の field 選択なので、
+          // 重複のコストは小さいと判断した）。
+          activityKind: classifyManagerActivity({
+            turnEndReason: manager.turnEndReason,
+            turnEndedAt: manager.turnEndedAt,
+            lastReportAt: manager.lastReportAt,
+            toolUseStallPending: manager.toolUseStallPending,
+            waitingCount: manager.waiting.length,
+          }),
+          lastTurnEndedAt: manager.updatedAt,
+        },
+        now,
+      );
+      if (!isCandidate) continue;
+      outcomes.push(await this.#autoFoldOne(manager.managerId, runnerId, pids));
+    }
+    return outcomes;
+  }
+
+  /**
+   * Issue #1394 段⑥⑦ — 実際に1本畳む（か、見送る）。
+   *
+   * 呼ばれた時点で段⑤の5条件は満たしている——ここが持つのはその先の2つの
+   * 安全弁である:
+   *
+   * 1. **競合の再確認。** 候補と判定してからここに来るまでの間（同じ呼び出し
+   *    内の他の委譲の await を挟む）に、誰か・何かが先にこの委譲へ触れて
+   *    `status` が `done` でなくなっているかもしれない。読み直して違って
+   *    いたら、安全側に倒して何もしない（`'raced'`）。
+   * 2. **未 push の安全弁**（`evaluateAutoFoldUnpushedWork`）。`'blocked'` なら
+   *    畳まず、日誌に見送った理由を残す。
+   */
+  async #autoFoldOne(
+    managerId: string,
+    runnerId: string,
+    pids: { readonly current: number; readonly max: number },
+  ): Promise<AutoFoldOutcome> {
+    const pidsNote = `pids ${String(pids.current)}/${String(pids.max)}`;
+
+    const fresh = (await this.#stores.jobs.listJobs()).find((entry) => entry.id === managerId);
+    if (fresh === undefined || fresh.status !== 'done') {
+      return {
+        managerId,
+        runnerId,
+        outcome: 'raced',
+        detail: `候補と判定した後、実際に畳む前に状態を読み直したら done ではなくなっていた（${
+          fresh === undefined ? '台帳から消えている' : `いまは ${fresh.status}`
+        }）。安全側に倒して何もしなかった。`,
+      };
+    }
+
+    const unpushed = await this.unpushedWork(managerId, {
+      // **`UNPUSHED_WORK_OBSERVATION_TIMEOUT_MS` を使い回す**（新しい定数を
+      // 増やさない）——`case 'report'` の fire-and-forget 観測と同じ「安全側に
+      // 短く取った未検証の既定値」という理由がそのまま当てはまる。
+      signal: AbortSignal.timeout(UNPUSHED_WORK_OBSERVATION_TIMEOUT_MS),
+    }).catch((error: unknown): ManagerUnpushedWork => ({
+      kind: 'unavailable',
+      reason: `確かめようとして例外が飛んだ: ${String(error)}`,
+    }));
+    const verdict = evaluateAutoFoldUnpushedWork(unpushed);
+    if (verdict !== 'clear') {
+      const reason = describeAutoFoldUnpushedWorkProbe(unpushed);
+      await this.#journal({
+        type: 'decision',
+        decision:
+          `[auto-fold-skip] ${managerId} は pids 逼迫（runner=${runnerId}、${pidsNote}）で` +
+          `畳む候補だったが、畳まなかった: ${reason}。`,
+        grounds: 'デーモンの自動畳み（Issue #1394 段④⑥）: 未pushの安全弁が clear ではなかった',
+      });
+      return {
+        managerId,
+        runnerId,
+        outcome: 'blocked-unpushed-work',
+        detail: reason,
+      };
+    }
+
+    await this.#journal({
+      type: 'decision',
+      decision:
+        `[auto-fold] ${managerId} を pids 逼迫（runner=${runnerId}、${pidsNote}）を理由に自動で畳む` +
+        '（手が空いている・背景処理待ちの印なし・未pushの作業なし、のすべてを満たした）。',
+      grounds:
+        'デーモンの自動畳み（Issue #1394 段④⑥⑦）: pidsが上限の80%以上・段⑤の畳む候補の5条件・' +
+        '未push安全弁のすべてを満たした',
+    });
+
+    const result = await this.abort(
+      managerId,
+      `pids 逼迫（${pidsNote}）を受けてデーモンが自動で畳んだ`,
+      'auto-fold',
+    );
+    return {
+      managerId,
+      runnerId,
+      outcome:
+        result.outcome === 'stopped'
+          ? 'folded'
+          : result.outcome === 'not_stopped'
+            ? 'not-stopped'
+            : 'unknown',
+      detail: result.detail,
+    };
   }
 
   /**
@@ -6767,7 +6988,8 @@ class Pool implements ManagerPool {
   ): Promise<ManagerAbortResult> {
     await this.#ensureConnected();
 
-    const who = by === 'clone' ? 'クローン' : '人間';
+    const who =
+      by === 'clone' ? 'クローン' : by === 'auto-fold' ? 'デーモン（pids逼迫の自動畳み）' : '人間';
 
     const record = this.#records.get(managerId) ?? (await this.#load(managerId));
     if (!record) {
