@@ -280,6 +280,41 @@ export interface ManagerSummary {
    */
   runnerLostSince?: string;
   /**
+   * **`status: 'running'` のまま、宛先の runner が名簿から entry ごと消えている**
+   * と判定したときだけ `true` で立てる（Issue #1212 running 側。段1）。
+   * 判定していなければ**欄ごと消える**。
+   *
+   * ## `runnerLostSince` とは材料が違う——両者は排他ではない
+   *
+   * あちらの材料は `#silentRunners()`（**entry は名簿に残っているが**
+   * `state: 'lost'`）。こちらの材料は `#registeredRunnerIds()`（entry の
+   * **有無だけ**を見る）で、entry がまるごと消えている委譲だけを拾う
+   * ——名簿から entry が消える前に必ず `lost` を経由するとは限らないので、
+   * 「この欄が立つ委譲は必ず先に `runnerLostSince` が立っていた」とは言えない。
+   * `vanishedRunnerBacklog`（このファイル）が runnerId ごとに数えている集合を、
+   * 委譲ごとにばらして運ぶのがこの欄である。
+   *
+   * ## 時刻を持たない——消えた時刻は取れないので作らない
+   *
+   * 名簿は entry がいつ消えたかを記録していない（在るか無いかしか分からない）。
+   * **`…Since` の形で時刻を載せると、読み手（CLI・Web・クローン）はそれを
+   * 消えた時刻として読む**——実際に入れられるのは走り始めた時刻の近似だけで、
+   * 取れない値を作ることになる（AGENTS.md の地雷「取れない軸に 0 の行を
+   * 作る」と同じ向き）。⟹ 欄は印だけにし、経過の目安が要る読み手は同じ行の
+   * `startedAt` を「走り始め」として名乗って使う（`vanishedRunnerBacklog` の
+   * `oldestStartedAt` と同じ近似を、近似だと分かる名前のまま渡す）。
+   *
+   * ## `isLive()` の返り値は動かさない（#1442 の判断を踏襲）
+   *
+   * `live` は `#silentRunners()` だけを見て決まり、この欄が立っていても
+   * `live` は動かない——entry がまるごと消えている委譲でも、`sessionId` が
+   * 残っていれば `manager_send` は resume から入り直せることがあるためで
+   * ある（`live` の doc にある「戻せないことの証明ではない」と同じ理由）。
+   * この欄は `live` / `status` のどちらにも触れず、独立した集合に**添える**
+   * だけである。
+   */
+  runnerVanished?: true;
+  /**
    * **宛先の runner が応答したうえで、この委譲のセッションを一覧に載せなかったと
    * 観測した時刻**（ISO8601）。観測していなければ**欄ごと消える**。
    *
@@ -4650,10 +4685,12 @@ class Pool implements ManagerPool {
       text: `${EXCHANGE_KIND_REPLY_PREFIX}[${managerId}] ${input.request}`,
     });
     const silent = this.#silentRunners();
+    const registeredRunnerIds = this.#registeredRunnerIds();
     return summaryOf(
       record,
       isLive(record, silent),
       lostSinceOf(record, silent),
+      vanishedOf(record, registeredRunnerIds),
       record.sessionMissingSince,
       record.turnEndedAt,
       record.turnEndReason,
@@ -5107,6 +5144,11 @@ class Pool implements ManagerPool {
     // 読んで台帳へ写すだけである（`#noteMissingSessions` / `#silentRunners`）。
     this.#noteMissingSessions();
     const silent = this.#silentRunners();
+    // **同じ理由で1回だけ引く（Issue #1212 running 側。段1）。** 一覧を作って
+    // いる間に名簿が動いても、同じ応答の中では全件を同じ像で比べる
+    // （`activeTokenGeneration` と同じ筋。真下の `#noteVanishedRunnerGauge` の
+    // 呼び出しにもこの値を渡し、二重に読み直さない）。
+    const registeredRunnerIds = this.#registeredRunnerIds();
     // **一覧まるごと同じ「現役」で比べる**（Issue #914 提案1）。1本ずつ
     // `this.#tokenIdentity?.()` を呼び直すと、一覧を作っている間に回転が
     // 割り込んだとき、同じ応答の中で一部だけ新しい現役と比べることになる
@@ -5125,6 +5167,7 @@ class Pool implements ManagerPool {
           record,
           isLive(record, silent),
           lostSinceOf(record, silent),
+          vanishedOf(record, registeredRunnerIds),
           record.sessionMissingSince,
           record.turnEndedAt,
           record.turnEndReason,
@@ -5156,6 +5199,7 @@ class Pool implements ManagerPool {
           fallback,
           isLive(fallback, silent),
           lostSinceOf(fallback, silent),
+          vanishedOf(fallback, registeredRunnerIds),
           fallback.sessionMissingSince,
           fallback.turnEndedAt,
           fallback.turnEndReason,
@@ -5178,7 +5222,7 @@ class Pool implements ManagerPool {
     // 道具・毎ターンの状況の節・日報のどれからも呼ばれる既存の呼び出し先
     // なので、新しい tick は足さずここへ載せる——書く頻度は
     // `#noteVanishedRunnerGauge` 自身が「本数が変わった回だけ」に絞る。
-    await this.#noteVanishedRunnerGauge(summaries);
+    await this.#noteVanishedRunnerGauge(summaries, registeredRunnerIds);
     return summaries.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   }
 
@@ -5212,9 +5256,12 @@ class Pool implements ManagerPool {
    * 将来 `#journal` の実装が変わっても、この計器の書き込みの遅さ・失敗で
    * `list()` が止まる/落ちることはない。
    */
-  async #noteVanishedRunnerGauge(summaries: readonly ManagerSummary[]): Promise<void> {
+  async #noteVanishedRunnerGauge(
+    summaries: readonly ManagerSummary[],
+    registeredRunnerIds: ReadonlySet<string>,
+  ): Promise<void> {
     try {
-      const backlog = vanishedRunnerBacklog(summaries, this.#registeredRunnerIds());
+      const backlog = vanishedRunnerBacklog(summaries, registeredRunnerIds);
       for (const runnerId of this.#vanishedRunnerGaugeLastCount.keys()) {
         if (!backlog.has(runnerId)) this.#vanishedRunnerGaugeLastCount.delete(runnerId);
       }
@@ -6651,6 +6698,7 @@ class Pool implements ManagerPool {
     }
 
     const silent = this.#silentRunners();
+    const registeredRunnerIds = this.#registeredRunnerIds();
     const resumed: ManagerSummary[] = [];
     for (const job of await this.#stores.jobs.listJobs()) {
       if (this.#records.has(job.id)) continue;
@@ -6747,6 +6795,7 @@ class Pool implements ManagerPool {
             record,
             isLive(record, silent),
             lostSinceOf(record, silent),
+            vanishedOf(record, registeredRunnerIds),
             record.sessionMissingSince,
             record.turnEndedAt,
             record.turnEndReason,
@@ -6863,6 +6912,7 @@ class Pool implements ManagerPool {
             record,
             isLive(record, silent),
             lostSinceOf(record, silent),
+            vanishedOf(record, registeredRunnerIds),
             record.sessionMissingSince,
             record.turnEndedAt,
             record.turnEndReason,
@@ -11997,6 +12047,30 @@ function lostSinceOf(
   return record.job.runnerId === undefined ? undefined : silentRunners.get(record.job.runnerId);
 }
 
+/**
+ * {@link ManagerSummary.runnerVanished} を1件ぶん判定する
+ * （Issue #1212 running 側。段1）。`lostSinceOf` と対になる関数だが材料が
+ * 違う——あちらは `#silentRunners()`、こちらは `#registeredRunnerIds()`
+ * （entry の有無だけを見る。{@link Pool.#registeredRunnerIds} の doc）を引く。
+ *
+ * **`status !== 'running'` なら常に `undefined`。** `vanishedRunnerBacklog`
+ * が `summary.status !== 'running'` を弾いているのと同じ条件——`done` で
+ * 畳まれた委譲の宛先が後から消えても、それは「running のまま残っている」
+ * 症状ではない。
+ *
+ * **時刻は返さない**（`ManagerSummary.runnerVanished` の doc「時刻を持たない」）。
+ */
+function vanishedOf(
+  record: ManagerRecord,
+  registeredRunnerIds: ReadonlySet<string>,
+): true | undefined {
+  if (record.job.status !== 'running') return undefined;
+  const runnerId = record.job.runnerId;
+  if (runnerId === undefined) return undefined;
+  if (registeredRunnerIds.has(runnerId)) return undefined;
+  return true;
+}
+
 function isLive(record: ManagerRecord, silentRunners: ReadonlyMap<string, string>): boolean {
   // **`lost` は何より先に見る。** 「繋がっている（`attached`）なら live」を先に
   // 置くと、両立しない組を出さないことが「両者が同時に立つ代入が無い」という
@@ -12242,6 +12316,12 @@ function summaryOf(
   record: ManagerRecord,
   live: boolean,
   runnerLostSince: string | undefined,
+  // **`live` と同じ作法で引数にする（Issue #1212 running 側。段1）。** 材料は
+  // `#registeredRunnerIds()`——`record` からは（`this` を持たない `summaryOf`
+  // からは）読めないプロセス内の状態なので、呼ぶ側が `vanishedOf(record,
+  // registeredRunnerIds)` で計算した値だけをここへ渡す。
+  // `ManagerSummary.runnerVanished` の doc。
+  runnerVanished: true | undefined,
   sessionMissingSince: string | undefined,
   turnEndedAt: string | undefined,
   turnEndReason: string | undefined,
@@ -12278,6 +12358,10 @@ function summaryOf(
     // **`live` と同じ引数の作法で運ぶ（省略可能な引数にしない）。** 既定を置くと、
     // 足す人が考えなかったことが「宛先の器は黙っていない」という主張になって外へ出る。
     ...(runnerLostSince === undefined ? {} : { runnerLostSince }),
+    // **同上（Issue #1212 running 側。段1）。** 既定を置くと、足す人が考えなかった
+    // ことが「entry は名簿に残っている」という主張になって外へ出る。呼ぶ側は
+    // `vanishedOf(record, registeredRunnerIds)` の返り値をそのまま渡せばよい。
+    ...(runnerVanished === undefined ? {} : { runnerVanished }),
     // **同上（#563）。** 既定を置くと、足す人が考えなかったことが「runner はこの
     // 委譲のセッションを持っている」という主張になって外へ出る。呼ぶ側は
     // `record.sessionMissingSince` をそのまま渡せばよい（像が正本である）。
