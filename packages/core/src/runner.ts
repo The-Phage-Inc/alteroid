@@ -1803,6 +1803,19 @@ class RunnerSession {
     if (this.#stopped) return;
     this.#stopped = true;
 
+    // **オーナー判断（2026-09-26、Issue #1533）。報告は「stop が指示された
+    // 時点の状態」を名乗る——`#settleAll` より前でここに控える。**
+    // `#shipArchive` / `#flushUnreported` を `#reader` の後ろへ動かした結果、
+    // 下の `#settleAll` が先に走るようになった。`settle()`（`#pending` の
+    // `settle:` コールバック）は「`waiting_human` かつ `#pending` が空になった」
+    // 時点で `#status` を `running` に戻す既存の仕組みを持つので、控えずに
+    // `this.#status` をそのまま読むと、確認が解放された**後**の値
+    // （`running`）を報告が名乗ってしまう——`#settleAll` が
+    // `#flushUnreported` より後だった以前には無かった状態変化で、報告の
+    // 意味が変わってしまう。**ここで控えるのは、その変化を打ち消し、以前
+    // どおり「stop が指示された瞬間の状態」を報告に載せるためである。**
+    const statusAtStop = this.#status;
+
     // **器の入れ替えと `manager_stop` はここを通る**（`Host#shutdown` / `Host#stop`
     // → `stop()`）。`result` を待っていると、この経路で畳まれたぶんは台帳に1行も
     // 残らない。生ログと同じで、渡し損ねたら二度と取れない。
@@ -1811,7 +1824,8 @@ class RunnerSession {
     // **`worker_wait` も同じ理由で取りこぼさない。** この経路は `#finish` を
     // 通らないので、ここで閉じないと開いたままの区間が黙って消える
     // （`#finish` の doc と同じ判断）。`settled` は渡さない — 中で
-    // `#openTasks` の状態から導く（`#closeWorkerWaitWindow` の doc）。
+    // `RunnerWorkerWaitWindow` の `#openTasks` の状態から導く
+    // （`#closeWorkerWaitWindow` の doc）。
     this.#closeWorkerWaitWindow();
 
     // **分類できなかった失敗の件数も、同じ理由でここで出す（Issue #393）。**
@@ -1820,14 +1834,10 @@ class RunnerSession {
     // 初出の1行は既に出ているので存在は残るが、**量が失われる**。
     noteUnclassifiedFailuresSummary(this.#unclassifiedFailures, this.#id);
 
-    // 止まる前に全文を返す。runner のディスクは器と一緒に消えるので、ここで
-    // 渡し損ねると manager_id から生ログへ降りる経路が切れる。
-    await this.#shipArchive();
-    // **`#finish` と同じ理由でここにも置く（#323）。** この経路は `closed` すら
-    // 出さないので、置かないと「マネージャーが既に書いた本文」が器と一緒に消える
-    // — 直上の `#shipArchive` / `#flushUsage` / `#closeWorkerWaitWindow` が
-    // ここに並んでいるのと同じ穴である。
-    this.#flushUnreported(reason, this.#status);
+    // **`#settleAll` の位置はここに残す（`#wakeInput` → `query.close()` の前）。**
+    // 経路Aと経路Bで `report`/`settled` の前後が入れ替わるのは、この行を動かした
+    // からではなく、下の `#shipArchive` / `#flushUnreported` を後ろへ動かした
+    // からである（Issue #1533 の測定コメントが指摘した (b) の食い違い）。
     this.#settleAll(reason);
     this.#wakeInput();
     try {
@@ -1835,7 +1845,35 @@ class RunnerSession {
     } catch {
       // 既に閉じている
     }
+    // **Issue #1533。生ログの送り出しと報告を、CLI の読み手（`#reader`）が
+    // 終わるまで待ってから出す。** 以前はここが `query.close()` の前にあり、
+    // CLI がまだ生きているうちに一発で `readFile` していた —— 読んだ後に CLI が
+    // 書く行（stdin の EOF を受けてから書く最後の数行など）を確実に取りこぼす
+    // 形だった。`#finish()` 側には既に「`close()` より先に読む」という注釈が
+    // あるが、あれは control channel（`#flushUsage` が使う）の話であって、
+    // 生ログ（ファイル）の読み出しとは別の資源である——生ログはここで
+    // `#reader` の終わりを待ってから読む形に変える。
+    //
+    // **未確認の前提**: CLI が stdout を閉じた（＝`#reader` が終わった）時点で、
+    // 生ログを書き終えているという前提の上に立っている。SDK
+    // （`@anthropic-ai/claude-agent-sdk@0.3.282`）の `Query#close()` は stdin を
+    // 閉じたあと 2000ms 待って `SIGTERM`、さらに 5000ms 待って `SIGKILL` を
+    // 送るだけで、生ログ（`transcript_path`）を書いているのは CLI のサブ
+    // プロセス自身である——そのバイナリの中でいつフラッシュ・fsync するかは
+    // 読めない（Issue #1533 のコメント、SDK 調査）。**確かめていない。**
     await this.#reader?.catch(() => undefined);
+    // 止まる前に全文を返す。runner のディスクは器と一緒に消えるので、ここで
+    // 渡し損ねると manager_id から生ログへ降りる経路が切れる。
+    await this.#shipArchive();
+    // **`#finish` と同じ理由でここにも置く（#323）。** この経路は `closed` すら
+    // 出さないので、置かないと「マネージャーが既に書いた本文」が器と一緒に消える
+    // — 直上の `#shipArchive` / `#flushUsage` / `#closeWorkerWaitWindow` が
+    // ここに並んでいるのと同じ穴である。
+    //
+    // **`this.#status`（いまの値）ではなく `statusAtStop`（入口で控えた値）を
+    // 渡す。** 上の断りのとおり——`#settleAll` が確認を解いた後の `#status` を
+    // 読むと、報告の意味が変わってしまう。
+    this.#flushUnreported(reason, statusAtStop);
     this.#onClosed();
   }
 
@@ -2973,8 +3011,9 @@ class RunnerSession {
     // （他の道具の `brief`/`randomUUID` 系の判断と同じ）。**代用値をここで作るのは、
     // 何で埋めるかが層の判断だからである**（`agent-events.ts` の doc）。
     const taskId = event.taskId ?? randomUUID();
-    // **#1373: `#openTasks` の開閉とは無関係に、このターンで開いた作業者を
-    // 別勘定で数える。** `RunnerTurnTally` の `#openedWorkersThisTurn` の doc を参照。
+    // **#1373: `RunnerWorkerWaitWindow` の `#openTasks` の開閉とは無関係に、
+    // このターンで開いた作業者を別勘定で数える。** `RunnerTurnTally` の
+    // `#openedWorkersThisTurn` の doc を参照。
     this.#turnTally.addOpenedWorker(taskId);
     this.#workerWaitWindow.taskStarted(taskId);
   }
@@ -3414,8 +3453,9 @@ class RunnerSession {
     // 終わる経路そのものである。
     await this.#flushUsage();
     // **取りこぼしを作らない。** window が開いたまま（か閉じ待ちのまま）
-    // 畳まれるなら降ろしてから閉じる。`settled` は渡さない — その時点の
-    // `#openTasks` から導く（`#closeWorkerWaitWindow` の doc）。委譲した全員
+    // 畳まれるなら降ろしてから閉じる。`settled` は渡さない —
+    // `RunnerWorkerWaitWindow` のその時点の `#openTasks` から導く
+    // （`#closeWorkerWaitWindow` の doc）。委譲した全員
     // から通知を受け切っていたのに `result` が来ないまま閉じた回は
     // `settled: true` になる（`turns` が最後の1回を含まないだけである）。
     this.#closeWorkerWaitWindow();

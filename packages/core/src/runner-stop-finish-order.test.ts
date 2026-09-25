@@ -30,6 +30,14 @@ import type { RunnerEvent } from './runner-protocol.js';
  * Issue #1533 本文）。**このテストが赤くなったら「順序が変わった」という事実
  * だけを報告し、直す・戻すの判断はオーナーに委ねること。**
  *
+ * **2026-09-25 追記: 上の3点のうちオーナーが選んだ形が入った。** `stop()` の
+ * `#shipArchive`/`#flushUnreported` を `query.close()` → `await this.#reader`
+ * の後ろへ動かした（`#settleAll` の位置はそのまま）。**これは「揃えた」の
+ * ではなく「報告を後ろへ動かした」結果、経路Aの並びが経路Bの並びに実質的に
+ * 近づいた形である**（PR 本文に同じ断り書きがある）。下の `経路A（stop()）`
+ * と `(a)〜(c)` のテストは、この変更を受けて期待値を書き換えてある——元の
+ * 期待値・コメントは各テストに history として残してある。
+ *
  * ## 何を1本の時系列に積むか
  *
  * `RunnerHost` の `emit` コールバックが呼ばれた順に、そのまま `timeline` へ
@@ -75,21 +83,55 @@ interface FakeSession {
    * ——**この歯が選んだ「経路B」の代表**（下の doc を見よ）。
    */
   end(): void;
+  /**
+   * `deferCloseEnd: true` のときだけ意味を持つ。**`Query#close()` が呼ばれても
+   * ストリームをまだ終わらせない**（本物の SDK が `close()` の後も CLI の
+   * 終了・生ログの書き切りを待つ「やわらかい停止」を模す——PR 本文の
+   * 「未確認の前提」）。この呼び出しで初めてストリームを終える。
+   */
+  endAfterClose(): void;
+  /**
+   * `deferCloseEnd: true` のときだけ意味を持つ。`endAfterClose()` の代わりに
+   * ——ストリームを**例外で**終わらせる。`close()` を呼んだこと自体とは
+   * 独立の、transport 側の故障（壊れた pipe 等）を模す（Issue #1533 の
+   * SDK 調査コメント: 本物の `Query#close()` は `inputStream.done()` で
+   * 正常終了させるだけで、例外にするのは `readMessages()` の別ループの
+   * catch である）。Issue #1589 / PR #1590 が固定した「`stop()` の後にこれが
+   * 起きても `#finish('failed', …)` は呼ばれない」を、#1533 の並べ替え後の
+   * 形（生ログ・報告が `#reader` の後ろ）でも保つことを確かめる歯専用。
+   */
+  crashAfterClose(reason: string): void;
 }
 
-function fakeSdk(onClose: () => void): { fn: typeof sdkQuery; sessions: FakeSession[] } {
+/**
+ * @param onClose `Query#close()` が呼ばれた瞬間に鳴らす（timeline へ積むため）。
+ * @param testOptions.deferCloseEnd `true` なら `close()` が呼ばれても
+ *   `for await` を終わらせない——`FakeSession#endAfterClose()` を呼ぶまで
+ *   `#reader` は生きたままになる。新しい歯（「archive は #reader の終わりの
+ *   後」）専用。既定 (`false`) は他のテストと同じ「`close()` が即座に終わらせる」
+ *   動き。**名前を `testOptions` にしてあるのは、下の `params.options`（SDK の
+ *   `Options`）と同じ名前にすると後者にシャドウされて無効化されるため**
+ *   （実装中に一度その事故を踏んで直した——`options` という名前は下で
+ *   `const options = params.options ?? {};` として再定義される）。
+ */
+function fakeSdk(
+  onClose: () => void,
+  testOptions: { deferCloseEnd?: boolean } = {},
+): { fn: typeof sdkQuery; sessions: FakeSession[] } {
   const sessions: FakeSession[] = [];
   let sayCounter = 0;
 
   const fn = ((params: { prompt: unknown; options?: Options }) => {
     const options = params.options ?? {};
     let emit: ((message: SDKMessage | null) => void) | null = null;
+    let fail: ((error: unknown) => void) | null = null;
     const buffered: SDKMessage[] = [];
 
     const push = (message: SDKMessage | null) => {
       if (emit) {
         const resolve = emit;
         emit = null;
+        fail = null;
         resolve(message);
       } else if (message !== null) {
         buffered.push(message);
@@ -140,6 +182,17 @@ function fakeSdk(onClose: () => void): { fn: typeof sdkQuery; sessions: FakeSess
       end() {
         push(null);
       },
+      endAfterClose() {
+        push(null);
+      },
+      crashAfterClose(reason) {
+        if (fail) {
+          const reject = fail;
+          emit = null;
+          fail = null;
+          reject(new Error(reason));
+        }
+      },
     };
     sessions.push(session);
 
@@ -161,10 +214,12 @@ function fakeSdk(onClose: () => void): { fn: typeof sdkQuery; sessions: FakeSess
           yield next;
           continue;
         }
-        const message = await new Promise<SDKMessage | null>((resolve) => {
+        const message = await new Promise<SDKMessage | null>((resolve, reject) => {
           emit = resolve;
+          fail = reject;
         });
         emit = null;
+        fail = null;
         if (message === null) return;
         yield message;
       }
@@ -174,6 +229,7 @@ function fakeSdk(onClose: () => void): { fn: typeof sdkQuery; sessions: FakeSess
     return Object.assign(generator, {
       close: () => {
         onClose();
+        if (testOptions.deferCloseEnd) return;
         push(null);
       },
       interrupt: async () => undefined,
@@ -253,7 +309,7 @@ function labelOf(event: RunnerEvent): string {
  * 時点でまだ `host.list()` に載っているか」を記録する——載っていれば
  * `onClosed` はまだ呼ばれていない証拠になる。
  */
-function setup(): {
+function setup(sdkOptions: { deferCloseEnd?: boolean } = {}): {
   host: RunnerHost;
   events: RunnerEvent[];
   timeline: string[];
@@ -273,7 +329,7 @@ function setup(): {
   const events: RunnerEvent[] = [];
   const timeline: string[] = [];
   const managerId = 'mgr-1';
-  const { fn, sessions } = fakeSdk(() => timeline.push('query.close()'));
+  const { fn, sessions } = fakeSdk(() => timeline.push('query.close()'), sdkOptions);
   let stillListedAtLastEmit = false;
 
   const host = createRunnerHost({
@@ -362,17 +418,46 @@ describe('#1533: stop() と #finish の畳みの順序を、現状のまま固�
     // **characterization —— 現状の並びをそのまま固定する。**
     // ⛔ この配列が変わったら「順序が変わった」という事実だけを報告し、直す
     // ・戻すの判断はしない（ファイル冒頭の doc）。
+    //
+    // **2026-09-25 追記（Issue #1533 の直し）。** 元は次の並びだった:
+    //
+    // ```
+    // 'emit:usage', 'emit:worker_wait(settled=false)', 'emit:archive(len=9)',
+    // 'emit:report(status=waiting_human,unreported=true)',
+    // 'emit:settled(requestId=req-1)', 'query.close()',
+    // ```
+    //
+    // `stop()` の `#shipArchive`/`#flushUnreported` を `query.close()` →
+    // `await this.#reader` の後ろへ動かした（生ログを CLI の読み手が終わって
+    // から読む——PR 本文の「未確認の前提」を見よ）ことで、下の並びへ変わった。
+    // `#settleAll` の位置そのものは動かしていない——動いたのは
+    // `archive`/`report` の側で、結果として `settled` より後ろへ回った。
+    //
+    // **`status` が `waiting_human` から `running` に変わった理由も同じ移動の
+    // 副作用である。** `#onPermission` が確認を積んだ時点で
+    // `#status = 'waiting_human'` になり、`settle()` は「`waiting_human` かつ
+    // `#pending` が空になった」時点で `running` へ戻す
+    // （`packages/core/src/runner.ts` の `settle:` コールバック）。以前は
+    // `#flushUnreported` が `settleAll` より先に走っていたので、まだ
+    // `waiting_human` のまま報告していた。いまは `settleAll` が先に確認を
+    // deny で解いてから `#flushUnreported` が走るので、報告の時点ではもう
+    // `running` に戻っている——クローンへ届く報告としては、むしろこちらの方が
+    // 「もう確認は待っていない」という実情に合っている。
+    //
+    // **2026-09-26 追記: オーナーはこの判断を採らなかった。** 「報告は
+    // stop が指示された時点の状態を名乗る」という以前の挙動を保つ方を選び、
+    // `stop()` の入口（`#stopped = true` の直後、`#settleAll` より前）で
+    // `this.#status` を `statusAtStop` として控え、`#flushUnreported` には
+    // その控えた値を渡す形に直した（`runner.ts` の `stop()` 冒頭のコメントを
+    // 見よ）。だから `status` は `waiting_human` のまま——上の「むしろ実情に
+    // 合っている」という判断は、実装のログとして残すが不採用である。
     expect(s.timeline).toEqual([
       'emit:usage',
       'emit:worker_wait(settled=false)',
-      'emit:archive(len=9)',
-      // **`status` は `waiting_human`。** 未決の確認（`askPermission`）がまだ
-      // 解けていない時点で `#flushUnreported` が呼ばれるため——`#onPermission`
-      // が確認を積んだ時点で `#status = 'waiting_human'` にしており、解けるのは
-      // この直後の `settleAll`（次の行）である。
-      'emit:report(status=waiting_human,unreported=true)',
       'emit:settled(requestId=req-1)',
       'query.close()',
+      'emit:archive(len=9)',
+      'emit:report(status=waiting_human,unreported=true)',
     ]);
 
     // stop() は closed を emit しない（doc「あちらは closed すら出さない」）。
@@ -440,7 +525,15 @@ describe('#1533: stop() と #finish の畳みの順序を、現状のまま固�
  * にくいので、同じ状態から取り直して個別に検算する。
  */
 describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
-  it('(a) report の emit は query.close() の前か後か——経路で違う', async () => {
+  it('(a) report の emit は query.close() の前か後か——#1533 の直しで揃った（以前は経路で違った）', async () => {
+    // **2026-09-25 追記（Issue #1533 の直し）。** このテストは元は
+    // 「経路A: report が close より前 / 経路B: report が close より後」という
+    // **食い違い**を固定していた（タイトルも「経路で違う」だった）。`stop()` の
+    // `#shipArchive`/`#flushUnreported` を `query.close()` → `await this.#reader`
+    // の後ろへ動かしたことで、経路Aも「report は close より後」になり、
+    // **この食い違いそのものが無くなった**——揃えるのが直しの目的だったので、
+    // ここでは「揃っている」ことを固定し直す。
+
     // 経路A
     const a = setup();
     await a.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
@@ -454,7 +547,7 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
     const closeIdxA = a.timeline.indexOf('query.close()');
     expect(reportIdxA).toBeGreaterThanOrEqual(0);
     expect(closeIdxA).toBeGreaterThanOrEqual(0);
-    expect(reportIdxA).toBeLessThan(closeIdxA); // 経路A: report が close より前
+    expect(reportIdxA).toBeGreaterThan(closeIdxA); // 経路A: report は close より後（直しで動いた）
 
     // 経路B
     const b = setup();
@@ -472,12 +565,18 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
     const closeIdxB = b.timeline.indexOf('query.close()');
     expect(reportIdxB).toBeGreaterThanOrEqual(0);
     expect(closeIdxB).toBeGreaterThanOrEqual(0);
-    expect(reportIdxB).toBeGreaterThan(closeIdxB); // 経路B: report が close より後
+    expect(reportIdxB).toBeGreaterThan(closeIdxB); // 経路B: report が close より後（以前と同じ）
 
-    // ⟹ 差が有る（実測）。
+    // ⟹ 差が無くなった（実測）。
   });
 
-  it('(b) 未決の確認の解決（settled）は report の emit の前か後か——経路で違うか、値は同じか', async () => {
+  it('(b) 未決の確認の解決（settled）は report の emit の前か後か——#1533 の直しで揃った（以前は経路で違った）', async () => {
+    // **2026-09-25 追記（Issue #1533 の直し）。** 元は「経路A: settled が
+    // report より後 / 経路B: settled が report より前」という食い違いを固定
+    // していた。`#settleAll` の呼び出し位置そのものは動かしていない
+    // （PR 本文の断り）——動いたのは `report`（`#flushUnreported`）の側で、
+    // それが `settleAll` より後ろへ回った結果、経路Aも「settled が report より
+    // 前」になった。
     const a = setup();
     await a.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
     const sessionA = await firstSession(a.sessions);
@@ -489,8 +588,8 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
 
     const settledIdxA = a.timeline.findIndex((l) => l.startsWith('emit:settled'));
     const reportIdxA = a.timeline.findIndex((l) => l.startsWith('emit:report'));
-    // 経路A: settleAll は flushUnreported（report）より後
-    expect(settledIdxA).toBeGreaterThan(reportIdxA);
+    // 経路A: settleAll は flushUnreported（report）より前（直しで動いた）
+    expect(settledIdxA).toBeLessThan(reportIdxA);
 
     const b = setup();
     await b.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
@@ -516,12 +615,17 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
       (answerB as { message?: string }).message,
     );
 
-    // ⟹ 前後関係に差が有る（実測）。解決される決定（behavior）は同じ、
-    // message（reason の文言）は違う——経路ごとに違う reason 文字列を渡している
-    // ためで、これは順序とは別の軸である。
+    // ⟹ 前後関係の差は無くなった（実測）。解決される決定（behavior）は以前と
+    // 同じ、message（reason の文言）が違うのも以前と同じ——経路ごとに違う
+    // reason 文字列を渡しているためで、これは順序とは別の軸のまま変わっていない。
   });
 
-  it('(c) 生ログの書き出し（archive）は query.close() の前か後か——経路で違う。fake が close 後の破損まで模していないことも書く', async () => {
+  it('(c) 生ログの書き出し（archive）は query.close() の前か後か——#1533 の直しで揃った（以前は経路で違った）。fake が close 後の破損まで模していないことも書く', async () => {
+    // **2026-09-25 追記（Issue #1533 の直し）。** 元は「経路A: archive が close
+    // より前 / 経路B: archive が close より後」という食い違いを固定していた
+    // ——これがまさに #1533 が問題にした食い違いそのものである。`stop()` の
+    // `#shipArchive` を `query.close()` → `await this.#reader` の後ろへ動かした
+    // ことで、経路Aも「archive は close より後」になった。
     const a = setup();
     await a.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
     const sessionA = await firstSession(a.sessions);
@@ -532,7 +636,7 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
 
     const archiveIdxA = a.timeline.findIndex((l) => l.startsWith('emit:archive'));
     const closeIdxA = a.timeline.indexOf('query.close()');
-    expect(archiveIdxA).toBeLessThan(closeIdxA); // 経路A: archive が close より前
+    expect(archiveIdxA).toBeGreaterThan(closeIdxA); // 経路A: archive は close より後（直しで動いた）
 
     const b = setup();
     await b.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
@@ -547,19 +651,24 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
 
     const archiveIdxB = b.timeline.findIndex((l) => l.startsWith('emit:archive'));
     const closeIdxB = b.timeline.indexOf('query.close()');
-    expect(archiveIdxB).toBeGreaterThan(closeIdxB); // 経路B: archive が close より後
+    expect(archiveIdxB).toBeGreaterThan(closeIdxB); // 経路B: archive が close より後（以前と同じ）
 
-    // ⟹ 順序自体は差が有る（実測）。
+    // ⟹ 順序自体の差は無くなった（実測）。
     //
     // ただし「close の後に読むと壊れる／欠ける」かどうかは、**この足場では
     // 測れない**——`#shipArchive()` は `node:fs/promises` の実物の `readFile`
     // を、実在するローカルの一時ファイルに対して呼ぶ（`fakeSdk` は
     // `transcript_path` という文字列を運ぶだけで、SDK の `Query#close()` を
-    // 模した `close()` はこのファイルを一切触らない）。だから経路Bで
+    // 模した `close()` はこのファイルを一切触らない）。だから両経路で
     // 「close の後に archive を読んでいる」ことは実測できても、**本物の SDK
     // が close 時にこのファイルへ何をするか（閉じる／削除する／書きかけで
     // 止める等）は、この fake では検証できない**——これは案2（SDK の
     // `Query.close()` が生ログファイルに何をするか）の側で読むしかない。
+    // **さらに、「close の前に読んでいた」ときの取りこぼし（読んだ後に CLI が
+    // 書く最後の数行）は、この fake では最初から再現できない**——`close()` は
+    // ファイルに触らないので、いつ読んでも同じ内容が返る。だから、この歯は
+    // 「順序が動いたこと」だけを固定し、それが実際に生ログの完全性を上げたか
+    // どうかは主張しない（PR 本文「未確認の前提」）。
   });
 
   it('(d) closed の emit（経路Bだけ）は report の前か後か', async () => {
@@ -622,5 +731,144 @@ describe('#1533 (a)〜(e): 観測できる差があるかどうか', () => {
       return copy;
     };
     expect([...withoutClosed(typesA)].sort()).toEqual([...withoutClosed(typesB)].sort());
+  });
+});
+
+/**
+ * **新しい歯（Issue #1533 の直し本体）。** `stop()` の生ログの送り出し
+ * （`#shipArchive`）は、`#reader`（CLI の読み手）が終わるまで出ないことを
+ * 固定する——「並びが変わった」ことだけでなく、「`close()` を呼んだ直後には
+ * まだ出ていない」という**時間的な余白**そのものを歯にする。
+ *
+ * `deferCloseEnd: true` の fake は、`Query#close()` が呼ばれてもストリームを
+ * 終わらせない（`FakeSession#endAfterClose()` を呼ぶまで `#reader` が生き
+ * 続ける）。これで「`close()` は呼ばれたが CLI 側の後始末（本物の SDK なら
+ * stdin の EOF を受けてから最後の行を書き切るまでの猶予）がまだ終わっていない」
+ * 状態を作れる——このとき `archive` が出ていなければ、`#shipArchive` が本当に
+ * `#reader` の終わりを待っていることの直接証拠になる。
+ *
+ * **変異（`#shipArchive`/`#flushUnreported` を `#reader` の前へ戻す）で赤に
+ * なることを実測した**（このテストを書いた直後に `runner.ts` を一時的に
+ * 元の並びへ戻して確認し、戻した。PR 本文に実測のログを載せる）。
+ */
+describe('#1533 新しい歯: stop() の生ログの送り出しは #reader の終わりの後', () => {
+  it('query.close() の直後にはまだ archive が出ない。#reader が終わって初めて出る', async () => {
+    const s = setup({ deferCloseEnd: true });
+    await s.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
+    const session = await firstSession(s.sessions);
+
+    const transcriptPath = join(dir, 'transcript-defer.jsonl');
+    writeFileSync(transcriptPath, '遅延後に読まれる生ログ', 'utf8');
+    await session.say('畳まれる前に喋った本文');
+    await session.postToolUse({
+      tool_name: 'Bash',
+      tool_input: {},
+      transcript_path: transcriptPath,
+    });
+    s.resetTimeline();
+
+    const stopPromise = s.host.stop('mgr-1');
+
+    // close() は呼ばれるが、deferCloseEnd により #reader はまだ終わらない
+    // ——一呼吸置いて確かめる（`stop()` 自身もまだ解決していないはず）。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(s.timeline).toContain('query.close()');
+    // ⭐ ここが歯の本体: close() は呼ばれても、archive はまだ出ていない。
+    expect(s.timeline.some((l) => l.startsWith('emit:archive'))).toBe(false);
+    expect(s.timeline.some((l) => l.startsWith('emit:report'))).toBe(false);
+    // まだ list に残っている——`stop()` がまだ終わっていない証拠
+    // （`onClosed()` は `stop()` の最後の同期文である）。
+    expect(s.host.list().some((m) => m.managerId === 'mgr-1')).toBe(true);
+
+    // #reader をここで初めて終わらせる——本物の SDK でいえば、CLI が
+    // stdout を閉じて `for await` が自然に終わる瞬間に当たる。
+    session.endAfterClose();
+    await stopPromise;
+
+    // ⭐ #reader が終わって初めて archive/report が出る。
+    expect(s.timeline.some((l) => l.startsWith('emit:archive'))).toBe(true);
+    expect(s.timeline.some((l) => l.startsWith('emit:report'))).toBe(true);
+    const closeIdx = s.timeline.indexOf('query.close()');
+    const archiveIdx = s.timeline.findIndex((l) => l.startsWith('emit:archive'));
+    expect(archiveIdx).toBeGreaterThan(closeIdx);
+  });
+});
+
+/**
+ * **新しい歯（Issue #1533 + #1589、置き場所はここに決めた）。** `stop()` が
+ * `query.close()` した後、`#reader` が例外で抜ける経路（Issue #1589 / PR #1590
+ * が「`#finish('failed', …)` を呼ばない」で塞いだ経路）を、**#1533 の並べ替え
+ * （生ログ・報告を `#reader` の後ろへ動かした形）の上で**もう一度確かめる。
+ *
+ * `runner-unreported.test.ts` にも `fakeSdk({ closeThrows: true })` を使った
+ * 同種の歯（#1590 が足したもの）があるが、あちらは `close()` が呼ばれた瞬間に
+ * 即座にストリームを例外で終わらせる作りで、「`#reader` がまだ終わっていない
+ * 間は report/closed が出ていない」という**時間的な余白**までは見れない。
+ * ここは `deferCloseEnd` + `crashAfterClose` で「`close()` は呼ばれたが
+ * `#reader` はまだ生きている」→「そこで初めて例外が起きる」という2段階を
+ * 作れる、この `timeline` 付きの足場でしか測れない——だからここに置いた。
+ *
+ * `primeState` で未決の確認を1件開いたまま（`#status = 'waiting_human'`）
+ * `stop()` を呼ぶ——`statusAtStop` の断り（`runner.ts` の `stop()` 冒頭）が
+ * 効いていることも同時に確かめる（`#settleAll` が確認を deny で解いて
+ * `#status` が `running` に戻った**後**でも、report は `waiting_human` を
+ * 名乗り続けるはず）。
+ */
+describe('#1533 + #1589 新しい歯: stop() の後に #reader が例外で抜けても、報告は stop() からの1本だけ', () => {
+  it('report は1本だけ・reason/status は stop() のもの・closed は出ない・報告は #reader の終わりの後', async () => {
+    const s = setup({ deferCloseEnd: true });
+    await s.host.start({ managerId: 'mgr-1', request: '調べて', cwd: dir });
+    const session = await firstSession(s.sessions);
+
+    const transcriptPath = join(dir, 'transcript-crash.jsonl');
+    writeFileSync(transcriptPath, '例外経路の生ログ', 'utf8');
+    const { askPromise } = await primeState(session, transcriptPath);
+    s.resetTimeline();
+
+    const stopPromise = s.host.stop('mgr-1');
+
+    // close() は呼ばれるが、deferCloseEnd により #reader はまだ終わらない
+    // ——この時点では report も closed もまだ出ていないはず。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(s.timeline).toContain('query.close()');
+    expect(s.timeline.some((l) => l.startsWith('emit:report'))).toBe(false);
+    expect(s.timeline.some((l) => l.startsWith('emit:closed'))).toBe(false);
+    expect(s.host.list().some((m) => m.managerId === 'mgr-1')).toBe(true);
+
+    // #reader をここで初めて例外で抜けさせる——`close()` を呼んだこと自体とは
+    // 独立の transport 障害を模す（Issue #1533 の SDK 調査コメント: 本物の
+    // `close()` は `inputStream.done()` で正常終了させるだけで、例外にする
+    // のは `readMessages()` の別ループの catch である）。
+    session.crashAfterClose('SDK が close 時に例外を投げた');
+    await stopPromise;
+    const settledAnswer = await askPromise;
+
+    // ⭐ closed は1本も出ない（Issue #1589 / PR #1590 が固定した挙動が、
+    // #1533 の並べ替え後もそのまま効いている）。
+    expect(s.events.some((e) => e.type === 'closed')).toBe(false);
+
+    // ⭐ report はちょうど1本、stop() のもの。
+    const reports = s.events.filter(
+      (e): e is Extract<RunnerEvent, { type: 'report' }> => e.type === 'report',
+    );
+    expect(reports).toHaveLength(1);
+    // reason は stop() の reason（#finish が合成する
+    // 「マネージャーのセッションが落ちた: …」ではない）。
+    expect(reports[0]?.unreported).toEqual({ reason: 'デーモンから停止を指示された。' });
+    // status は stop が指示された時点の値（`waiting_human`）。`#settleAll` が
+    // 確認を deny で解いた後の `running` ではない——`statusAtStop` の断りが
+    // 効いている証拠。
+    expect(reports[0]?.status).toBe('waiting_human');
+
+    // ⭐ その report は #reader の終わりの後に出る（timeline 上でも close より後）。
+    const reportIdx = s.timeline.findIndex((l) => l.startsWith('emit:report'));
+    const closeIdx = s.timeline.indexOf('query.close()');
+    expect(reportIdx).toBeGreaterThan(closeIdx);
+
+    // settleAll は deny で解決する。
+    expect(settledAnswer).toEqual({
+      behavior: 'deny',
+      message: 'デーモンから停止を指示された。',
+    });
   });
 });
