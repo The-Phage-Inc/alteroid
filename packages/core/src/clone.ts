@@ -58,7 +58,7 @@ import {
   distillSucceededEntry,
 } from './distill-gap.js';
 import { stampAnsweredApproval, stampingJournal } from './approval-trace.js';
-import { excerptLine } from './excerpt.js';
+import { excerpt, excerptLine, renderListingFromEnd } from './excerpt.js';
 import {
   EXCHANGE_KIND_DECISION_PREFIX,
   EXCHANGE_KIND_FAILURE_PREFIX,
@@ -778,6 +778,20 @@ const CONTEXT_WINDOW_FOLD_NOTICE =
  *
  * **⛔ ここに「どうすべきか」は書かない**（`usage-limits.ts` の
  * `describeUsageNotice` と同じ約束）。材料だけ渡して判断は人間とクローンに残す。
+ *
+ * ## ⚠️ 「材料は同じ」の中身は、issue #955 でここが書かれた時点から変わっている
+ *
+ * マネージャーの報告（束の `managerReportBatchPrompt` も単発の `managerPrompt` も）は
+ * もう無制限の文字数を持てない（{@link MANAGER_REPORT_BATCH_BODY_BUDGET}）。**これが原因で
+ * 文脈窓に当たっていた回は、開き直せば束が縮んで収まる可能性がある**——
+ * 「材料は同じ」ではなくなる。**外部イベントの束（`externalBatchPrompt`）は
+ * 調べた結果、変更していない**——本文（`renderPayload`）には元から
+ * `EXTERNAL_PAYLOAD_LIMIT` の上限が掛かっており、この軸では最初から
+ * 「材料は同じ」ではなかった（詳細は `externalBatchPrompt` の doc）。それでも
+ * 「材料は同じ」が成り立つ経路は残っている（システムプロンプト・記憶の
+ * 焼き込み・**人間の発言**）——詳しい前提は `#noteContextWindowFold` の doc に
+ * 書いてある。**この下の文言そのものは1文字も変えていない**——どの原因で
+ * あっても「畳んでも直らない」という判断そのものは変わらないため。
  */
 const CONTEXT_WINDOW_FOLD_HELD_NOTICE =
   '⚠️ このセッションは既に会話を引き継がずに開いたもので、まだ1度も答えを返せていない。' +
@@ -7155,6 +7169,41 @@ class Clone implements CloneHost {
    * **畳み直しだけ**で、ターンは回り続ける。そして**抑止しなくても落ち続ける**
    * （同じ材料でもう一度開くだけ）ので、**抑止して悪くなるものが1つも無い。**
    *
+   * ## ⚠️ 「材料は同じ」が指す中身（issue #955）
+   *
+   * **新しいセッションの最初のターンに載りうるものは、次の3種類だけである。**
+   * このうちどれが原因かで、開き直した先が「同じ材料」になるかどうかが変わる。
+   *
+   * 1. **システムプロンプト**（`buildCloneSessionOptions` 等が焼く固定文）——
+   *    セッションを開き直しても内容は変わらない。**常に同じ材料。**
+   * 2. **記憶の焼き込み**（セッション開始時に注入される目次・premise 等）——
+   *    件数・文字数の両方に予算が掛かっている（`memory.ts` の
+   *    `MEMORY_TOC_ENTRY_LIMIT` / `MEMORY_TOC_CHAR_BUDGET`）が、記憶そのものが
+   *    育てば開き直しの間にも伸びうる。**開き直した瞬間だけを見れば、ほぼ同じ材料。**
+   * 3. **このターンを起こした合図の本文**——ここが唯一、合図の種類によって
+   *    答えが変わる:
+   *    - **マネージャーの報告**（束の `managerReportBatchPrompt` と単発の
+   *      `managerPrompt`）は、#955 で本文に文字数の予算を掛けた
+   *      （`MANAGER_REPORT_BATCH_BODY_BUDGET`。束は合計、単発は1件ぶん）。
+   *      **⟹ これが原因だった回は、開き直せば本文が縮んで収まる可能性がある——
+   *      「材料は同じ」ではなくなった。**
+   *    - **外部イベントの束**（`externalBatchPrompt`）は、#955 で調べたが
+   *      変更していない——本文（`renderPayload`）には元から
+   *      `EXTERNAL_PAYLOAD_LIMIT`（8,000文字）の上限が掛かっており、
+   *      この軸では最初から「材料は同じ」ではなかった（詳細は
+   *      `externalBatchPrompt` の doc）。
+   *    - **人間の発言**（`humanTurnText`）には、この直しでも上限を掛けていない
+   *      （意図的——人間の言葉を機械が黙って切ると north_star 禁止1「人間に
+   *      できることがこの層でできないならバグ」に当たる。人間は Web UI で
+   *      全文を送っているのに、クローンだけが黙って切られた版を受け取る形に
+   *      なるため）。**⟹ 巨大な人間の発言が原因の回は、いまも「材料は同じ」
+   *      のままである。**
+   *
+   * **⟹ この関数の判定条件（`#resumedFrom === null && !#sessionAnswered`）は
+   * 1文字も変えていない。** 原因の内訳が変わっただけで、「畳んでも直らない
+   * ケースが在る」という結論そのものは変わらない——2 と 3-人間発言 が残る限り、
+   * この枝は引き続き要る。
+   *
    * ## `setCloneSessionId(null)` は畳んだ後ではなく**印と同時に**打つ
    *
    * 畳む前にプロセスが死ぬ窓が在る。そこで打っていなければ、**長すぎるセッション
@@ -11566,7 +11615,10 @@ function managerPrompt(
     return [
       `${head}（報告）`,
       '',
-      event.text,
+      // **本文に束と同じ予算を掛ける（issue #955）。** 単発の報告も、新しい
+      // セッションの最初のターンに載れば束と同じ形で文脈窓を越えうる——
+      // 束だけ締めて単発を素通しにすると、同じ穴が1件ぶん残る。
+      ...boundedReportBody({ ...event, kind: 'report' }),
       '',
       // **経過も印も、本文の後ろ・指示の前に置く**（#391 と同じ規則。
       // 本文より前に置くと「読まなくてよい」と読まれて本文を飛ばされる ——
@@ -11633,6 +11685,85 @@ function managerPrompt(
 }
 
 /**
+ * `managerReportBatchPrompt` が文字数の予算により報告本文を省いたときに使う、
+ * 全文の取り方（issue #955）。
+ *
+ * **`retrievalHintFor` と機構は同じだが、文言は独立させてある。** あちらの
+ * `manager_message` 分岐の文面は「配り直し」の文脈（`closedRedeliveryNotice`）
+ * 専用で、末尾に「この配り直しでも直前に書いている」と付ける。**ここへ来る
+ * 事象は構造上すべて初回配達である**（`#runManagerReportBatch` の doc
+ * 「この経路に来る事象は構造上すべて初回配達である」）ので、その文言を
+ * そのまま流用すると起きていないことを起きたと書くことになる——だから
+ * `retrievalHintFor` を直接は呼ばず、同じ材料（`journal_read` の `types` /
+ * `since`）で文言だけ書き直した専用の関数を用意した。
+ *
+ * **根拠となる書き込みは同じ**（`#journalIncomingBody`）。`#runManagerReportBatch`
+ * は、この関数の呼び出し元（`managerReportBatchPrompt`）を呼ぶより前に、束の
+ * 全イベントぶん個別に `#journalIncomingBody` を呼び終えている（同関数の doc
+ * 「件数ぶん個別に書く」）——だから探せば必ず見つかる。
+ *
+ * **`externalBatchPrompt` には対応する関数を用意していない。** あちらの本文
+ * （`renderPayload`）には既に `EXTERNAL_PAYLOAD_LIMIT` の上限が掛かっており、
+ * 今回の変更が対象にした「1件あたり無制限」の穴が無かった
+ * （`externalBatchPrompt` の doc に詳細）。
+ */
+function managerReportRetrievalHint(event: ManagerReportMessage): string {
+  return (
+    `全文の取り方: \`journal_read\` に \`types: ["exchange"]\` と ` +
+    `\`since: "${event.at}"\` を渡して絞り込む（マネージャー ${event.managerId} からの` +
+    `${event.kind} が処理されるたびに、"${EXCHANGE_KIND_REPLY_PREFIX}[${event.managerId}/${event.kind}] " で始まる` +
+    '全文を、この束を渡す前に日誌へ個別に書いてある）。'
+  );
+}
+
+/**
+ * `managerReportBatchPrompt` が束ねる報告の本文（合計）に掛ける文字数の予算
+ * （issue #955）。
+ *
+ * **無かった理由。** この束は `MERGED_BATCH_SIZE_LIMIT`（件数＝50）でしか
+ * 締めておらず、1件あたりの文字数には上限が無かった。1件が巨大な報告
+ * （例: 1MB）を50件束ねれば、束のターン入力だけで数十MBになりうる——
+ * `.claude/skills/listing-and-detail/SKILL.md` が言う「件数の上限だけでは
+ * 足りない」の実例そのものである。
+ *
+ * **予算は件数ではなく文字数で持つ。** 積む形は既存のヘルパー
+ * （`excerpt.ts` の `renderListingFromEnd`）を使い、手で書かない——
+ * `memory.ts` の `MEMORY_TOC_CHAR_BUDGET`（#741）と同じ直し方である。
+ * **末尾（＝最新の報告）を優先して残す**（`renderListingFromEnd` の doc
+ * 「並びが時系列で、続きを読む動機が『直近』にある一覧のため」）——
+ * `managerReportBatchPrompt` 自身が「後の報告が前の報告を補足・訂正して
+ * いることがある」と言っている、その「後の報告」を最初に落とすと本末
+ * 転倒になる。
+ *
+ * **値の出し方。** `PROMPT_CHARACTER_BUDGET`（`prompt.ts`。47,500）と同じ
+ * 桁——あちらも「1ターンぶんの連結後プロンプト全体」を締める役割で、この
+ * 束もマネージャー起点のターンでは同じ役割を果たす。**値が同じでも定数は
+ * 使い回さない**（AGENTS.md 地雷表「予算の定数は用途ごとに別に置く」）——
+ * 片方だけ直したくなったときに一緒に動く形を避けるため、独立した定数として
+ * 持つ。
+ */
+const MANAGER_REPORT_BATCH_BODY_BUDGET = 47_500;
+
+/**
+ * 単発の報告（`managerPrompt` の 'report' 分岐）の本文を予算で締める
+ * （issue #955）。予算は束と同じ {@link MANAGER_REPORT_BATCH_BODY_BUDGET}
+ * ——1ターンに載る報告本文の上限という同じ役割だからである。
+ *
+ * **予算に収まる回は本文を1文字も変えない**（配列の1要素として素通しする）。
+ * 切った回は `excerpt` の「N 文字省略。全 M 文字」の印に加えて、全文の取り方
+ * （{@link managerReportRetrievalHint}）を次の行に出す——**切ったのに取り方を
+ * 言わないと、読めるものを減らしたことになる**（listing-and-detail の性質2）。
+ */
+function boundedReportBody(event: ManagerReportMessage): string[] {
+  if (event.text.length <= MANAGER_REPORT_BATCH_BODY_BUDGET) return [event.text];
+  return [
+    excerpt(event.text, MANAGER_REPORT_BATCH_BODY_BUDGET),
+    '',
+    `⚠ 本文が文字数の予算（${MANAGER_REPORT_BATCH_BODY_BUDGET.toLocaleString('en-US')} 文字）を超えたので、ここでは先頭だけを出した。 ${managerReportRetrievalHint(event)}`,
+  ];
+}
+
+/**
  * 同じマネージャーから連続して届いた report をターン1本の本文にする
  * （`#mergedManagerReportBatch`）。
  *
@@ -11660,6 +11791,13 @@ function managerPrompt(
  * 上限で束を切ると `events.length` は実際に届いた総数より小さくなるので、
  * 文面は「N件が届いた」ではなく「N件をまとめて渡す」にしてある（切った事実
  * そのものは `#notices` の `mergedBatchTruncation` が別に言う）。
+ *
+ * **⚠️ issue #955: 本文の合計に文字数の予算を掛けた
+ * （{@link MANAGER_REPORT_BATCH_BODY_BUDGET}）。** 予算に収まる回は1文字も
+ * 変わらない——`renderListingFromEnd` は省略が起きないとき、渡した配列を
+ * そのまま `join('\n')` するだけである。省略が起きた回は、古い側（先頭）の
+ * ブロックから丸ごと落ち、**その旨と全文の取り方**
+ * （{@link managerReportRetrievalHint}）を先頭へ1行足す。
  */
 function managerReportBatchPrompt(
   events: ManagerReportMessage[],
@@ -11669,22 +11807,33 @@ function managerReportBatchPrompt(
   const head = events[0];
   if (head === undefined) return '';
 
+  const items = events.map((event, index) => {
+    // **印は本文の後ろ、指示の前に置く**（`managerPrompt` の 'report' 分岐と
+    // 同じ理由 —— 本文より前に置くと「読まなくてよい」と読まれて本文を飛ばされる）。
+    const closed = closedReportNotice(settlements[index] ?? { kind: 'unknown' });
+    return [
+      `**(${index + 1})** ${describeReportAge(event.at, now)}`,
+      '',
+      event.text,
+      ...(closed === null ? [] : ['', closed]),
+    ].join('\n');
+  });
+
   return [
     `[system] マネージャー ${head.managerId} から届いた報告を、処理待ちのあいだに続けて **${events.length} 件** まとめて渡す（要約していない）。`,
     '**まとめて読んでから答えよ。** 後の報告が前の報告を補足・訂正していることがある。**最後まで読んでから判断すること。**',
     '',
     '---',
     '',
-    ...events.map((event, index) => {
-      // **印は本文の後ろ、指示の前に置く**（`managerPrompt` の 'report' 分岐と
-      // 同じ理由 —— 本文より前に置くと「読まなくてよい」と読まれて本文を飛ばされる）。
-      const closed = closedReportNotice(settlements[index] ?? { kind: 'unknown' });
-      return [
-        `**(${index + 1})** ${describeReportAge(event.at, now)}`,
-        '',
-        event.text,
-        ...(closed === null ? [] : ['', closed]),
-      ].join('\n');
+    // **最新の1件だけで予算を超える回も、この1行は必ず出る。** その1件を
+    // `excerpt` で予算まで切った時点で予算が埋まるので、束の残り（2件以上の
+    // 束なので必ず在る）は落ちる ⟹ `rest > 0` になり、全文の取り方を名乗る。
+    renderListingFromEnd(items, {
+      budget: MANAGER_REPORT_BATCH_BODY_BUDGET,
+      omitted: ({ rest, shown, total }) =>
+        `⚠ 本文の合計が文字数の予算（${MANAGER_REPORT_BATCH_BODY_BUDGET.toLocaleString('en-US')} 文字）に` +
+        `当たったので、古い ${rest} 件（${total} 件中、新しい ${shown} 件だけを本文つきで出した）は本文を省いた。` +
+        ` ${managerReportRetrievalHint(head)}`,
     }),
     '',
     '続きが要るなら、それぞれの報告に対して `manager_send` で指示を出せ。要らないなら何もしなくてよい。',
@@ -11741,6 +11890,24 @@ function managerReportBatchPrompt(
  * 上限に当たったかどうかに関わらず常に真である。**切ったという事実そのものは
  * `#notices` の `mergedBatchTruncation`（別の断り書き）が言う——ここで重ねて
  * 言わない。**
+ *
+ * **⚠️ issue #955 で調べたが、ここには変更を入れていない。** 本文
+ * （`renderPayload`）には**既に** `EXTERNAL_PAYLOAD_LIMIT`（8,000文字）の
+ * 上限が掛かっている——`renderPayload` が `body.length > EXTERNAL_PAYLOAD_LIMIT`
+ * を見て `slice` する。issue の見立て「1件あたりの文字数の上限が無い」は、
+ * この関数については誤りだった（依頼者の見立ても検証すること。AGENTS.md）。
+ * 50件束ねても本文は1回しか出さない（このコメント群の上）ので、束全体の
+ * 上限も実質 8,000文字強のままである——`managerReportBatchPrompt`（1件あたり
+ * 無制限だった報告を件数ぶん連結する）とは構造が違う。
+ *
+ * **ただし別の欠陥が見つかっている（範囲外として報告した）。** `renderPayload`
+ * が切ったときの合図（`…（以下省略）`）は省いた文字数も全文の取り方も言わない
+ * ——`.claude/skills/listing-and-detail/SKILL.md` の性質2に反する。しかも
+ * `#journalIncomingBody` が日誌へ書く `summary` も同じ `renderPayload` を
+ * 通すため、**日誌の側にも切る前の全文が残っていない**——ここを直すには
+ * 「切ったら名乗る」だけでなく「日誌には切る前の生の本文を残す」という、
+ * この PR の範囲（束の文字数予算）とは別の変更が要る。踏み込まず、issue へ
+ * 報告する。
  */
 function externalBatchPrompt(events: ExternalEvent[]): string {
   const head = events[0];
