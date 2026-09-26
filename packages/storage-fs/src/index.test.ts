@@ -3,6 +3,9 @@ import { join } from 'node:path';
 
 import {
   captureStderr,
+  createAuthProviderRegistry,
+  createAuthService,
+  decodeState,
   renderMemoryDocuments,
   verifyCommitmentAppraisalContract,
   verifyCommitmentFoldContract,
@@ -16,7 +19,13 @@ import {
   verifyJournalStoreWithContract,
   verifyTranscriptArchiveContract,
 } from '@alteroid/core';
-import type { Commitment, InboxEvent, JournalEntry } from '@alteroid/core';
+import type {
+  Commitment,
+  InboxEvent,
+  JournalEntry,
+  OAuthProfile,
+  OAuthProvider,
+} from '@alteroid/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { makeTempDir } from '../../../vitest.tmpdir.js';
@@ -4262,6 +4271,86 @@ describe('AuthStore', () => {
 
     it('存在しないアカウントの取り消しは not_found', async () => {
       expect(await stores.auth.setAccountOwner('居ない', null)).toEqual({ status: 'not_found' });
+    });
+  });
+
+  /**
+   * **大小文字だけが違う検証済みメールも衝突として検出する（fs。issue #1702）。**
+   *
+   * `packages/core/src/auth-service.test.ts` の同名の歯（memory）と同じ入力・
+   * 同じ期待値を、`createAuthService`（`auth-service.ts` の実コード。器だけ fs へ
+   * 差し替える）に対して確かめる。`auth-service.ts` のコメント
+   * （`grep -Fn -- '衝突するときは連絡先を空にしておく' packages/core/src/auth-service.ts`）
+   * は「検証済みメールの一意性を壊さない」ことを明示的な意図として書いている。
+   * issue #1688 でこの歯は `findAccountByEmail` が大小文字を区別していたために
+   * red だった（オーナー判断は #1702：メールの大小文字は区別しない）。比較を
+   * 大小文字を無視する形へ直したいまは green であることが保証。
+   */
+  describe('大小文字だけが違う検証済みメール（#1702）', () => {
+    function fakeProvider(profiles: Record<string, OAuthProfile>): OAuthProvider {
+      return {
+        kind: 'oauth2',
+        id: 'fake',
+        label: 'Fake',
+        authorizationUrl: (request) => `https://example.test/authorize?state=${request.state}`,
+        exchange: async ({ code }) => {
+          const profile = profiles[code];
+          if (profile === undefined) throw new Error(`未知の code: ${code}`);
+          return profile;
+        },
+      };
+    }
+
+    it('大小文字だけが違う検証済みメールも衝突として検出し、2つ目のアカウントには乗せない', async () => {
+      const service = createAuthService({
+        store: stores.auth,
+        providers: createAuthProviderRegistry([
+          fakeProvider({
+            'code-alice': {
+              subject: 'sub-alice',
+              email: 'alice@example.test',
+              emailVerified: true,
+              displayName: 'Alice',
+            },
+            'code-impostor-case': {
+              subject: 'sub-impostor-case',
+              email: 'ALICE@EXAMPLE.TEST',
+              emailVerified: true,
+              displayName: 'Not Alice (case)',
+            },
+          }),
+        ]),
+      });
+
+      async function login(code: string): Promise<{ requestId: string; claimSecret: string }> {
+        const started = await service.startLogin({
+          provider: 'fake',
+          redirectUri: 'http://127.0.0.1:4517/auth/fake/callback',
+        });
+        const state = decodeState(
+          new URL(started.authorizationUrl).searchParams.get('state') ?? '',
+        );
+        expect(state).not.toBeNull();
+        const completed = await service.completeLogin({
+          state: `${state?.requestId}.${state?.nonce}`,
+          code,
+        });
+        expect(completed.status).toBe('ok');
+        return { requestId: started.requestId, claimSecret: started.claimSecret };
+      }
+
+      const alice = await login('code-alice');
+      const claimedAlice = await service.claim(alice);
+      if (claimedAlice.status !== 'ready') throw new Error('ログインできていない');
+      expect(claimedAlice.account.email).toBe('alice@example.test');
+
+      const impostorCase = await login('code-impostor-case');
+      const claimedImpostorCase = await service.claim(impostorCase);
+      if (claimedImpostorCase.status !== 'ready') throw new Error('ログインできていない');
+
+      expect(claimedImpostorCase.account.id).not.toBe(claimedAlice.account.id);
+      // 大小文字を区別せずに衝突を検出しているので null（#1702）。
+      expect(claimedImpostorCase.account.email).toBeNull();
     });
   });
 });

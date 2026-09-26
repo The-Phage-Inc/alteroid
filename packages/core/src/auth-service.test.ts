@@ -87,6 +87,13 @@ describe('createAuthService', () => {
             emailVerified: true,
             displayName: 'Not Alice',
           },
+          // 同じメールだが大小文字だけが違う版（#1702）。
+          'code-impostor-case': {
+            subject: 'sub-impostor-case',
+            email: 'ALICE@EXAMPLE.TEST',
+            emailVerified: true,
+            displayName: 'Not Alice (case)',
+          },
         }),
       ]),
       newId: () => `id-${++counter}`,
@@ -294,6 +301,39 @@ describe('createAuthService', () => {
     expect(isAccountGranted(claimedImpostor.account)).toBe(false);
     // 検証済みメールの一意性も壊れない（連絡先は空のまま）。
     expect(claimedImpostor.account.email).toBeNull();
+  });
+
+  /**
+   * **大小文字だけが違う検証済みメールも衝突として検出する（in-memory。issue #1702）。**
+   *
+   * 直上の歯は「大小文字まで完全に同じメール」での相乗り防止を確かめている。
+   * ここでは**大小文字だけが違う**メール（`alice@example.test` vs
+   * `ALICE@EXAMPLE.TEST`）で同じ検証を行う。
+   *
+   * `auth-service.ts` の該当コメント（`grep -Fn -- '衝突するときは連絡先を空にしておく' packages/core/src/auth-service.ts`）
+   * は「検証済みメールの一意性を壊さない」ことを明示的な意図として書いている。
+   * issue #1688 でこの歯は一度 `findAccountByEmail`（`packages/core/src/testing.ts` /
+   * `packages/storage-fs/src/auth.ts` / `packages/storage-pg/src/auth.ts`）が
+   * `===` / SQL の `=`（大小文字を区別する）で比較していたために red だった
+   * （オーナー判断は #1702：メールの大小文字は区別しない）。3実装とも比較を
+   * 大小文字を無視する形へ直したいまは、**この歯は green であることが保証**
+   * ——大小文字だけが違うメールも衝突として検出され、2つ目のアカウントには
+   * 乗らない。
+   */
+  it('大小文字だけが違う検証済みメールも衝突として検出し、2つ目のアカウントには乗せない（#1702）', async () => {
+    const alice = await login('code-alice');
+    const claimedAlice = await service.claim(alice);
+    if (claimedAlice.status !== 'ready') throw new Error('ログインできていない');
+    expect(claimedAlice.account.email).toBe('alice@example.test');
+
+    // 別 identity が「大小文字だけが違う」同じメールを名乗ってログインしてくる。
+    const impostorCase = await login('code-impostor-case');
+    const claimedImpostorCase = await service.claim(impostorCase);
+    if (claimedImpostorCase.status !== 'ready') throw new Error('ログインできていない');
+
+    expect(claimedImpostorCase.account.id).not.toBe(claimedAlice.account.id);
+    // 大小文字を区別せずに衝突を検出しているので null（#1702）。
+    expect(claimedImpostorCase.account.email).toBeNull();
   });
 
   it('同じ identity で入り直しても同じアカウントで、許可は保たれる', async () => {
