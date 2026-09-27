@@ -1214,8 +1214,11 @@ export function createRunnerApp(deps: RunnerAppDeps) {
     .get('/managers', (c) => c.json({ managers: host.list() }))
 
     .post('/managers', zValidator('json', runnerStartCommandSchema), async (c) => {
-      await host.start(c.req.valid('json'));
-      return c.json({ ok: true });
+      // **`cwd` は実際に開いた値（Issue #1814）。** `command.cwd` の写しではない
+      // ——`Host#start` の doc を見よ。デーモンはこれと自分が送った値を比べて、
+      // 倒れたかどうかを知る。
+      const { cwd } = await host.start(c.req.valid('json'));
+      return c.json({ ok: true, cwd });
     })
 
     /** 中断されたセッションの続きへ戻す（生ログはデーモンが持ってくる）。 */
@@ -1224,8 +1227,9 @@ export function createRunnerApp(deps: RunnerAppDeps) {
       if (command.managerId !== c.req.param('id')) {
         return c.json({ error: 'manager_id が経路と本文で食い違っている' as const }, 400);
       }
+      let resumed: { cwd: string };
       try {
-        await host.resume(command);
+        resumed = await host.resume(command);
       } catch (error) {
         /*
          * **世代が古い resume は 409、Hono の既定 500 に落とさない。**
@@ -1243,7 +1247,7 @@ export function createRunnerApp(deps: RunnerAppDeps) {
         }
         throw error;
       }
-      return c.json({ ok: true });
+      return c.json({ ok: true, cwd: resumed.cwd });
     })
 
     .post('/managers/:id/messages', zValidator('json', runnerMessageCommandSchema), async (c) => {
