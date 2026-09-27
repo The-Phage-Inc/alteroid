@@ -1133,6 +1133,20 @@ export function createMemoryStores(): Stores {
       const parsed = authIdentitySchema.parse(identity);
       identities.set(identityKey(parsed.provider, parsed.subject), parsed);
     },
+    // 検査から書き込みまでの間に await を挟まない（他の1操作と同じ理由——
+    // 挟むと同じ identity を作ろうとする2本目が割り込む窓ができる。issue #1714）。
+    async createAccountWithIdentity({ account, identity }) {
+      const key = identityKey(identity.provider, identity.subject);
+      const existing = identities.get(key);
+      if (existing !== undefined) return { created: false, existing };
+      // 本物（fs / pg）と同じく `authAccountSchema` / `authIdentitySchema` を
+      // 通す（issue #1715。fs と同じ並び——account を先に parse する）。
+      const parsedAccount = authAccountSchema.parse(account);
+      const parsedIdentity = authIdentitySchema.parse(identity);
+      accounts.set(parsedAccount.id, parsedAccount);
+      identities.set(key, parsedIdentity);
+      return { created: true };
+    },
     async putAccessToken(token) {
       // 本物（fs / pg）と同じく `accessTokenRecordSchema` を通す（issue #1715）。
       const parsed = accessTokenRecordSchema.parse(token);

@@ -9,6 +9,7 @@ import type {
   AuthAccount,
   AuthIdentity,
   AuthStore,
+  CreateAccountWithIdentityOutcome,
   GrantOutcome,
   LoginRequest,
   OwnerOutcome,
@@ -144,6 +145,98 @@ export class PgAuthStore implements AuthStore {
         target: [authIdentities.provider, authIdentities.subject],
         set,
       });
+  }
+
+  /**
+   * 「初めて見る identity」の account 作成を**1つのトランザクションで**行う
+   * （issue #1714）。
+   *
+   * **identity を先に、`(provider, subject)` の一意制約に対する
+   * `on conflict do nothing` で insert する。1行入ったときだけ account を
+   * insert する。** identity が入らなかった（＝別の呼び出しが先に同じ
+   * identity を作っていた）ら、**account の insert そのものへ進まない**——
+   * 同じトランザクション内で既存の identity を読み直して返す。
+   *
+   * ⚠️ **順序は「account を先」ではいけない**（#1714 の最初の実装がこの順で、
+   * レビューで指摘された）。`auth_accounts_email_lower_idx`（#1702。`lower(email)`
+   * の一意索引）が本番の pg には在る。同じ identity の2つのログインは
+   * `completeLogin` の外側の衝突検査で同じ検証済みメールを候補 account に
+   * 載せるので、account を先に insert すると**負けた側が identity の
+   * `on conflict do nothing` へ辿り着く前に、account 側のメール一意索引で
+   * 一意制約違反として落ちる**（`tx.rollback()` ではなく本物の例外）。
+   * identity を先にすれば、負けた側は identity の一意制約で
+   * do nothing になり、account の insert へ進まない——メールの索引には
+   * そもそも当たらない。
+   *
+   * **`auth_identities.account_id` に外部キーは無い**（`migrate.ts` の
+   * `create table auth_identities` に `references` 節が無いことを DDL で
+   * 確認済み）。だから identity を先に insert しても、まだ存在しない
+   * account を指す一時的な状態を作ることに問題は無い——同じトランザクション内で
+   * 即座に account を insert して埋める。
+   *
+   * account の insert が（この対象とは別の理由で）落ちたら、例外はそのまま
+   * 投げる——トランザクションごと巻き戻るので、先に入れた identity も一緒に
+   * 消える（孤児は作らない）。
+   */
+  async createAccountWithIdentity(input: {
+    account: AuthAccount;
+    identity: AuthIdentity;
+  }): Promise<CreateAccountWithIdentityOutcome> {
+    const account = stripNulls(authAccountSchema.parse(input.account));
+    const identity = stripNulls(authIdentitySchema.parse(input.identity));
+
+    return this.#db.transaction(async (tx) => {
+      const identityRows = await tx
+        .insert(authIdentities)
+        .values({
+          provider: identity.provider,
+          subject: identity.subject,
+          accountId: identity.accountId,
+          email: identity.email,
+          emailVerified: identity.emailVerified,
+          createdAt: new Date(identity.createdAt),
+          lastLoginAt: new Date(identity.lastLoginAt),
+        })
+        .onConflictDoNothing({ target: [authIdentities.provider, authIdentities.subject] })
+        .returning();
+
+      if (identityRows.length === 0) {
+        // 負けた。account へは進まない——ここまでで既に、同じ identity を
+        // 取り合う競合が起こりうる唯一の索引（identity の主キー）を通過して
+        // いる。勝った側の commit は `on conflict do nothing` 自体が待つので、
+        // ここで読み直せば必ず見える。
+        const existingRows = await tx
+          .select()
+          .from(authIdentities)
+          .where(
+            and(
+              eq(authIdentities.provider, identity.provider),
+              eq(authIdentities.subject, identity.subject),
+            ),
+          )
+          .limit(1);
+        const existingRow = existingRows[0];
+        if (existingRow === undefined) {
+          throw new Error(
+            'createAccountWithIdentity: 競合したはずの identity が読めない（他の1操作と矛盾）',
+          );
+        }
+        return { created: false, existing: this.#toIdentity(existingRow) };
+      }
+
+      await tx.insert(authAccounts).values({
+        id: account.id,
+        displayName: account.displayName,
+        email: account.email,
+        createdAt: new Date(account.createdAt),
+        lastLoginAt: optionalDate(account.lastLoginAt),
+        grantedAt: optionalDate(account.grantedAt),
+        grantedBy: account.grantedBy,
+        ownerDeclaredAt: optionalDate(account.ownerDeclaredAt),
+      });
+
+      return { created: true };
+    });
   }
 
   async putAccessToken(token: AccessTokenRecord): Promise<void> {
