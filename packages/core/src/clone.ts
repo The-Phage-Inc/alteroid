@@ -1535,6 +1535,22 @@ export function createClone(options: CloneOptions): CloneHost {
  * 同じ `approvalId` でも回答のたびに違う id が出る——「1回目の回答の合図を
  * 2回目の回答で上書きしてしまう」事故を防ぐ。
  */
+/**
+ * 既に終わった（回答済み・取り下げ済みの）承認への回答を断った（issue #2007。
+ * `Clone#answerApproval` が投げる）。`apps/daemon` はこれを 409 に写す。
+ */
+export class ApprovalAlreadySettledError extends Error {
+  constructor(
+    readonly approvalId: string,
+    readonly settled: 'answered' | 'withdrawn',
+  ) {
+    super(
+      `承認待ち ${approvalId} は既に${settled === 'answered' ? '回答済み' : '取り下げ済み'}なので、回答しなかった`,
+    );
+    this.name = 'ApprovalAlreadySettledError';
+  }
+}
+
 export function humanAnswerEventId(approvalId: string, answeredAt: string): string {
   return `human-answer-${approvalId}-${answeredAt}`;
 }
@@ -2828,13 +2844,36 @@ class Clone implements CloneHost {
     // 受信箱への永続化（下）までの間にプロセスが落ちると、この行は「回答済みだが
     // 未配達」のまま残る——それが `#reconcileUndeliveredAnswers` が起動時に
     // 拾い直す対象そのものである。
-    await this.#stores.jobs.putApproval({
-      ...approval,
-      answeredAt,
-      answer,
-      answerDelivery: 'pending',
-      ...(via === undefined ? {} : { answeredVia: via }),
+    //
+    // **読み直す1操作で書き、既に終わった承認には書かない（issue #2007）。** 以前は
+    // 上の `getApproval` で読んだ写しを `putApproval` で丸ごと書き戻していたので、
+    // 回答済み・取り下げ済みかを見ないまま回答を立て、配達・再開まで進んでいた
+    // ——取り下げたはずの承認に回答が立つ、同じ承認への2つの回答が両方通る（仕事が
+    // 2回再開しうる）。`updateApproval` の排他区間の中で現在の行を見て、`answeredAt`
+    // か `withdrawnAt` が既に立っていれば書かずに断る（`ApprovalAlreadySettledError`）。
+    // 断ったら、日誌・許可の記録・配達のどれにも進まない。
+    let settled: 'answered' | 'withdrawn' | undefined;
+    const written = await this.#stores.jobs.updateApproval(approvalId, (current) => {
+      if (current.withdrawnAt !== undefined) {
+        settled = 'withdrawn';
+        return null;
+      }
+      if (current.answeredAt !== undefined) {
+        settled = 'answered';
+        return null;
+      }
+      return {
+        ...current,
+        answeredAt,
+        answer,
+        answerDelivery: 'pending',
+        ...(via === undefined ? {} : { answeredVia: via }),
+      };
     });
+    if (written === null) {
+      if (settled !== undefined) throw new ApprovalAlreadySettledError(approvalId, settled);
+      throw new Error(`承認待ち ${approvalId} は存在しない`);
+    }
 
     // 日誌だけを追っても回答済みだと分かるようにする（追記専用なので新しい行）
     await this.#journal({
@@ -2882,13 +2921,7 @@ class Clone implements CloneHost {
     // もう一度回せる。
     if (delivery === 'delivered') {
       try {
-        await this.#stores.jobs.putApproval({
-          ...approval,
-          answeredAt,
-          answer,
-          answerDelivery: 'delivered',
-          ...(via === undefined ? {} : { answeredVia: via }),
-        });
+        await this.#markAnswerDelivered(approvalId, answeredAt);
       } catch (error) {
         noteDroppedRecord('回答の配達印の確定', inboxEventShape(event), error);
       }
@@ -6005,6 +6038,27 @@ class Clone implements CloneHost {
   }
 
   /**
+   * 承認の行に「配達済み」の印を付ける（issue #1977 / #2002 / #2007）。
+   *
+   * **読み直す1操作（`updateApproval`）で、`answerDelivery` だけを書き換える。** 以前は
+   * 呼び手が読んだ写しに `answerDelivery: 'delivered'` を足して、行を丸ごと書き戻して
+   * いた（`answerApproval` / `#markAnswerDeliveredOnHandle` / `#reconcileUndeliveredAnswers`
+   * の4か所）。読んでから書くまでの間に同じ行へ別の書き込み（取り下げ・2回目の回答など）
+   * が入ると、古い写しでそれを消していた（C の3回目の横断レビューが #2007 に付けた指摘）。
+   *
+   * **書くのは、現在の行がまだ `'pending'` で、`answeredAt` が同じ回答のときだけ。**
+   * それ以外（既に `'delivered'`・別の回答に置き換わっている）は何もしない。
+   * 例外はそのまま投げる（呼び手がそれぞれの跡を残す）。
+   */
+  async #markAnswerDelivered(approvalId: string, answeredAt: string): Promise<void> {
+    await this.#stores.jobs.updateApproval(approvalId, (current) =>
+      current.answerDelivery === 'pending' && current.answeredAt === answeredAt
+        ? { ...current, answerDelivery: 'delivered' }
+        : null,
+    );
+  }
+
+  /**
    * `human_answer` を処理するとき、承認の行がまだ `'pending'` なら `'delivered'` を書く
    * （issue #2002）。
    *
@@ -6019,9 +6073,9 @@ class Clone implements CloneHost {
    * 届く」であって「ちょうど1回」ではない（クローン teto の判断: 回答を失うより、
    * 二重に届くほうが害が小さい）。
    *
-   * 書き込みの失敗は握って跡を残す（処理そのものは止めない）。行の写しが古くても、
-   * 書き換えるのは `answerDelivery` だけで、`answeredAt` が同じ行（＝同じ回答）に
-   * 限る——同じ承認への2回目の回答を、古い回答で上書きしない。
+   * 書き込みの失敗は握って跡を残す（処理そのものは止めない）。書き込みは
+   * `#markAnswerDelivered` に任せる——読み直す1操作で、`answerDelivery` だけを
+   * 書き換える（読んだ写しで行を丸ごと書き戻さない。issue #2007 のコメント）。
    */
   async #markAnswerDeliveredOnHandle(
     approval: PendingApproval | null,
@@ -6031,7 +6085,7 @@ class Clone implements CloneHost {
     if (approval.answeredAt === undefined) return;
     if (humanAnswerEventId(approval.id, approval.answeredAt) !== event.id) return;
     try {
-      await this.#stores.jobs.putApproval({ ...approval, answerDelivery: 'delivered' });
+      await this.#markAnswerDelivered(approval.id, approval.answeredAt);
     } catch (error) {
       noteDroppedRecord('回答の配達印の確定（処理時）', inboxEventShape(event), error);
     }
@@ -6152,12 +6206,12 @@ class Clone implements CloneHost {
         if (claimedIds.has(event.id)) {
           // 直前の `#restoreUnreadPass` が既に拾っている——印を確定させる
           // だけで、もう一度 put も post もしない。
-          await this.#stores.jobs.putApproval({ ...approval, answerDelivery: 'delivered' });
+          await this.#markAnswerDelivered(approval.id, approval.answeredAt);
         } else {
           // まだ受信箱に一度も乗っていない——`answerApproval` の (c)(d)(e) と
           // 同じ並びで埋める。
           await this.#stores.inbox.put(event, event.at);
-          await this.#stores.jobs.putApproval({ ...approval, answerDelivery: 'delivered' });
+          await this.#markAnswerDelivered(approval.id, approval.answeredAt);
           this.post(event);
         }
         reconciled += 1;

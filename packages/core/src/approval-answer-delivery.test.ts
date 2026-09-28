@@ -489,6 +489,24 @@ describe('配達済みの印の書き込みだけが落ちても、起こし直�
             return target.putApproval(approval);
           };
         }
+        // 「配達済み」の印は、#2007 のコメントの直しで `updateApproval`（読み直す1操作）
+        // から書くようになった。落とす場所をそちらにも広げる——落とすのは、今までと同じく
+        // 「pending の行を delivered にする1回目の書き込み」だけである。
+        if (prop === 'updateApproval') {
+          return async (id: string, mutate: (current: PendingApproval) => PendingApproval | null) =>
+            target.updateApproval(id, (current) => {
+              const next = mutate(current);
+              if (
+                !failedOnce &&
+                current.answerDelivery === 'pending' &&
+                next?.answerDelivery === 'delivered'
+              ) {
+                failedOnce = true;
+                throw new Error('配達済みの印の書き込みが落ちた（テスト用）');
+              }
+              return next;
+            });
+        }
         const value = Reflect.get(target, prop, receiver) as unknown;
         return typeof value === 'function'
           ? (value as (...args: unknown[]) => unknown).bind(target)
@@ -525,5 +543,129 @@ describe('配達済みの印の書き込みだけが落ちても、起こし直�
     expect((await stores.jobs.getApproval('ap-1'))?.answerDelivery).toBe('delivered');
 
     void second.clone;
+  });
+});
+
+/**
+ * issue #2007: 承認への回答（`answerApproval`）は、`getApproval` で読んでから
+ * `putApproval` で丸ごと書き戻す形で、回答済み・取り下げ済みかを自分では見ていなかった。
+ * そのため、取り下げ済みの承認にも回答が立って配達・再開まで進み、同じ承認への2回目の
+ * 回答や、ほぼ同時の2つの回答も両方通っていた（同じ承認に紐づく仕事が2回再開しうる）。
+ *
+ * ここでは、既に終わった承認への回答は断られ、行も配達も動かないことを見る。
+ */
+describe('既に終わった承認への回答は断る（issue #2007）', () => {
+  it('取り下げ済みの承認に回答すると断られ、行に回答が立たず、human_answer は配られない', async () => {
+    const stores = createMemoryStores();
+    await stores.jobs.putApproval(
+      seedApproval({
+        withdrawnAt: '2026-09-01T00:06:00.000Z',
+        withdrawnReason: '判断が要らなくなった',
+      }),
+    );
+    const { clone, inputs } = bootClone(stores, 'hang');
+
+    await expect(clone.answerApproval('ap-1', '許可します')).rejects.toThrow();
+    await idle();
+
+    const approval = await stores.jobs.getApproval('ap-1');
+    expect(approval?.answeredAt).toBeUndefined();
+    expect(approval?.answer).toBeUndefined();
+    expect(await stores.inbox.peekPending()).toEqual([]);
+    expect(inputs).toHaveLength(0);
+  });
+
+  it('回答済みの承認に2回目の回答をすると断られ、1回目の回答が残り、配達は1回だけ', async () => {
+    const stores = createMemoryStores();
+    await stores.jobs.putApproval(seedApproval());
+    const { clone, inputs } = bootClone(stores, 'hang');
+
+    await clone.answerApproval('ap-1', '許可します');
+    await waitFor(() => inputs.length > 0, '1回目の処理');
+    await expect(clone.answerApproval('ap-1', 'やっぱりやめて')).rejects.toThrow();
+    await idle();
+
+    const approval = await stores.jobs.getApproval('ap-1');
+    expect(approval?.answer).toBe('許可します');
+    expect(inputs).toHaveLength(1);
+  });
+
+  it('2つの回答を同時に投げると、ちょうど1つだけが通り、もう1つは断られる', async () => {
+    const stores = createMemoryStores();
+    await stores.jobs.putApproval(seedApproval());
+    const { clone, inputs } = bootClone(stores, 'hang');
+
+    const results = await Promise.allSettled([
+      clone.answerApproval('ap-1', '許可します'),
+      clone.answerApproval('ap-1', 'やめて'),
+    ]);
+    await waitFor(() => inputs.length > 0, '回答の処理');
+    await idle();
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    expect(inputs).toHaveLength(1);
+  });
+});
+
+/**
+ * issue #2007（C の3回目の横断レビューのコメント）: 「配達済み」の印を付ける書き込みは、
+ * 読んだ写しに `answerDelivery: 'delivered'` を足して、行を丸ごと書き戻していた
+ * （`#markAnswerDeliveredOnHandle` / `#reconcileUndeliveredAnswers` / `answerApproval`）。
+ * 読んでから書くまでの間に同じ行へ別の書き込みが入ると、古い写しでそれを消していた。
+ *
+ * ここでは、`#handle` が承認を読んだ直後に、同じ行へ別の書き込み（取り下げの印）が
+ * 入る場面を作り、印を付けた後もその書き込みが残ることを見る。
+ */
+describe('配達済みの印は、読んだ写しで行を丸ごと書き戻さない（issue #2007 のコメント）', () => {
+  it('#handle が行を読んだ直後に入った別の書き込みを、配達済みの印で消さない', async () => {
+    const base = createMemoryStores();
+    await base.jobs.putApproval(
+      seedApproval({
+        answeredAt: '2999-01-01T00:05:00.000Z',
+        answer: '許可します',
+        answerDelivery: 'pending',
+      }),
+    );
+    let interleaved = false;
+    const jobs = new Proxy(base.jobs, {
+      get(target, prop, receiver) {
+        if (prop === 'getApproval') {
+          return async (id: string) => {
+            const snapshot = await target.getApproval(id);
+            // 最初に読まれた直後に、同じ行へ別の書き込みを入れる（読んだ写しは古くなる）。
+            if (!interleaved && snapshot !== null) {
+              interleaved = true;
+              await target.putApproval({
+                ...snapshot,
+                withdrawnAt: '2999-01-01T00:06:00.000Z',
+                withdrawnReason: '同時に入った別の書き込み（テスト用）',
+              });
+            }
+            return snapshot;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === 'function'
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    });
+    const stores: Stores = { ...base, jobs };
+    const { clone, inputs } = bootClone(stores, 'hang');
+
+    clone.post({
+      type: 'human_answer',
+      id: expectedHumanAnswerEventId('ap-1', '2999-01-01T00:05:00.000Z'),
+      at: '2999-01-01T00:05:00.000Z',
+      approvalId: 'ap-1',
+      answer: '許可します',
+    } as unknown as InboxEvent);
+    await waitFor(() => inputs.length > 0, '回答の処理');
+    await idle();
+
+    const approval = await base.jobs.getApproval('ap-1');
+    expect(interleaved).toBe(true);
+    expect(approval?.withdrawnAt).toBe('2999-01-01T00:06:00.000Z');
   });
 });
