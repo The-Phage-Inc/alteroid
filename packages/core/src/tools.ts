@@ -4347,6 +4347,7 @@ function describeUnpushedWork(probe: ManagerUnpushedWork): string {
     // ⚠️ #1765 段2 / #1865 — `scratchRootsUnknown` / `unreadableDirCount` の
     // どちらかが載っているときは「見つからなかった」と言い切らない。前者は
     // /tmp スクラッチの有無、後者は job.cwd の下の子ディレクトリの読み失敗
+    // （2本目以降の /tmp スクラッチ起点そのものの読み失敗も同じ件数に入る。#1891）
     // ——どちらも「探せなかっただけで、そこに未 push の実装が残っている
     // 可能性がある」という同じ形なので、握り潰さず並べて注記する。
     const uncertain: string[] = [];
@@ -4359,6 +4360,7 @@ function describeUnpushedWork(probe: ManagerUnpushedWork): string {
     if (result.unreadableDirCount !== undefined) {
       uncertain.push(
         `${result.cwd} の下の子ディレクトリの読み取りに${String(result.unreadableDirCount)}回失敗した` +
+          '（/tmp スクラッチの起点そのものの読み失敗を含む）' +
           '——その下に未 push の実装が残っていた可能性がある',
       );
     }
@@ -4397,7 +4399,7 @@ function describeUnpushedWork(probe: ManagerUnpushedWork): string {
     result.unreadableDirCount === undefined
       ? ''
       : `\n  ⚠️ ${result.cwd} の下で子ディレクトリの読み取りに${String(result.unreadableDirCount)}件` +
-        '失敗した——そこに未 push の実装が残っている可能性があり、上の一覧には含まれていない。';
+        '失敗した（/tmp スクラッチの起点そのものの読み失敗を含む）——そこに未 push の実装が残っている可能性があり、上の一覧には含まれていない。';
   return (
     `未 push の実装・未コミットの変更（${result.cwd} の下、${String(result.worktrees.length)}本の作業ツリー）:\n` +
     lines.join('\n') +
