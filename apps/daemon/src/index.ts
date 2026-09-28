@@ -923,6 +923,57 @@ export function describeReopenedTokenNotice(
 }
 
 /**
+ * `credentialService` の `onCloneEnvShadowed` が知らせてきたときの stderr の本文
+ * （issue #1894）。
+ *
+ * **`main()` に埋め込んだままでは測れない**ので、ここへ切り出した（AGENTS.md
+ * 「テストを弱めずに直す」の「テストが書けない構造は、テストが無いのと同じ」）。
+ * `describeReopenedTokenNotice` と同じ形——出力は1文字も変えていない
+ * （`scope: 'app'` を含まない場合は、この PR より前の文言と逐語で同じ）。
+ *
+ * ## なぜ2本に分けるか
+ *
+ * `scope: 'app'` の名前は、`scope` が `'all'`/`'runner'`/未設定の名前と
+ * 挙動が違う（`CredentialFingerprint.shadowsCloneEnv` の doc、issue #1867・
+ * #1894）。`scope: 'app'` はマネージャーに**何も配られていない**——「マネー
+ * ジャーも器の環境変数の値で走っている」も「外しても配られる値は変わらない」
+ * も、`scope: 'app'` については逆に言い切ってしまう（前者は「何も配られて
+ * いない」の否定、後者は「外すと配られ始める」の否定）。**同じ1文で両方の
+ * scope を語ると、どちらか一方が必ず誤りになる**ので、名前を出す前に分ける。
+ */
+export function describeCloneEnvShadowedNotice(
+  names: readonly string[],
+  appScopedNames: readonly string[],
+): string {
+  const appScoped = new Set(appScopedNames);
+  const otherNames = names.filter((name) => !appScoped.has(name));
+  let out = '';
+  if (otherNames.length > 0) {
+    out +=
+      `alteroidd: GitHub の名前で、正本の行よりこのデーモンの器の環境変数の値が` +
+      `優先して配られています（マネージャーもクローンも、器の環境変数の値で` +
+      `走っています。正本のその行は配られていません）: ${otherNames.join(', ')}。` +
+      `正本のその行を外しても配られる値は変わりません（どちらにしても器の` +
+      `環境変数の値が配られます）。揃えるには、正本の値を器の環境変数に` +
+      `合わせて置き直すか（alteroid credential set <名前>）、器の環境変数の` +
+      `側を変えてください（この HTTP の口からは変えられません）\n`;
+  }
+  if (appScopedNames.length > 0) {
+    out +=
+      `alteroidd: GitHub の名前で、正本の行よりこのデーモンの器の環境変数の値が` +
+      `優先して配られています（クローンは器の環境変数の値で走っています。` +
+      `正本のその行は配られていません）: ${appScopedNames.join(', ')}。` +
+      `これは scope: app（clone だけに撒く）の行なので、マネージャーには` +
+      `この名前がいま何も配られていません（scope で意図して閉じてある。` +
+      `issue #1867）。⚠ 正本のその行を外すと、器の環境変数の値がマネージャー` +
+      `にも配られ始めます（scope で閉じた先へ届く）。揃えるには、正本の値を` +
+      `器の環境変数に合わせて置き直すか（alteroid credential set <名前>）、` +
+      `器の環境変数の側を変えてください（この HTTP の口からは変えられません）\n`;
+  }
+  return out;
+}
+
+/**
  * `tokenRotationStream` の網羅性チェック専用。呼ばれること自体が保証で、
  * `event` の型が `never` でなくなった時点（＝ 未対応の値が足された時点）で
  * 呼び出し側が型エラーになる。実行時にここへ来ることは型が守っている限り
@@ -1380,17 +1431,12 @@ export async function main(): Promise<void> {
      *
      * 連続した同じ食い違いは呼ばれない（`createCredentialService` 側で
      * 抑止済み）ので、ここで頻度を気にする必要は無い。
+     *
+     * **本文の組み立ては `describeCloneEnvShadowedNotice` に切り出してある**
+     * （issue #1894）——`scope: 'app'` の名前は挙動が違うので文言も分ける。
      */
-    onCloneEnvShadowed: (names) => {
-      process.stderr.write(
-        `alteroidd: GitHub の名前で、正本の行よりこのデーモンの器の環境変数の値が` +
-          `優先して配られています（マネージャーもクローンも、器の環境変数の値で` +
-          `走っています。正本のその行は配られていません）: ${names.join(', ')}。` +
-          `正本のその行を外しても配られる値は変わりません（どちらにしても器の` +
-          `環境変数の値が配られます）。揃えるには、正本の値を器の環境変数に` +
-          `合わせて置き直すか（alteroid credential set <名前>）、器の環境変数の` +
-          `側を変えてください（この HTTP の口からは変えられません）\n`,
-      );
+    onCloneEnvShadowed: (names, appScopedNames) => {
+      process.stderr.write(describeCloneEnvShadowedNotice(names, appScopedNames));
     },
   });
 
