@@ -6406,6 +6406,13 @@ describe('ターンが report で終わったとき unpushedWork を1回取る�
    * 'stopped'` の早期 return）では `unpushedWork` を呼ばない——止めた委譲へ
    * 向けて runner との往復を新たに起こす意味が無いという設計判断
    * （`#observeUnpushedWorkOnReport` の呼び出し箇所のコメントを見よ）。
+   *
+   * **⚠️ `abort()` 自身は `unpushedWork()` を呼ぶ（Issue #1266 残り2。
+   * `source: 'stop'`）。** これは測りたい R4 の話とは別の経路（`report` 到達
+   * 時の安全弁ではなく、止める直前の握手）なので、`calls` は `abort()` の
+   * 直後に一度リセットし、**そこから先**（＝止めた後に届いた report）で
+   * 増えていないことだけを見る。`lastUnpushedWorkObservation` も同じ理由で
+   * 「無い」ではなく「`abort()` が残した値のまま変わっていない」ことを見る。
    */
   it('止めた後に届いた report では unpushedWork を呼ばない（R4）', async () => {
     // **`止めたマネージャーの後続イベント（R4）` describe の `stopped()` と
@@ -6453,6 +6460,18 @@ describe('ターンが report で終わったとき unpushedWork を1回取る�
     const aborted = await s.pool.abort(job.id, 'テストで止めた');
     expect(aborted.outcome).toBe('stopped');
 
+    // **`abort()` 自身が `runner.stop()` の直前に取った観測（Issue #1266
+    // 残り2。`source: 'stop'`）はここで既に残っている。** これは測りたい
+    // 対象（R4：止めた後に届いた report）とは別の経路なので、`calls` を
+    // ここでリセットし、観測の値も控えておく——この先で両方とも動かない
+    // ことを見る。
+    expect(calls).toEqual(['mgr-stopped-no-unpushed-probe']);
+    calls.length = 0;
+    const observationAfterAbort = (await stores.jobs.listJobs()).find(
+      (j) => j.id === job.id,
+    )?.lastUnpushedWorkObservation;
+    expect(observationAfterAbort).toMatchObject({ kind: 'observed', source: 'stop' });
+
     fake.report(job.id, '止めた後に届いた報告');
 
     // 日誌には残る（R4 の既存の保証）——これが処理された合図として待つ。
@@ -6466,9 +6485,12 @@ describe('ターンが report で終わったとき unpushedWork を1回取る�
       )
       .toBe(true);
 
+    // **ここから先（止めた後に届いた report）では、何も増えない・変わらない。**
     expect(calls).toEqual([]);
     const stored = await stores.jobs.listJobs();
-    expect(stored.find((j) => j.id === job.id)?.lastUnpushedWorkObservation).toBeUndefined();
+    expect(stored.find((j) => j.id === job.id)?.lastUnpushedWorkObservation).toEqual(
+      observationAfterAbort,
+    );
 
     await s.pool.stop();
   });
@@ -12327,6 +12349,49 @@ describe('shutdownObservationArrivedAfterSwap（クローンの指摘を受け�
     expect(found?.sessionMissingSince).toBeDefined();
     expect(found?.shutdownObservationArrivedAfterSwap).toBe(false);
     expect(found?.lastUnpushedWorkObservation).toMatchObject({ source: 'report' });
+
+    await pool.stop();
+    await real.stop();
+  });
+
+  /**
+   * **Issue #1266 残り2の陰性**——`abort()` が新しく取るようになった
+   * `source: 'stop'` の観測は、`runnerSessionSince` より後であっても
+   * 「届いた」（`shutdownObservationArrivedAfterSwap: true`）へは倒れない。
+   * 判定は `source === 'shutdown'` の厳密一致（`manager.ts` の `summaryOf`）
+   * のままで、`'stop'` を特別扱いする分岐を足していないことを固定する
+   * ——直上の `source: 'report'` の歯と同じ形を `'stop'` でも測る。
+   */
+  it('source が stop（Issue #1266 残り2。force:true 等の明示停止）の観測も、runnerSessionSince より後でも「届いていない」に倒す', async () => {
+    let clock = new Date('2026-09-27T00:00:00.000Z').getTime();
+    const a = new FakePoolRunner('runner-a', { managers: 0 });
+    const stores = createMemoryStores();
+    const real = createRunnerRegistry([a]);
+    const patches = new Map<string, { sessions: readonly string[]; sessionsObservedAt: string }>();
+    const registry = withEntrySessions(real, () => patches);
+    const pool = createManagerPool({
+      stores,
+      post: () => undefined,
+      runners: registry,
+      now: () => clock,
+    });
+
+    const summary = await pool.start({ request: '調べもの' });
+    const managerId = summary.managerId;
+
+    clock += 5_000;
+    a.unpushedWorkResult = { cwd: '/work/project', worktrees: [] };
+    await pool.unpushedWork(managerId, { source: 'stop' });
+
+    clock += 10_000;
+    patches.set('runner-a', { sessions: [], sessionsObservedAt: new Date(clock).toISOString() });
+
+    const listed = await pool.list();
+    const found = listed.find((m) => m.managerId === managerId);
+
+    expect(found?.sessionMissingSince).toBeDefined();
+    expect(found?.shutdownObservationArrivedAfterSwap).toBe(false);
+    expect(found?.lastUnpushedWorkObservation).toMatchObject({ source: 'stop' });
 
     await pool.stop();
     await real.stop();
