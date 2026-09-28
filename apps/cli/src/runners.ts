@@ -2,6 +2,8 @@ import { stdout } from 'node:process';
 
 import {
   describeRevisionStatus,
+  type RunnerCredentialFingerprint,
+  type RunnerProfileFingerprint,
   type RunnerPushHealth,
   type RunnerPushOutcome,
   type RunnerRevisionReport,
@@ -89,6 +91,24 @@ export async function runnersVacateCommand(runnerId: string): Promise<void> {
 }
 
 /**
+ * 指紋（`credentials`/`profile`）を聞きに行けたかの3状態。
+ *
+ * **`asked` / `unheard` / `failed` を1つも潰さない**（`apps/web/app/routes/
+ * settings.tsx` の `Credentials` と同じ意味）——繋がっていないので聞いて
+ * いない（`unheard`）／聞いたが失敗した（`failed`）／聞いて0件だった
+ * （`asked` かつ空）を同じ文言に潰すと、「配られていない」のか「確かめ
+ * られなかった」のかが端末からは区別できなくなる（#1947）。
+ *
+ * **この型の生成元は無い。** 本体（`runnerProbeSchema`）は daemon の
+ * `apps/daemon/src/openapi.ts` にしか定義が無く、CLI は daemon の実装を
+ * import しないので、ここに同じ形を書く（型だけの複製——3状態の文言を
+ * 作る関数は下の `renderCredentialsFingerprint`/`renderProfileFingerprint`
+ * に1本ずつしか無く、複製していない）。
+ */
+type RunnerProbe =
+  { status: 'asked' } | { status: 'unheard' } | { status: 'failed'; error: string };
+
+/**
  * `GET /runners` の応答のうち、この口が読む分。
  *
  * **`daemonRevision` は2値（`RunnerRevisionReport`）で、runner の版は3値
@@ -109,6 +129,23 @@ interface RunnersView {
      */
     instanceId?: string;
     instanceSince?: string;
+    /**
+     * 配られている鍵の指紋（#1947）。**空であることだけを見ないこと。** 叩けな
+     * かったときもここは空になるので、「鍵が配られていない」と読んでよいのは
+     * `credentialsProbe.status === 'asked'` のときだけである（`credentials`/
+     * `credentialsProbe` は daemon が接続している runner には毎回必ず probe
+     * する——opt-in のクエリは無いので、CLI が読んでも追加の往復は発生しない）。
+     */
+    credentials: RunnerCredentialFingerprint[];
+    /** 指紋を聞きに行けたか。上の空と、聞けなかったことを分ける。 */
+    credentialsProbe: RunnerProbe;
+    /**
+     * 置かれている実行環境プロファイルの指紋（#1947）。**無いことだけを見ない
+     * こと。** 叩けなかったときもここは省略される。
+     */
+    profile?: RunnerProfileFingerprint;
+    /** プロファイルの指紋を聞きに行けたか。上の不在と、聞けなかったことを分ける。 */
+    profileProbe: RunnerProbe;
     revision: RunnerRevisionStatus;
     /**
      * 押し込み（push）の直近結果。**指紋（`credentialsProbe`/`profileProbe`）とは
@@ -171,6 +208,13 @@ export function renderRunners(view: RunnersView): string {
     // 片方でもう片方を推測することになる。
     lines.push(`  版: ${describeRevisionStatus(runner.revision)}`);
     if (runner.error !== undefined) lines.push(`  直近の失敗: ${runner.error}`);
+    // **指紋（credentials/profile）は「聞けたか」の3状態を潰さない**（#1947）。
+    // Web の設定画面（`Credentials`）と同じ判断——繋がっていないので聞いて
+    // いない（`unheard`）／聞いたが失敗した（`failed`）／聞いて0件だった
+    // （`asked` かつ空）を同じ文言に潰すと、「配られていない」のか「確かめ
+    // られなかった」のかが端末からは区別できなくなる。
+    lines.push(`  ${renderCredentialsFingerprint(runner)}`);
+    lines.push(`  ${renderProfileFingerprint(runner)}`);
     // **押し込みの結果（`pushHealth`）は新たな往復を払わない**（`credentialsProbe`/
     // `profileProbe` とは別物）ので、その場で聞き直すのではなく記憶をそのまま出す。
     // **3種類とも「まだ一度も試みていない」ことがある。** その種類だけ行を出さない
@@ -210,4 +254,56 @@ function renderPushHealth(pushHealth: RunnerPushHealth): string | undefined {
     outcomeText('MCP の登録', pushHealth.mcpServers),
   ].filter((part): part is string => part !== undefined);
   return parts.length === 0 ? undefined : parts.join(' / ');
+}
+
+/**
+ * 鍵の指紋（`credentials`/`credentialsProbe`）を1行へ（#1947）。
+ *
+ * **3状態を1つも潰さない**（`RunnerProbe` の doc と同じ理由）。
+ *
+ * **名前だけを出し、sha256 は出さない。** Web（`apps/web/app/routes/
+ * settings.tsx` の `Credentials`）は名前だけを Badge で出しており、CLI だけ
+ * が `NAME=sha256` を全部の鍵について並べると、(1) 人間向けの2つの画面の
+ * 見せ方が割れる (2) 鍵の本数が増えるほど1行が長くなる。core の
+ * `runner_list`（`packages/core/src/tools.ts`、`fingerprints: true` の
+ * とき）が sha256 まで出すのは別の事情（エージェントの文脈で「人間が置いた
+ * 鍵とマネージャーが握っている鍵が同じか」を照合する必要があるため）で、
+ * こちら（人間が端末で読む一覧）には当てはまらないので、core 側は変えて
+ * いない。
+ */
+function renderCredentialsFingerprint(runner: RunnersView['runners'][number]): string {
+  if (runner.credentialsProbe.status === 'unheard') {
+    return '鍵: 確かめていない（繋がっていないので聞いていない）';
+  }
+  if (runner.credentialsProbe.status === 'failed') {
+    return `鍵を確かめられなかった: ${runner.credentialsProbe.error}`;
+  }
+  if (runner.credentials.length === 0) {
+    return '鍵: 渡している鍵は無い';
+  }
+  return `鍵: ${runner.credentials.map((c) => c.name).join(', ')}`;
+}
+
+/**
+ * プロファイルの指紋（`profile`/`profileProbe`）を1行へ（#1947）。上と同じ3状態
+ * ・同じ理由。Web にもこの PR で同じ形（`Profile` コンポーネント）を足した。
+ *
+ * **`profile.sha256` は既に「先頭12桁」であって64桁の生の sha256 ではない**
+ * （`packages/core/src/profile.ts` の `fingerprintOf`——`createHash('sha256')
+ * .digest('hex').slice(0, 12)`。`runnerProfileFingerprintSchema.sha256` の
+ * doc も「先頭12桁」と明記している）。だからここでさらに切り詰める必要は
+ * 無く、`updatedAt` を添えて「置いてある」ことと「いつの内容か」を1行で
+ * 分かるようにする。
+ */
+function renderProfileFingerprint(runner: RunnersView['runners'][number]): string {
+  if (runner.profileProbe.status === 'unheard') {
+    return 'プロファイル: 確かめていない（繋がっていないので聞いていない）';
+  }
+  if (runner.profileProbe.status === 'failed') {
+    return `プロファイルを確かめられなかった: ${runner.profileProbe.error}`;
+  }
+  if (runner.profile === undefined) {
+    return 'プロファイル: 置いていない';
+  }
+  return `プロファイル: 置いてある（指紋 ${runner.profile.sha256}、${runner.profile.updatedAt} 更新）`;
 }

@@ -264,6 +264,63 @@ describe('runner の鍵欄は、聞けた分しか言わない', () => {
 });
 
 /**
+ * #1947: プロファイルの指紋（`profile`/`profileProbe`）。鍵欄
+ * （`credentialsProbe`）と同じ3状態を、同じ理由で潰さない。
+ */
+describe('runner のプロファイル欄は、聞けた分しか言わない', () => {
+  it('聞いていないときは「置いていない」と言わない', async () => {
+    renderSettings({
+      runners: [{ ...BASE, profileProbe: { status: 'unheard' } }],
+      daemonRevision: DAEMON_UNKNOWN,
+    });
+
+    expect(await screen.findByText(/プロファイルは確かめていない/)).toBeTruthy();
+    expect(screen.queryByText('プロファイルは置いていない')).toBeNull();
+  });
+
+  it('失敗したときは理由が出る', async () => {
+    renderSettings({
+      runners: [{ ...BASE, profileProbe: { status: 'failed', error: 'ECONNRESET: 途中で切れた' } }],
+      daemonRevision: DAEMON_UNKNOWN,
+    });
+
+    expect(await screen.findByText(/ECONNRESET: 途中で切れた/)).toBeTruthy();
+    expect(screen.queryByText('プロファイルは置いていない')).toBeNull();
+  });
+
+  it('聞いて profile が無ければ「置いていない」と言う', async () => {
+    renderSettings({
+      runners: [{ ...BASE, profileProbe: { status: 'asked' } }],
+      daemonRevision: DAEMON_UNKNOWN,
+    });
+
+    expect(await screen.findByText('プロファイルは置いていない')).toBeTruthy();
+  });
+
+  /**
+   * **指紋（先頭12桁。既に切り詰め済み）に加えて `updatedAt` も出す**
+   * （CLI の `renderProfileFingerprint` と同じ形に揃える）。
+   */
+  it('聞けて profile があれば指紋と更新時刻を出す', async () => {
+    renderSettings({
+      runners: [
+        {
+          ...BASE,
+          profile: { sha256: 'abc123456789', bytes: 42, updatedAt: '2026-09-01T00:00:00.000Z' },
+          profileProbe: { status: 'asked' },
+        },
+      ],
+      daemonRevision: DAEMON_UNKNOWN,
+    });
+
+    const line = await screen.findByText(/abc123456789/);
+    expect(line.textContent).toContain('プロファイル: 置いてある');
+    // 時分は器の時間帯で変わるので、日付だけ固定して見る（他のブロックと同じ理由）。
+    expect(line.textContent).toMatch(/09\/01/);
+  });
+});
+
+/**
  * `pushHealth`（押し込みの直近結果）は `credentialsProbe`/`profileProbe`（指紋・
  * 聞き直し）とは別物。**「一度も試みていない」ときは行そのものを出さない**
  * （AGENTS.md「取れない軸に0の行を作らない」）。3種類は独立の軸なので、1つが

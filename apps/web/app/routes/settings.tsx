@@ -230,6 +230,46 @@ function PushHealth({ runner }: { runner: RunnerSummary }) {
   );
 }
 
+/**
+ * 置かれている実行環境プロファイルの指紋。**`Credentials` と同じ3状態**
+ * （unheard/failed/asked）を潰さない（#1947）。
+ *
+ * CLI（`apps/cli/src/runners.ts` の `renderProfileFingerprint`）に先に足した
+ * のと同じ4欄のうち、Web にまだ無かった2欄（`profile`/`profileProbe`）を
+ * 埋める——出さないと、この画面でだけ「プロファイルが置かれているか」が
+ * 判定できない非対称が残る（`credentials`/`credentialsProbe` は既にこの画面が
+ * 読んでいるので、そちらと揃える）。
+ */
+function Profile({ runner }: { runner: RunnerSummary }) {
+  if (runner.profileProbe.status === 'unheard') {
+    return (
+      <span className="text-[11px] text-muted">
+        プロファイルは確かめていない（繋がっていないので聞いていない）
+      </span>
+    );
+  }
+  if (runner.profileProbe.status === 'failed') {
+    return (
+      <span className="text-[11px] break-words text-danger">
+        プロファイルを確かめられなかった: {runner.profileProbe.error}
+      </span>
+    );
+  }
+  if (runner.profile === undefined) {
+    return <span className="text-[11px] text-muted">プロファイルは置いていない</span>;
+  }
+  // **`sha256` は既に「先頭12桁」であって64桁の生の sha256 ではない**
+  // （`packages/core/src/profile.ts` の `fingerprintOf`）。CLI
+  // （`apps/cli/src/runners.ts` の `renderProfileFingerprint`）と同じ形に
+  // 揃え、`updatedAt` も添えて「いつの内容か」を分かるようにする。
+  return (
+    <span className="font-mono text-[11px] break-all text-muted">
+      プロファイル: 置いてある（指紋 {runner.profile.sha256}、
+      {formatDateTime(runner.profile.updatedAt)} 更新）
+    </span>
+  );
+}
+
 function Runners() {
   const { data, error, isLoading } = useRunners();
   const runners = data?.runners ?? [];
@@ -320,6 +360,9 @@ function Runners() {
               )}
               <div className="mt-2 flex flex-wrap gap-1.5">
                 <Credentials runner={runner} />
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                <Profile runner={runner} />
               </div>
               <PushHealth runner={runner} />
               {runner.runnerId === undefined || runner.state === 'vacating' ? null : (
