@@ -6,6 +6,7 @@ import { Badge, Card, Empty, ErrorNote, Spinner } from '~/components/ui';
 import { useManagersWindow } from '~/hooks/use-managers-window';
 import { cn } from '~/lib/cn';
 import { formatRelative } from '~/lib/format';
+import { terminalFailureNote } from '~/lib/manager-failure-note';
 import type { ManagerDenial, ManagerStatus, ManagerSummary } from '~/lib/types';
 
 const STATUS: Record<ManagerStatus, { tone: 'ok' | 'warn' | 'danger' | 'neutral'; label: string }> =
@@ -196,17 +197,41 @@ export function ManagerDenialNote({
  *
  * **SDK の語（`code` / `via`）をそのまま出す。** 言い換えると人間が SDK の型定義や
  * ログで引ける手がかりが消える。`billing_error` と `rate_limit` は次の一手が違う。
+ *
+ * ## Issue #1882: `status` を見ずに「生きている」を言い続けていた
+ *
+ * 呼び出しが `status` を渡していなかったので、詳細（`manager-detail.tsx` の
+ * `FailureNote`）と同じ形で、`failed` / `lost` / `stopped` のように**既に終端
+ * している**回でも「セッションは生きているので、原因が解ければ話しかければ続く」
+ * を言っていた。**`lastFoldedTurn` の扱いは詳細の `FailureNote` の doc
+ * （「Issue #1882 / #1798」）と同じ。**
+ *
+ * **終端した回の文言は `~/lib/manager-failure-note` の `terminalFailureNote`
+ * から取る。** 詳細と同じ文をこのファイルへ複製して手書きしていたので、
+ * レビュー指摘で生成元を1本化した——**「もう続かない」が `send()` /
+ * `#resume()` の現物より強かったことの根拠と、揃え直した文言はそちらの doc に
+ * ある。** 生きている回（`done` 等）の文言はこの画面だけの語調（一覧の行には
+ * 「下の話しかける」に相当する導線が無い）なので、ここに残す。
  */
 export function ManagerFailureNote({
   failure,
+  status,
+  lastFoldedTurn,
 }: {
   failure: ManagerSummary['lastFailure'] | undefined;
+  status: ManagerStatus;
+  lastFoldedTurn: ManagerSummary['lastFoldedTurn'];
 }) {
   if (failure === undefined || failure === null) return null;
+  // Issue #1798 と同じ線（`manager-detail.tsx` の `FailureNote` の doc を見よ）
+  // ——`lastFoldedTurn` が在る回の `lastFailure` は、畳まれる前の無関係な
+  // 古いターンを指す。
+  if (lastFoldedTurn !== undefined) return null;
   return (
     <p className="mt-1 text-[11px] text-danger">
-      ⚠ 直近のターンは報告ではなく失敗で終わっている: {failure.code}（{failure.via}）
-      。セッションは生きているので、原因が解ければ話しかければ続く。
+      ⚠ 直近のターンは報告ではなく失敗で終わっている: {failure.code}（{failure.via}）。
+      {terminalFailureNote(status) ??
+        'セッションは生きているので、原因が解ければ話しかければ続く。'}
     </p>
   );
 }
@@ -654,7 +679,11 @@ function ManagersBody({ selected }: { selected: readonly ManagerStatus[] }) {
                       失敗も `status` に映らない（上限に当たった回も `done` の
                       まま）。札はそのまま残し、その隣に添える。
                     */}
-                    <ManagerFailureNote failure={manager.lastFailure} />
+                    <ManagerFailureNote
+                      failure={manager.lastFailure}
+                      status={manager.status}
+                      lastFoldedTurn={manager.lastFoldedTurn}
+                    />
                     {/*
                       これも `status` に映らない（`done` のまま）。札は差し替えず
                       隣に添える（`ManagerAwaitingBackgroundNote` の doc）。

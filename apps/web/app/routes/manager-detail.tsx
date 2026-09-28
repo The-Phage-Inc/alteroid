@@ -19,6 +19,7 @@ import { useAbortManager, useAppraiseManager, useSendManagerMessage } from '~/ho
 import { useManager, useManagerTranscript } from '~/hooks/queries';
 import { cn } from '~/lib/cn';
 import { formatDateTime, formatRelative } from '~/lib/format';
+import { terminalFailureNote as sharedTerminalFailureNote } from '~/lib/manager-failure-note';
 
 import type { AppraisalValue } from '@alteroid/core';
 /**
@@ -324,7 +325,7 @@ export default function ManagerDetail({ loaderData }: Route.ComponentProps) {
               className="border-t border-border px-4 py-3 text-xs text-muted"
             />
             <LostNote status={manager.status} />
-            <FailureNote failure={manager.lastFailure} />
+            <FailureNote manager={manager} />
           </Card>
 
           <DiagnosticsCard manager={manager} />
@@ -641,15 +642,60 @@ function LostNote({ status }: { status: ManagerStatus }) {
  *    SDK の型定義やログで引ける手がかりが消える
  * 2. **いつの失敗か（`at`）** — 「直近」がいつなのかが無いと、今も止まっているのか
  *    ずっと前に一度失敗しただけなのかが読めない
- * 3. **セッションは生きている** — これが `status` を `failed` へ倒さなかった理由
- *    そのものである（`schema.ts` の `lastFailure` の doc）。書かないと、人間は
- *    続けられる仕事を閉じる
+ * 3. **セッションが生きているかどうかの事実** — これが `status` を `failed` へ倒さ
+ *    なかった理由（生きている回）か、既に終端したという事実（終端した回）かの、
+ *    どちらかを必ず書く。書かないと、人間は続けられる仕事を閉じる（生きている回）か、
+ *    終わった仕事に話しかけ続ける（終端した回）
  *
  * **「上限に当たった」と決めつけないこと。** 観測しているのは「SDK が応答ではないと
  * 言った」ことと、その `code` だけである。`code` の意味の解釈は SDK 側が持っている。
+ *
+ * ## Issue #1882: `status` を見ずに「生きている」を言い続けていた
+ *
+ * `status` を受け取らず `lastFailure` だけを見ていたので、`failed` / `lost` /
+ * `stopped` のように**既に終端している**回でも「この仕事は死んでいない。セッションは
+ * 生きているので……」を言っていた。同じ画面の状態バッジは終端の札（例:
+ * 「停止済み」）を出しているので、1画面の中で言い切りが事実と矛盾する
+ * （実測は下の `terminalFailureNote` の doc）。
+ *
+ * **揃える先は core の #1796（PR #1857）の `describeUsageStopped`
+ * （`packages/core/src/tools.ts`）——同じ2値に分ける。** `failed` / `lost` は
+ * 「セッションそのものが、依頼者が望まない終わり方で既に終端している」、`stopped` は
+ * 「人間・クローンが明示的に停止させ、確かめたうえで既に終端している」。**core の値は
+ * import できない**（apps/web の import 制限。`eslint.config.js`）ので、文言は
+ * この画面の既存の語調（「この仕事は」「終わっている」の言い回し）で別に書く——
+ * 意味の線（終端の理由の2値）だけを揃え、文字は複製しない。
+ *
+ * **一覧（`managers.tsx` の `ManagerFailureNote`）と同じ文を手書きで複製していた
+ * ので、終端した回の文言は `~/lib/manager-failure-note` の `terminalFailureNote`
+ * へ1本化した（レビュー指摘）。** その doc に、直す前の「もう続かない」という
+ * 言い切りが `send()` / `#resume()` の現物より強かったこと（`stopConfirmedAt` は
+ * `#retire()` が消す in-memory の印でしかなく、`status` そのものは resume を
+ * 止めない）と、揃え直した文言の根拠がある。
+ *
+ * **`running` / `waiting_human` / `done`（生きている3値）は今までどおり**——
+ * 「この仕事は死んでいない。セッションは生きているので……」の文言を1文字も変えて
+ * いない（既存の歯「「待機中」の札を残したまま、SDK の語・時刻・次の一手を出す」が
+ * そのまま固定している）。
+ *
+ * ## Issue #1882 / #1798: `lastFoldedTurn` が在る回は出さない
+ *
+ * `lastFailure` は `manager.ts` の `case 'report'` が `record.job.status ===
+ * 'stopped'` の間は一切触らない欄（`lastFoldedTurn` だけを書いて早期 return する
+ * 分岐）——**`lastFoldedTurn` が在る回の `lastFailure` は、畳まれる前の無関係な
+ * 古いターンを指す。** この行の下に出したいのは「直近のターン」の話なので、
+ * 古いターンの失敗を「直近のターン」として出すと読み違える。
+ *
+ * **判定のコピーを作らない代わりに、core と同じ線を張る。** core の
+ * `manager_report`（`packages/core/src/tools.ts`）は `foldedTurn !== undefined`
+ * の回に `describeManagerFailure` を呼ばない（Issue #1798）——ここも同じ回に
+ * `null` を返す。畳まれたターンの本文そのものは `FoldedTurnNote` が別に出す。
  */
-function FailureNote({ failure }: { failure: ManagerSummary['lastFailure'] | undefined }) {
+function FailureNote({ manager }: { manager: ManagerSummary }) {
+  const { lastFailure: failure, lastFoldedTurn, status } = manager;
   if (failure === undefined || failure === null) return null;
+  // Issue #1798 と同じ線（上の doc の「Issue #1882 / #1798」を見よ）。
+  if (lastFoldedTurn !== undefined) return null;
   return (
     <p className="border-t border-border px-4 py-3 text-xs text-danger">
       直近のターンは
@@ -657,14 +703,38 @@ function FailureNote({ failure }: { failure: ManagerSummary['lastFailure'] | und
       <code className="font-mono">{failure.code}</code>（印の出どころ:{' '}
       <code className="font-mono">{failure.via}</code>、{formatDateTime(failure.at)}）。
       <br />
-      <strong className="font-medium">この仕事は死んでいない</strong>
-      。セッションは生きているので、原因が解ければ下の「話しかける」から続けられる（だから状態は
-      <strong className="font-medium">失敗ではなく待機中</strong>
-      のままである）。
+      {terminalFailureNote(status)}
       <strong className="font-medium">何が起きたかの解釈まではしていない</strong>— 観測したのは「SDK
       がこれは応答ではないと言った」ことと、この
       <code className="font-mono">code</code> だけである。
     </p>
+  );
+}
+
+/**
+ * {@link FailureNote} の第2段落（生きているか、既に終端しているか）。
+ *
+ * **終端した回（`failed` / `lost` / `stopped`）の文言は
+ * `~/lib/manager-failure-note` の `terminalFailureNote` から取る。** 一覧
+ * （`managers.tsx` の `ManagerFailureNote`）と同じ文を2箇所で手書きしていたので、
+ * レビュー指摘で生成元を1本化した——**「もう続かない」が `send()` / `#resume()`
+ * の現物より強かったことの根拠と、揃え直した文言はそちらの doc にある。**
+ *
+ * **`running` / `waiting_human` / `done`（生きている3値）はここでだけ書く。**
+ * 「下の『話しかける』」という導線はこの詳細画面にしかない（一覧の行には
+ * 送信欄が無い）ので、共通化した側には置いていない——文言は直す前と1文字も
+ * 変えていない。
+ */
+function terminalFailureNote(status: ManagerStatus): ReactNode {
+  const terminal = sharedTerminalFailureNote(status);
+  if (terminal !== null) return terminal;
+  return (
+    <>
+      <strong className="font-medium">この仕事は死んでいない</strong>
+      。セッションは生きているので、原因が解ければ下の「話しかける」から続けられる（だから状態は
+      <strong className="font-medium">失敗ではなく待機中</strong>
+      のままである）。
+    </>
   );
 }
 
@@ -846,12 +916,33 @@ function DenialsCard({
  *
  * **健全な回（drift 無し）では空文字が返る**（`describeReportDrift` の doc）
  * ——その場合は1行も出さない。
+ *
+ * ## Issue #1882 / #1797: `lastFoldedTurn` が在る回は、その材料で組む
+ *
+ * `manager.lastReportAt` / `manager.lastReportStatus` は `manager.ts` の
+ * `case 'report'` が `record.job.status === 'stopped'` の間は一切触らない欄
+ * （`lastFoldedTurn` だけを書いて早期 return する分岐）——**`lastFoldedTurn` が
+ * 在る回のこの2欄は、畳まれる前の無関係な古いターンの値のままである。** そのまま
+ * `describeReportDrift` へ渡すと、「いま読んでいる畳まれた本文」とは無関係な
+ * drift を語ることになる（Issue の実測: `status: 'stopped'` + 古い
+ * `lastReportStatus: 'running'` の組で「この報告は…いま走っているターンの中身
+ * ではない」が出た）。
+ *
+ * **判定のコピーは作らない代わりに、core と同じ合成をする。** core の
+ * `manager_report`（`packages/core/src/tools.ts`、Issue #1797）は
+ * `lastReportAt` を `foldedTurn.at`（この本文が実際に届いた時刻）へ、
+ * `lastReportStatus` を `'stopped'` へ差し替える——`lastFoldedTurn` は
+ * `case 'report'` が `status === 'stopped'` の間だけ書く欄なので、書かれた瞬間の
+ * status は構造的に `'stopped'` だったと分かる（専用の記録欄が無くても合成できる）。
+ * ここも同じ2値を合成して渡す——生成元（`describeReportDrift`）は1箇所のまま
+ * 割らない。
  */
 function reportStatusDriftText(manager: ManagerSummary): string {
+  const foldedTurn = manager.lastFoldedTurn;
   return describeReportDrift({
     managerId: manager.managerId,
-    lastReportAt: manager.lastReportAt,
-    lastReportStatus: manager.lastReportStatus,
+    lastReportAt: foldedTurn !== undefined ? foldedTurn.at : manager.lastReportAt,
+    lastReportStatus: foldedTurn !== undefined ? 'stopped' : manager.lastReportStatus,
     status: manager.status,
     now: new Date(),
   });
