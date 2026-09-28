@@ -2894,6 +2894,36 @@ function denialLine(denials: ManagerDenial[], lastReportAt: string | undefined):
  * `case 'usage_notice'` も `withRecoveryNote` を呼ぶが、あちらは合図が
  * 届いた瞬間の文言で、世代の行を並べて出していないので、ここでは触っていない
  * （Issue #931 に残した）。
+ *
+ * ## ⚠️ Issue #1882: `status` が既にセッションの死を確定させている回は分けて言う
+ *
+ * `lastFailure` は `manager.ts` の `case 'report'` が書く欄で、次の `report` が
+ * 届くまで消えない（`delete record.job.lastFailure` は次の成功した report の
+ * 分岐でしか通らない）。だから、枠(429)などで畳まれた回の直後にセッション
+ * そのものが `failed` / `lost`（{@link isManagerOutcomeUnobserved}）や
+ * `stopped`（`manager.ts` の `abort()` が `isLive()` で確かめたうえで終端させる）
+ * へ確定しても、`lastFailure` は古い前提のまま残る。**このとき「セッションは
+ * 生きているので、原因が解ければ manager_send で続きから進む」と言い切ると、
+ * 同じ応答に並ぶ `systemErrorLine`（「セッションは失敗で畳まれた」）と正面から
+ * 矛盾する**——`describeUsageStopped` が Issue #1796 で直したのと同じ形の穴が、
+ * この欄にも独立に在った（本文は #1796 と共有していない。`usageStoppedAt` と
+ * `lastFailure` は別の欄なので、片方を直してももう片方には届かない）。
+ *
+ * **`status` を追加の引数として受け取り、`isManagerOutcomeUnobserved` と
+ * `status === 'stopped'` の2分岐で言い分ける**（`describeUsageStopped` と
+ * 同じ2分岐・同じ判定関数）。**生きている側（`running` / `waiting_human` /
+ * `done`）の文言は1文字も変えない**——変えてよいのは終端した2つの枝だけである。
+ *
+ * **終端した2つの枝では {@link RESTART_BEFORE_CHECK_ADVICE} を付けない。**
+ * この助言の趣旨は「確かめずに `manager_start` で起こし直すと同じ仕事が2本
+ * 走る」ことへの注意で、二重起動の危険は「本当に死んでいるか確認できていない」
+ * ときにしか成り立たない。終端した2枝は `isLive()` が確認済みで死んでいる
+ * 側（`stopped` も `lost` と同じ列——`manager.ts` の `isLive()` の doc）なので、
+ * この助言はここでは当てはまらない——`describeUsageStopped` の終端2枝も
+ * この助言を付けていない（同じ判断）。**`withRecoveryNote`（回復の見込み）は
+ * 終端した枝でも外さない**——あちらは「この失敗コードの性質上、待てば枠は
+ * 戻るか」という、セッションの生死とは軸が違う情報で、次に `manager_start` で
+ * 新しく起こすタイミングを計るのにも使える。
  */
 /**
  * `manager_start` が返す `ManagerSummary` から、cwd をどう名乗るかの1句を作る
@@ -2921,16 +2951,52 @@ function describeStartedCwd(
 function describeManagerFailure(
   failure: ManagerSummary['lastFailure'],
   lastReport: string | undefined,
+  status: ManagerSummary['status'],
   staleToken = false,
 ): string | null {
   if (failure === undefined) return null;
-  const base =
+  const opening =
     `⚠ 直近のターンは報告ではなく失敗で終わっている: ${failure.code}（${failure.via}, ${failure.at}）。` +
     'この行の下に出る本文は runner が包んだエラー文（「このターンは応答を返さずに終わった: …」）で' +
-    'あって報告ではない——**完遂して畳んだと読まないこと。** ' +
-    'セッションは生きているので、原因が解ければ manager_send で続きから進む' +
-    '（status が done のままなのはそのためで、この委譲が死んだという意味ではない）。' +
-    RESTART_BEFORE_CHECK_ADVICE;
+    'あって報告ではない——**完遂して畳んだと読まないこと。** ';
+  // **Issue #1882: `status` が既にセッションの死を確定させている回は分けて
+  // 言う——`describeUsageStopped`（Issue #1796）と同じ2分岐、同じ判定関数
+  // （このファイル冒頭の doc「## ⚠️ Issue #1882」）。**
+  // **終端した枝のクォート内の言い換えは、生きている側の文言（下）の部分
+  // 文字列にしない。** `describeUsageStopped` も同じ形（生きている側「セッション
+  // は生きているので、鍵が回ればこの委譲は続く」に対し、終端側のクォートは
+  // 「セッションは生きているので鍵が回れば続く」——読点を落とし文末も変えて
+  // ある）。理由はここで作る側の事情——このクォートを生きている側の文言の
+  // 部分文字列にすると、`.not.toContain(ALIVE_CLAIM)` の陰性対照がクォートの
+  // 中身にも当たってしまい、直したはずの断定がテストの上では消えたことにすら
+  // 気づけない（実際にこの PR の歯を書く過程で一度それを踏んだ）。
+  const base = isManagerOutcomeUnobserved(status)
+    ? opening +
+      `ただし status: ${status}——セッションそのものが、依頼者が望まない終わり方で` +
+      '既に終端している。「セッションが生きていて原因が解ければ進められる」という前提は' +
+      'ここでは成り立たない——起こし直すには manager_send で resume を試みるしかなく、' +
+      '届く保証は無い（届いた事実の判定は `systemErrorLine` 等の別の行を見ること）。'
+    : status === 'stopped'
+      ? opening +
+        'ただし status: stopped——このセッションは、その後 人間・クローンが明示的に' +
+        '停止させ、確かめたうえで既に終端している（`abort()` が runner の一覧を探って' +
+        'セッションが消えたことを確かめた事実。`manager.ts` の `isLive()` の doc）。' +
+        '「セッションが生きていて原因が解ければ進められる」という前提はここでは成り立たない' +
+        '——起こし直すには manager_send で resume を試みるしかなく、届く保証は無い' +
+        '（届いた事実の判定は `systemErrorLine` 等の別の行を見ること）。'
+      : opening +
+        'セッションは生きているので、原因が解ければ manager_send で続きから進む' +
+        '（status が done のままなのはそのためで、この委譲が死んだという意味ではない）。' +
+        RESTART_BEFORE_CHECK_ADVICE;
+  // **`stopped` でも「起こし直しは resume を試みるしかなく、届く保証は無い」を
+  // 言う。** `send()`（`manager.ts`）は `status` を見ずに `#load()` で
+  // `ManagerRecord` を作り直し（`attached: false`、`stopConfirmedAt` 無し）、
+  // `#resume()` も `record.stopConfirmedAt`（プロセス内の像にしか無く `Job`
+  // へは書かない印）が立っていなければ素通りする。⟹ `stopped` はセッションが
+  // **確認済みで死んでいる**が、`manager_send` からの起こし直し自体は塞がれて
+  // いない——`isLive()` が確認したのは「その確認をした瞬間」の生死であって、
+  // resume が届くかどうかを保証する印ではない。`isManagerOutcomeUnobserved`
+  // 側の枝と同じ一文をここにも揃える。
   if (lastReport === undefined) return base;
   const fromText = limitRecoveryOf(lastReport);
   const recovery =
@@ -2954,11 +3020,26 @@ function describeManagerFailure(
  * {@link tokenGenerationMismatched} を当てるのに同じ委譲の世代が要る。
  * **2つの欄だけを渡す形に戻さないこと**——戻すと、呼び出し側が判定を
  * 組み立て直すことになり、`manager_report` 側と割れる。
+ *
+ * **`lastFoldedTurn` が在る回は出さない（Issue #1882 のレビュー指摘）。**
+ * `manager.ts` の `case 'report'` は `record.job.status === 'stopped'` の間
+ * `lastFoldedTurn` だけを書いて早期 return する（`lastFailure` には触れない）
+ * ので、`lastFoldedTurn` が在る回の `lastFailure` は必ず畳まれる**前**の、
+ * 無関係な古いターンを指す——`describeManagerFailure` の「直近のターンは
+ * 報告ではなく失敗で終わっている」は、より新しいターン（畳まれたもの）が
+ * 既に在る以上「直近」がそもそも事実と違う。`manager_report` は同じ穴を
+ * Issue #1798 で `foldedTurn !== undefined ? null : describeManagerFailure(...)`
+ * というガードで塞いでおり（このファイルの `case 'report'` ハンドラ）、
+ * ここも同じガードで揃える——揃えないと `manager_list` と `manager_report`
+ * が同じ委譲について違うことを言う（`manager_list` は誤った⚠を出し、
+ * `manager_report` は出さない）。
  */
 function failureLine(manager: ManagerSummary): string | null {
+  if (manager.lastFoldedTurn !== undefined) return null;
   const note = describeManagerFailure(
     manager.lastFailure,
     manager.lastReport,
+    manager.status,
     tokenGenerationMismatched(manager),
   );
   return note === null ? null : `  ${note}`;
@@ -3018,6 +3099,21 @@ function failureLine(manager: ManagerSummary): string | null {
  * 見ない。手元の再現で `status: 'stopped'` + `usageStoppedAt` を作ると、
  * 直す前はここが「セッションは生きている」を言ったままだった）。
  *
+ * ## ⚠️ Issue #1882: `stopped` 枝にも「resume を試みるしかなく、届く保証は
+ * 無い」を足す（`describeManagerFailure` と揃える）
+ *
+ * 直上の `isManagerOutcomeUnobserved` の枝は「起こし直すには manager_send で
+ * resume を試みるしかなく、届く保証は無い」まで言うが、この `stopped` の枝は
+ * 「ここでは成り立たない」で言い切って終わっていた——`manager_send`
+ * （`manager.ts` の `send()`）は `status` を見ずに `#load()` で
+ * `ManagerRecord` を作り直し（`stopConfirmedAt` はプロセス内の像にしか無く
+ * `Job` へは書かないので、作り直した像には残らない）、`#resume()` もその印が
+ * 無ければ素通りするので、`stopped` でも resume は実際に試みられる。
+ * **「望んだ終端」と「セッションが生きているか」を分けたのと同じ理由で、
+ * 「確認済みで死んでいる」と「起こし直しの経路が塞がっているか」も別の軸
+ * である**——後者は塞がっていない。⟹ `isManagerOutcomeUnobserved` の枝と
+ * 同じ resume の一文をここにも足した。
+ *
  * **健全なマネージャーでは `null` を返し、1文字も増えない**（他の `describe*`
  * と同じ約束——一覧は文字数の予算 `LIST_BUDGET` に張り付いている）。
  *
@@ -3044,7 +3140,9 @@ function describeUsageStopped(manager: ManagerSummary): string | null {
       'ただし status: stopped——このセッションは、その後 人間・クローンが明示的に' +
       '停止させ、確かめたうえで既に終端している（`abort()` が runner の一覧を探って' +
       'セッションが消えたことを確かめた事実。`manager.ts` の `isLive()` の doc）。' +
-      '「セッションは生きているので鍵が回ればこの委譲は続く」はここでは成り立たない。'
+      '「セッションは生きているので鍵が回ればこの委譲は続く」はここでは成り立たない' +
+      '——起こし直すには manager_send で resume を試みるしかなく、届く保証は無い' +
+      '（届いた事実の判定は `systemErrorLine` 等の別の行を見ること）。'
     );
   }
   return (
@@ -10700,6 +10798,7 @@ export function createCloneTools(context: ToolContext) {
             : describeManagerFailure(
                 found.lastFailure,
                 found.lastReport,
+                found.status,
                 tokenGenerationMismatched(found),
               );
         // **manager_list 専用の3軸のうち2つ（Issue #1847）。** `manager_list`
