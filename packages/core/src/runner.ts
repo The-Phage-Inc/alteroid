@@ -6363,10 +6363,21 @@ const APPROVAL_WORDS = /\b(go ahead|approved|approve|ok|okay|yes|sure)\b/i;
  * `unreadable` は SDK 側では deny として扱われるので、許しすぎる側には
  * 化けない（`decideAnswer` の doc）。
  */
-const NEGATION_MARKERS_EN = /\b(not|n't|never|cannot|wait|hold off|hold on|pause\w*)\b/i;
+// `n't` は語境界の組の外に置く（issue #1932）。`\b(…|n't|…)\b` の形では、
+// `isn't` の `s` と `n` のあいだに `\b` が立たず、縮約の中で1回も当たらなかった。
+// `n't\b` なら `isn't` / `shouldn't` / `can't` の語尾に当たる。
+const NEGATION_MARKERS_EN = /\b(not|never|cannot|wait|hold off|hold on|pause\w*)\b|n't\b/i;
 const NEGATION_MARKERS_JA = ['ない', 'ません', 'ず', '保留', '見送', '不要'];
 
-function hasNegationMarker(message: string): boolean {
+/**
+ * **テストのためだけに export している**（issue #1932。`packages/core/src/index.ts`
+ * からは再エクスポートしていない）。#1926 の後は、否定の印を含む文は
+ * `isApprovalOnly` の時点で「承認だけ」から外れるので、`inferDecision` の
+ * 戻り値からはこの関数が当たったかどうかが見えない。印が実際に当たることを
+ * 直接測る歯（`runner-infer-decision.test.ts` の #1932 の describe）のために
+ * 外へ出した。挙動は変えていない。
+ */
+export function hasNegationMarker(message: string): boolean {
   return (
     NEGATION_MARKERS_EN.test(message) ||
     NEGATION_MARKERS_JA.some((marker) => message.includes(marker))
