@@ -1035,7 +1035,16 @@ export async function runSlashCommand(
         json: reason === '' ? {} : { reason },
       });
       if (!response.ok) {
-        stdout.write(`そのマネージャーは見つかりませんでした: ${id}\n`);
+        // 404 だけ「見つからない」と言う。それ以外（400・5xx 等）はサーバの
+        // 理由（`errorDetail`）をそのまま出す — 状態コードだけを見せて
+        // 「打ち間違えた」と誤読させない（issue #2172、`/commit-edit` と同じ形）。
+        stdout.write(
+          `${
+            response.status === 404
+              ? `そのマネージャーは見つかりませんでした: ${id}`
+              : await errorDetail(response)
+          }\n`,
+        );
         return 'ok';
       }
       // **応答をそのまま出す。** 「止めた」と言い換えると、器の側が別の結果
@@ -1094,9 +1103,7 @@ export async function runSlashCommand(
       }
       stdout.write(
         `${
-          response.status === 404
-            ? 'そのマネージャーは台帳にいません'
-            : `記録できませんでした (${response.status})`
+          response.status === 404 ? 'そのマネージャーは台帳にいません' : await errorDetail(response)
         }\n`,
       );
       return 'ok';
@@ -1149,7 +1156,15 @@ export async function runSlashCommand(
         json: { text },
       });
       if (!response.ok) {
-        stdout.write(`そのマネージャーは見つかりませんでした: ${id}\n`);
+        // 404 だけ「見つからない」と言う。それ以外はサーバの理由をそのまま出す
+        // （issue #2172、`/commit-edit` と同じ形）。
+        stdout.write(
+          `${
+            response.status === 404
+              ? `そのマネージャーは見つかりませんでした: ${id}`
+              : await errorDetail(response)
+          }\n`,
+        );
         return 'ok';
       }
       const { outcome, detail } = await response.json();
@@ -1180,7 +1195,15 @@ export async function runSlashCommand(
         json: { text, requestId: target.requestId },
       });
       if (!response.ok) {
-        stdout.write(`そのマネージャーは見つかりませんでした: ${target.managerId}\n`);
+        // 404 だけ「見つからない」と言う。それ以外はサーバの理由をそのまま出す
+        // （issue #2172、`/commit-edit` と同じ形）。
+        stdout.write(
+          `${
+            response.status === 404
+              ? `そのマネージャーは見つかりませんでした: ${target.managerId}`
+              : await errorDetail(response)
+          }\n`,
+        );
         return 'ok';
       }
       const { outcome, detail } = await response.json();
@@ -1223,7 +1246,15 @@ export async function runSlashCommand(
           json: { text: defaultText, decision },
         });
         if (!response.ok) {
-          stdout.write(`そのマネージャーは見つかりませんでした: ${target.managerId}\n`);
+          // 404 だけ「見つからない」と言う。それ以外はサーバの理由をそのまま出す
+          // （issue #2172、`/commit-edit` と同じ形）。
+          stdout.write(
+            `${
+              response.status === 404
+                ? `そのマネージャーは見つかりませんでした: ${target.managerId}`
+                : await errorDetail(response)
+            }\n`,
+          );
           return 'ok';
         }
         const { outcome, detail } = await response.json();
@@ -1247,7 +1278,15 @@ export async function runSlashCommand(
         },
       });
       if (!response.ok) {
-        stdout.write(`そのマネージャーは見つかりませんでした: ${target.managerId}\n`);
+        // 404 だけ「見つからない」と言う。それ以外はサーバの理由をそのまま出す
+        // （issue #2172、`/commit-edit` と同じ形）。
+        stdout.write(
+          `${
+            response.status === 404
+              ? `そのマネージャーは見つかりませんでした: ${target.managerId}`
+              : await errorDetail(response)
+          }\n`,
+        );
         return 'ok';
       }
       const { outcome, detail } = await response.json();
@@ -1629,10 +1668,14 @@ export async function runSlashCommand(
           ...(conversationId === null ? {} : { source: conversationId }),
         },
       });
+      if (response.ok) {
+        stdout.write('台帳に積みました（/commitments で確認できます）\n');
+        return 'ok';
+      }
+      // 404 だけ今の文言を保つ。それ以外（400・5xx 等）はサーバの理由
+      // （`errorDetail`）をそのまま出す（issue #2172、`/commit-edit` と同じ形）。
       stdout.write(
-        response.ok
-          ? '台帳に積みました（/commitments で確認できます）\n'
-          : '台帳に積めませんでした\n',
+        `${response.status === 404 ? '台帳に積めませんでした' : await errorDetail(response)}\n`,
       );
       return 'ok';
     }
@@ -1665,7 +1708,7 @@ export async function runSlashCommand(
             ? 'それは既に片付いています'
             : response.status === 404
               ? 'その id は台帳にありません'
-              : `記録できませんでした (${response.status})`
+              : await errorDetail(response)
         }\n`,
       );
       return 'ok';
@@ -1762,11 +1805,7 @@ export async function runSlashCommand(
         return 'ok';
       }
       stdout.write(
-        `${
-          response.status === 404
-            ? 'その id は台帳にありません'
-            : `記録できませんでした (${response.status})`
-        }\n`,
+        `${response.status === 404 ? 'その id は台帳にありません' : await errorDetail(response)}\n`,
       );
       return 'ok';
     }
