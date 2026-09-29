@@ -9835,9 +9835,22 @@ class Clone implements CloneHost {
       // 読んだ後に人間の取り消しが完了していると、写しの上では生きていても
       // `markUsed` は記録せず `false` を返す——その許可では通さない。
       // **店が例外を投げたときは、これまでどおり写しの読みに倒す**（通す）。
-      // 許可の層を境界と読むか監査と読むかの判断（人間の回答待ち）に関わる向きなので、
-      // ここでは変えない。
-      const usable = await this.#stores.permissionGrants.markUsed(grant.id, now).catch(() => true);
+      // 承認 d0f15fb7（`docs/architecture.md`「承認への回答と許可の記録 ——
+      // 境界ではなく監査の層」）で、許可の層はセキュリティの境界ではなく監査の層と
+      // 決まっている。⟹ 店が例外を投げて再確認できなかったからといって閉じる側へは
+      // 倒さない——境界であれば「確かめられなければ拒否」だが、監査の層が保証する
+      // のは「正規の口を通った許可が記録に残る」ことなので、その保証を満たせなかった
+      // こと自体を跡に残す（`noteDroppedRecord`。本文は出さない——grant の id だけ）。
+      // **この窓を塞がない。** 例外と人間の取り消しがちょうど同時に起きた回だけ、
+      // 取り消し済みの許可が1回通りうる——監査の層として受け入れた窓である。
+      // 道具の呼び出しそのものは `#journalToolUse` で日誌に残る。ただし、どの
+      // 許可（grant）で通ったかは残らない——`#allowedByGrantToolUses` はメモリ
+      // だけの控えで、`#onPostToolUse` が決着した時点で `delete` する。その許可が
+      // 使われた記録（`lastUsedAt`）が今回落ちたことは、この跡でしか分からない。
+      const usable = await this.#stores.permissionGrants.markUsed(grant.id, now).catch((error) => {
+        noteDroppedRecord('許可を使った時刻（lastUsedAt）', `grant=${grant.id}`, error);
+        return true;
+      });
       if (!usable) continue;
       if (typeof record.toolUseId === 'string') {
         this.#allowedByGrantToolUses.set(record.toolUseId, {
