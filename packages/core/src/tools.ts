@@ -3280,6 +3280,37 @@ function runnerVanishedLine(manager: ManagerSummary): string | null {
 }
 
 /**
+ * **Issue #2183: `awaitingBackground` の在庫のうち、配っていない報告の本数を
+ * `manager_report` に名乗る。**
+ *
+ * 人間の面（`apps/web/app/routes/managers.tsx` の「この間の報告
+ * {awaitingBackground.withheldReports}」）が既に出している事実を、クローンの
+ * 面にも運ぶだけである。`manager_list` の説明文は「握り潰した報告の中身は
+ * manager_report と日誌（decision）に在る」と案内しているが、直すまでは
+ * その案内の先（ここ）に事実が無かった——それを埋める。
+ *
+ * **`tasks`（背景タスクの在り高）とは別の軸なので混ぜない**
+ * （`ManagerAwaitingBackground.tasks` の doc「`withheldReports` と1つに
+ * 畳まない」）。`manager_list` の「背景処理待ち×N」の N はいまも `tasks` の
+ * ままで、ここを足しても `manager_list` の字面・`describeManagerState` は
+ * 1バイトも変えていない。
+ *
+ * **`count`（`withheldReports`）が 0 でも出す。** これは「取れない」ではなく
+ * 「0 と測れた」——直前にフラッシュされて在庫がまだ残っている（`count: 0`）
+ * 回で、人間の面（Web）も同じ値をそのまま出す（`withheld.count` の doc）。
+ *
+ * **健全な（`awaitingBackground` が無い）委譲では `null` を返し、1文字も
+ * 増えない**——他の `describe*` と同じ約束。
+ */
+function describeWithheldReports(manager: ManagerSummary): string | null {
+  if (manager.awaitingBackground === undefined) return null;
+  return (
+    `配っていない報告 ${manager.awaitingBackground.withheldReports} 本` +
+    '（中身は日誌の decision に在る）。'
+  );
+}
+
+/**
  * **`lastReport` を「直近の報告」と呼んでよいか（Issue #714 / #917）。**
  *
  * 呼んではいけない回が2つある——どちらも `lastReport` の本文は完遂した報告
@@ -10967,6 +10998,30 @@ export function createCloneTools(context: ToolContext) {
               // いる一覧で行を1本増やすと出せる件数が減るため（他の条件付き
               // 行と同じ理由）。
               describeUnpushedWorkObservation(manager),
+              // **Issue #2182: 評定が在る行だけ1行増える。** `commitment_list`
+              // と同じ作法（字面の生成元は `describeAppraisal` 1箇所で、
+              // `commitment_list` と割れない）。未評定の行に「未評定」と
+              // 刷らない——印が無いことがその状態である（`describeAppraisal`
+              // の doc）。
+              ...(describeAppraisal(manager) === null
+                ? []
+                : [`  ${excerptLine(describeAppraisal(manager) ?? '', 120)}`]),
+              // **Issue #2183: ここには足さないと決めた。** `manager_report`
+              // には `describeWithheldReports` を足した（すぐ下の説明文が
+              // 案内する先）が、この一覧の行には足していない——理由は2つ。
+              // (1) この一覧は既に「背景処理待ち×N」で `tasks`（在り高）を
+              // 名乗っており、`withheldReports`（本数）まで並べると読み手は
+              // 2つの数を1本の行で見比べることになる——`ManagerAwaitingBackground`
+              // の doc が名指しで禁じているのは「1つに畳む」ことで、**別行でも
+              // 隣に置けば同じ混同が起きる**。(2) この一覧は文字数の予算
+              // （`LIST_BUDGET`）に張り付いていて、行を1本増やすと出せる件数が
+              // 減る（すぐ上の他の条件付き行と同じ制約）——`awaitingBackground`
+              // は多くの委譲で立たない軸なので費用は小さいが、詳細を持たない
+              // 数だけを並べても読み手の次の一手は変わらない（「配っていない
+              // 報告が N 本ある」と分かっても、この一覧からできることは
+              // 変わらず、結局 manager_report / journal_read へ掘りに行く）。
+              // ⟹ この一覧はいまのまま「案内する側」に留め、実際の本数と
+              // 内容は掘った先（`manager_report`）に置く。
             ],
           });
         });
@@ -11181,6 +11236,15 @@ export function createCloneTools(context: ToolContext) {
           // `manager_report` はインデントの無い地の文なので、`unpushedWorkReportNote`
           // でその飾りだけを落とす（判定・文言そのものは1文字も変えない）。
           const unpushedWork = unpushedWorkReportNote(found);
+          // **Issue #2182: 評定は報告の有無とは別の軸なので、ここでも出す**
+          // （直上の各行と同じ理由——片方が空だからもう片方も出さない、には
+          // しない）。字面の生成元は `describeAppraisal` 1箇所で、
+          // `commitment_list` / `manager_list` と割れない。
+          const appraisal = describeAppraisal(found);
+          // **Issue #2183: 配っていない報告の本数も同じ理由でここに出す。**
+          // 字面の生成元は `describeWithheldReports` 1箇所で、`manager_list`
+          // の「背景処理待ち×N」（`tasks`）とは割れない。
+          const withheldReportsNote = describeWithheldReports(found);
           return text(
             [
               missing,
@@ -11191,6 +11255,8 @@ export function createCloneTools(context: ToolContext) {
               denied,
               unobserved,
               unpushedWork,
+              appraisal,
+              withheldReportsNote,
             ]
               .filter((s) => s !== null)
               .join('\n\n'),
@@ -11314,6 +11380,16 @@ export function createCloneTools(context: ToolContext) {
         // では出さない（`failure` / `systemError` / `denied` / `unobserved` と
         // 同じ線）。
         const unpushedWork = part === 'request' ? null : unpushedWorkReportNote(found);
+        // **Issue #2182: 評定を、報告が在る回でも同じ場所で掘れるようにする。**
+        // `manager_list` / `commitment_list` と同じ材料（`describeAppraisal`
+        // 1箇所）——`failure` 等と同じ軸ではないので、両方が同時に出うる。
+        // `part === 'request'` では出さない（直上の各行と同じ線）。
+        const appraisal = part === 'request' ? null : describeAppraisal(found);
+        // **Issue #2183: 配っていない報告の本数を、報告が在る回でも同じ場所で
+        // 掘れるようにする。** 字面の生成元は `describeWithheldReports` 1箇所
+        // ——`tasks`（`manager_list` の「背景処理待ち×N」）とは別の軸なので
+        // 混ぜない。`part === 'request'` では出さない（同上）。
+        const withheldReportsNote = part === 'request' ? null : describeWithheldReports(found);
         const label =
           part === 'request'
             ? '依頼文'
@@ -11411,6 +11487,13 @@ export function createCloneTools(context: ToolContext) {
         // に置いているのと同じ相対位置——ここでも他の注記より後、本文より前。
         // **対象外の委譲では1文字も増えない。**
         const unpushedWorkNote = unpushedWork === null ? '' : `${unpushedWork}\n\n`;
+        // **同じ順・同じ理由で本文の上に置く（Issue #2182）。** `commitment_list`
+        // と同じ材料（`describeAppraisal`）——**評定が無い回は1文字も増えない。**
+        const appraisalNote = appraisal === null ? '' : `${appraisal}\n\n`;
+        // **同じ順・同じ理由で本文の上に置く（Issue #2183）。**
+        // `awaitingBackground` が無い回は1文字も増えない。
+        const withheldReportsFooterNote =
+          withheldReportsNote === null ? '' : `${withheldReportsNote}\n\n`;
         const tail = part1.more
           ? `\n\n…（ここで切れている。続きは manager_report managerId=${managerId}` +
             `${part === 'request' ? ' part=request' : ''} offset=${part1.to}）`
@@ -11422,7 +11505,7 @@ export function createCloneTools(context: ToolContext) {
         const footer =
           '\n\n（さらに掘るなら manager_transcript managerId=' + managerId + ' で生ログへ）';
         return text(
-          `${head}\n\n${driftNote}${failureNote}${usageStoppedNote}${runnerVanishedNote}${systemErrorNote}${cgroupEventsNote}${denialNote}${unobservedNote}${unpushedWorkNote}${part1.body}${tail}${footer}`,
+          `${head}\n\n${driftNote}${failureNote}${usageStoppedNote}${runnerVanishedNote}${systemErrorNote}${cgroupEventsNote}${denialNote}${unobservedNote}${unpushedWorkNote}${appraisalNote}${withheldReportsFooterNote}${part1.body}${tail}${footer}`,
         );
       },
     ),
