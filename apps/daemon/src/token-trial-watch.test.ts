@@ -26,6 +26,30 @@ import { isRejectionForTrialBackoff, startTokenTrialWatch } from './token-trial-
 
 const AT = Date.parse('2026-09-25T00:00:00.000Z');
 
+/**
+ * 実時間を待たない（issue #2146）。
+ *
+ * ここより下のテストは、実時間の `setTimeout` で 20〜40ms 待ち、その間に
+ * `tickMs: 5` の実時間の見張りが「十分な回数走った」ことを前提にして
+ * `expect(...)` していた。器が混んでイベントループが遅れると、待ちの間に
+ * 見張りが走りきらず、早すぎる `expect` が落ちうる（実測はまだ無いが、
+ * 落ちうる形そのものが issue #2146 の指摘）。
+ *
+ * `vi.useFakeTimers()` を敷き、`settle()` / `tickFor()` を
+ * `vi.advanceTimersByTimeAsync(ms)` に置き換える —— 見張りの内部の
+ * `setTimeout` も同じ偽の時計に乗るので、指定した ms ぶんの目盛りが
+ * 「実際に走ったこと」を保って進む（器の速さに依存しない）。論理時計
+ * （`now: () => AT` / `nowMs` を手で進める形）はこれとは別物で、ここでは
+ * 触っていない。
+ */
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 async function seedToken(
   stores: Stores,
   overrides: Partial<AgentToken> & { id: string; order: number },
@@ -52,9 +76,9 @@ function realRecordTrialVerdict(stores: Stores): TokenRotator['recordTrialVerdic
   return (input) => rotator.recordTrialVerdict(input);
 }
 
-/** マイクロタスクを回し切る。 */
+/** 偽の時計を5ms進める（見張りの1目盛りぶん。マイクロタスクも一緒に流れる）。 */
 async function settle(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await vi.advanceTimersByTimeAsync(5);
 }
 
 const RECOVERED: TokenRotationOutcome = {
@@ -115,7 +139,7 @@ describe('token-trial-watch: 試す条件と対象', () => {
       tickMs: 5,
       now: () => AT,
     });
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     watch.stop();
     expect(trial.calls).toEqual([]);
   });
@@ -135,7 +159,7 @@ describe('token-trial-watch: 試す条件と対象', () => {
       tickMs: 5,
       now: () => AT,
     });
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     watch.stop();
     expect(trial.calls).toEqual([]);
   });
@@ -180,10 +204,43 @@ describe('token-trial-watch: 試す条件と対象', () => {
       now: () => AT,
     });
     // 何目盛りか進めても、走っている試しが終わるまで2本目は起きない。
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     resolveTrial?.();
     await settle();
     watch.stop();
+  });
+
+  /**
+   * issue #2146（実時間の待ちを偽の時計へ置き換えた側で見つけた歯の穴）。
+   *
+   * **経緯**: 実時間の `setTimeout` 待ちを使っていたころ、この見張りには
+   * 「`stop()` の後は目盛りが止まる」ことを直接測る歯が無かった。それでも
+   * 変異試験（`stop()` の中身を空にする変異）は「読めない間は試しを呼ばず
+   * …」の歯を巻き込んで赤くなっていた——real timer では `stop()` が効かない
+   * watch が次のテストの実行中も裏で鳴り続け、その回の `stderr` スパイへ
+   * 紛れ込んでいたためである（**意図して測っていたのではなく、実時間だけが
+   * 持っていた偶然の副作用**）。`vi.useFakeTimers()` に変えると、テストご
+   * とに時計そのものが作り直されるため、この副作用は無くなる——つまり
+   * **偶然当たっていた歯が、置き換えで静かに外れる**ところだった。ここに
+   * 直接の歯を1本足すことで、外れた分を仕組みとして測り直す。
+   */
+  it('stop したら以降は目盛りが動かない', async () => {
+    const stores = createMemoryStores();
+    await seedToken(stores, { id: 'a', order: 0, cooldownUntil: AT + 60 * 60 * 1000 });
+    await stores.tokens.writeActive({ tokenId: 'a', generation: 1, rotatedAt: '' });
+    const trial = fakeTrial({ verdict: 'usable' });
+    const watch = startTokenTrialWatch({
+      stores,
+      recordTrialVerdict: realRecordTrialVerdict(stores),
+      trial: trial.port,
+      reconsider: () => Promise.resolve(RECOVERED),
+      onOutcome: () => Promise.resolve(),
+      tickMs: 5,
+      now: () => AT,
+    });
+    watch.stop();
+    await vi.advanceTimersByTimeAsync(30);
+    expect(trial.calls).toEqual([]);
   });
 });
 
@@ -212,12 +269,12 @@ describe('token-trial-watch: 通ったら', () => {
       now: () => nowMs,
     });
     // 1回目: 失敗（失敗の件数を数える）。
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.advanceTimersByTimeAsync(20);
     expect(trial.calls).toEqual(['a']);
     // 間隔が経つまで時計を進めてから2回目: 成功。
     nowMs += TOKEN_TRIAL_INTERVAL_MS + 1_000;
     trial.respond({ verdict: 'usable' });
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await vi.advanceTimersByTimeAsync(40);
     watch.stop();
 
     expect(reconsiderCalls).toEqual([
@@ -375,7 +432,7 @@ describe('token-trial-watch: 現役の指名が読めない（issue #2125）', (
       now: () => AT,
     });
     // 複数回の目盛りを回す（2回どころではなく、確実に何度も呼ばれるだけ待つ）。
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await vi.advanceTimersByTimeAsync(40);
     watch.stop();
 
     expect(trial.calls).toEqual([]);
@@ -406,12 +463,12 @@ describe('token-trial-watch: 現役の指名が読めない（issue #2125）', (
       now: () => AT,
     });
     // 読めないあいだは呼ばれない。
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     expect(trial.calls).toEqual([]);
 
     // 読めるようになる。
     unreadable = false;
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     watch.stop();
 
     expect(trial.calls).toEqual(['a']);
@@ -505,7 +562,7 @@ describe('token-trial-watch: 失敗したら', () => {
 describe('token-trial-watch: 偽陽性の退き方（設計点8）', () => {
   /** 論理時計は自前で進める（実時間の目盛りは「起こすきっかけ」でしかない）。 */
   async function tickFor(ms: number): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, ms));
+    await vi.advanceTimersByTimeAsync(ms);
   }
 
   it('偽陽性を検知したら、既定の間隔では試さず、倍の間隔まで待つ', async () => {
