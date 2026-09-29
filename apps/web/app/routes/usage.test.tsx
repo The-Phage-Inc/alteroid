@@ -7,29 +7,13 @@
  * （`apps/cli/src/usage.ts` と同じ規約）。
  */
 import { USAGE_ESTIMATE_NOTICE, ZERO_USAGE } from '@alteroid/core/usage';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { json, Providers, renderedMoneyTexts, stubFetch, storeTestBaseUrl } from '~/test-support';
 
 import Usage from './usage';
-
-/**
- * 「マネージャー別」軸の id が `<Link>`（react-router）を描画するようになったので
- * （issue #2046）、router context が要る。`commitments.test.tsx` /
- * `approvals.test.tsx` と同じ形（`createMemoryRouter` + `RouterProvider`）。
- */
-function renderUsage() {
-  const router = createMemoryRouter([{ path: '/', Component: Usage }], {
-    initialEntries: ['/'],
-  });
-  render(
-    <Providers>
-      <RouterProvider router={router} />
-    </Providers>,
-  );
-}
 
 let originalFetch: typeof fetch;
 
@@ -43,6 +27,30 @@ afterEach(() => {
   cleanup();
   globalThis.fetch = originalFetch;
 });
+
+/**
+ * **Router で包む（issue #2050）。** `Usage` は絞り込みの正本を URL に置く
+ * （`useSearchParams`）ので、Router 無しでは描けなくなった。「マネージャー別」軸の
+ * id も `<Link>` を描く（issue #2046）ので、どちらの理由でも Router が要る。形は
+ * `journal.tsx` の `renderJournal` / `managers.tsx` と同じ `createMemoryRouter`
+ * + `RouterProvider`。
+ *
+ * **`router` を返すのは、絞り込みが URL に載ったことを読むためである**
+ * （`router.state.location.search`）。画面の state を覗くのではなく URL を
+ * 見ることで、「開き直しても・共有しても同じ絞り込みが再現できる」という
+ * 主張そのものを測れる。
+ */
+function renderUsage(initialEntries: string[] = ['/']) {
+  const router = createMemoryRouter([{ path: '/', Component: Usage }], {
+    initialEntries,
+  });
+  const result = render(
+    <Providers>
+      <RouterProvider router={router} />
+    </Providers>,
+  );
+  return { ...result, router };
+}
 
 function row(
   costUsd: number,
@@ -386,6 +394,135 @@ describe('/usage 画面', () => {
       const tokens = input.className.split(/\s+/);
       expect(tokens).toContain('min-w-0');
     }
+  });
+});
+
+/**
+ * 絞り込みが URL に載る（issue #2050）。`journal.tsx`（#2029）の種別チップ・
+ * `managers.tsx`（#2030）の状態チップと同じ判断——絞り込みの正本を画面の
+ * state ではなく URL に置くことで、再読み込みやリンク共有で消えないように
+ * する。
+ *
+ * **表示の意味そのものは変えていない。** ここで測るのは「URL とのやり取り」
+ * だけで、絞り込みが `GET /usage` へどう効くかは上の「層と場所で絞り込める」
+ * が既に押さえている。
+ */
+describe('/usage 画面の絞り込みが URL に載る（issue #2050）', () => {
+  it('初期 URL の検索引数から絞り込みが復元され、/usage への問い合わせにその値が載る', async () => {
+    const stub = stubUsage({
+      rows: [],
+      since: '2026-08-01T00:00:00.000Z',
+      beforeLedger: false,
+    });
+
+    renderUsage([
+      '/?from=2026-08-01&to=2026-08-20&managerId=m1&layer=clone&site=distill&tokenId=tok-1',
+    ]);
+
+    await screen.findByText(/その範囲には記録が無い/);
+
+    // 入力欄そのものに復元されている。
+    expect((screen.getByLabelText(/^from$/) as HTMLInputElement).value).toBe('2026-08-01');
+    expect((screen.getByLabelText(/^to$/) as HTMLInputElement).value).toBe('2026-08-20');
+    expect((screen.getByLabelText(/^manager$/) as HTMLInputElement).value).toBe('m1');
+    expect((screen.getByLabelText(/layer/) as HTMLSelectElement).value).toBe('clone');
+    expect((screen.getByLabelText(/site/) as HTMLSelectElement).value).toBe('distill');
+    expect((screen.getByLabelText(/^token/) as HTMLInputElement).value).toBe('tok-1');
+
+    // `GET /usage` への問い合わせにも同じ値が載る。
+    await waitFor(() => {
+      const call = stub.calls.find((url) => url.includes('/usage'));
+      expect(call).toBeDefined();
+      const params = new URL(call as string).searchParams;
+      expect(params.get('from')).toBe('2026-08-01');
+      expect(params.get('to')).toBe('2026-08-20');
+      expect(params.get('managerId')).toBe('m1');
+      expect(params.get('layer')).toBe('clone');
+      expect(params.get('site')).toBe('distill');
+    });
+  });
+
+  it('入力欄を変えると URL に載る', async () => {
+    stubUsage({ rows: [], since: '2026-08-01T00:00:00.000Z', beforeLedger: false });
+    const { router } = renderUsage();
+    await screen.findByText(/その範囲には記録が無い/);
+
+    fireEvent.change(screen.getByLabelText(/^from$/), { target: { value: '2026-08-01' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('from')).toBe('2026-08-01');
+    });
+
+    fireEvent.change(screen.getByLabelText(/^to$/), { target: { value: '2026-08-20' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('to')).toBe('2026-08-20');
+    });
+
+    fireEvent.change(screen.getByLabelText(/^manager$/), { target: { value: 'mgr-9' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('managerId')).toBe('mgr-9');
+    });
+
+    fireEvent.change(screen.getByLabelText(/layer/), { target: { value: 'manager' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('layer')).toBe('manager');
+    });
+
+    fireEvent.change(screen.getByLabelText(/site/), { target: { value: 'session' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('site')).toBe('session');
+    });
+
+    fireEvent.change(screen.getByLabelText(/^token/), { target: { value: 'tok-2' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).get('tokenId')).toBe('tok-2');
+    });
+
+    // 履歴を汚さない（`journal.tsx` / `managers.tsx` と同じ `replace: true`）。
+    expect(router.state.historyAction).toBe('REPLACE');
+  });
+
+  it('URL に知らない layer / site が書かれていても落ちず、「すべて」として扱う', async () => {
+    const stub = stubUsage({
+      rows: [],
+      since: '2026-08-01T00:00:00.000Z',
+      beforeLedger: false,
+    });
+
+    renderUsage(['/?layer=no-such-layer&site=no-such-site']);
+
+    // 画面ごと落ちない。
+    await screen.findByText(/その範囲には記録が無い/);
+    // 選択肢は既知のものしか無いので、不正な値は「すべて」（空文字）に落ちる。
+    expect((screen.getByLabelText(/layer/) as HTMLSelectElement).value).toBe('');
+    expect((screen.getByLabelText(/site/) as HTMLSelectElement).value).toBe('');
+
+    // 不正な値のまま `GET /usage` へ渡さない（API へ変な問い合わせを投げない）。
+    await waitFor(() => {
+      const call = stub.calls.find((url) => url.includes('/usage'));
+      expect(call).toBeDefined();
+      const params = new URL(call as string).searchParams;
+      expect(params.has('layer')).toBe(false);
+      expect(params.has('site')).toBe(false);
+    });
+  });
+
+  it('絞り込みを空にすると URL からそのパラメタが消える', async () => {
+    stubUsage({ rows: [], since: '2026-08-01T00:00:00.000Z', beforeLedger: false });
+    const { router } = renderUsage(['/?managerId=m1&tokenId=tok-1']);
+    await screen.findByText(/その範囲には記録が無い/);
+
+    expect(new URLSearchParams(router.state.location.search).get('managerId')).toBe('m1');
+    expect(new URLSearchParams(router.state.location.search).get('tokenId')).toBe('tok-1');
+
+    fireEvent.change(screen.getByLabelText(/^manager$/), { target: { value: '' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).has('managerId')).toBe(false);
+    });
+
+    fireEvent.change(screen.getByLabelText(/^token/), { target: { value: '' } });
+    await waitFor(() => {
+      expect(new URLSearchParams(router.state.location.search).has('tokenId')).toBe(false);
+    });
   });
 });
 
