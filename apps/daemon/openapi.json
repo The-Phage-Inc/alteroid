@@ -830,7 +830,8 @@
                             "org_policy",
                             "warning",
                             "none",
-                            "stranded"
+                            "stranded",
+                            "settings_unreadable"
                           ]
                         },
                         "reason": {
@@ -3582,7 +3583,8 @@
                                   "org_policy",
                                   "warning",
                                   "none",
-                                  "stranded"
+                                  "stranded",
+                                  "settings_unreadable"
                                 ]
                               },
                               "reason": {
@@ -6585,7 +6587,8 @@
                                     "org_policy",
                                     "warning",
                                     "none",
-                                    "stranded"
+                                    "stranded",
+                                    "settings_unreadable"
                                   ]
                                 },
                                 "reason": {
@@ -7760,7 +7763,8 @@
                                     "org_policy",
                                     "warning",
                                     "none",
-                                    "stranded"
+                                    "stranded",
+                                    "settings_unreadable"
                                   ]
                                 },
                                 "reason": {
@@ -8935,7 +8939,8 @@
                                   "org_policy",
                                   "warning",
                                   "none",
-                                  "stranded"
+                                  "stranded",
+                                  "settings_unreadable"
                                 ]
                               },
                               "reason": {
@@ -10098,7 +10103,8 @@
                                   "org_policy",
                                   "warning",
                                   "none",
-                                  "stranded"
+                                  "stranded",
+                                  "settings_unreadable"
                                 ]
                               },
                               "reason": {
