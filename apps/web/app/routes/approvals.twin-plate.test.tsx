@@ -6,9 +6,8 @@
  * `approvals.test.tsx` が見ていない差だけをここに置く（そちらは変えていない）:
  *
  * 1. 時刻は `formatDateTime` と `formatRelative` の2つの span（部品の `Timestamp` = `<time>` ではない）
- * 2. 送るキーは `(metaKey || ctrlKey) && key === 'Enter'`。IME の確定の Enter を除く
- *    部品の既定（`isSubmitShortcut`）は使わない。**除くべきかはこのテストでは決めない**
- *    ——今の振る舞いを固定しているだけである
+ * 2. 送るキーは `(metaKey || ctrlKey) && key === 'Enter'` で、IME の確定の Enter は送信に
+ *    数えない（部品の既定 `isSubmitShortcut`。issue #2259 で会話と約束の入力欄に揃えた）
  * 3. エラーは「個別の失敗」→「まとめ送信の失敗」の順に別々に出し、どちらも無ければ出さない。
  *    その後ろに会話のパネルが来る
  */
@@ -136,9 +135,28 @@ describe('送るキー', () => {
     expect(singles).toEqual([]);
   });
 
-  // IME の確定の Enter を除くかは #2259 で決める。
-  it('今の振る舞い: IME の変換中の Ctrl + Enter も送る（部品の既定なら除かれる差。この PR では合わせない）', async () => {
-    const singles = await press({ key: 'Enter', ctrlKey: true, isComposing: true });
+  // **IME の確定の Enter は送信に数えない（issue #2259）。** 会話（`chat.tsx`）・約束
+  // （`commitments.tsx`）の入力欄と、部品 `ApprovalCard` の既定（`isSubmitShortcut`）に揃えた。
+  // 変換を確定するつもりの ⌘/Ctrl + Enter で、書きかけの回答が送られてしまわないようにする。
+  // 以前はここで「IME の変換中の Ctrl + Enter も送る」を今の振る舞いとして固定していた。
+  it('IME の変換中の Ctrl + Enter / Cmd + Enter では送らない（isComposing）', async () => {
+    const viaCtrl = await press({ key: 'Enter', ctrlKey: true, isComposing: true });
+    await Promise.resolve();
+    expect(viaCtrl).toEqual([]);
+    cleanup();
+    const viaMeta = await press({ key: 'Enter', metaKey: true, isComposing: true });
+    await Promise.resolve();
+    expect(viaMeta).toEqual([]);
+  });
+
+  it('isComposing を立てない実装（keyCode 229）でも、IME の確定の Ctrl + Enter では送らない', async () => {
+    const singles = await press({ key: 'Enter', ctrlKey: true, keyCode: 229 });
+    await Promise.resolve();
+    expect(singles).toEqual([]);
+  });
+
+  it('変換を確定した後の Ctrl + Enter では送る（IME を除く判定が送信そのものを止めていない）', async () => {
+    const singles = await press({ key: 'Enter', ctrlKey: true, isComposing: false });
     await waitFor(() => expect(singles).toEqual(['a-1']));
   });
 });
