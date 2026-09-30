@@ -12,6 +12,8 @@ import { cn } from '@/lib/utils';
  *
  * 名前は `font-display`（Michroma）の小文字。**大文字にしない** — 製品名の綴りが
  * 小文字である。
+ *
+ * **記号は `apps/web/public/favicon.svg` にも書き出してある。** 形を変えるときは両方を直すこと。
  */
 export function BrandMark({
   withWordmark = true,
