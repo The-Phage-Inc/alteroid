@@ -4831,7 +4831,7 @@ describe('クローンの道具', () => {
       const askHuman = tools.find((t) => t.name === 'ask_human');
       expect(askHuman).toBeDefined();
       await askHuman?.handler({ question: '質問' } as never, {});
-      const [pending] = await stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await stores.jobs.listApprovals({ pendingOnly: true })).entries;
       expect(pending?.conversationId).toBeUndefined();
     });
   });
@@ -5047,7 +5047,7 @@ describe('クローンの道具', () => {
 
     const reply = await h.call('ask_human', { question: 'これを送ってよいか' });
 
-    const pending = await h.stores.jobs.listApprovals({ pendingOnly: true });
+    const pending = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
     expect(pending).toHaveLength(1);
     expect(pending[0]?.question).toBe('これを送ってよいか');
 
@@ -5066,7 +5066,7 @@ describe('クローンの道具', () => {
 
     await h.call('ask_human', { question: '本番に出してよいか', managerId: 'mgr-1' });
 
-    const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+    const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
     expect(pending?.jobId).toBe('mgr-1');
   });
 
@@ -5123,7 +5123,7 @@ describe('クローンの道具', () => {
         reason: 'リリースノートを直すたびに聞かれるのを減らしたい',
       });
 
-      const pending = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const pending = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       expect(pending).toHaveLength(1);
       expect(pending[0]?.permissionRequest).toEqual({
         rule: 'Bash(gh release edit:*)',
@@ -5153,7 +5153,7 @@ describe('クローンの道具', () => {
       });
 
       expect(reply).toContain('拒否した');
-      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+      expect((await h.stores.jobs.listApprovals({ pendingOnly: true })).entries).toHaveLength(0);
     });
 
     it('allows が規則に一致しない例を含むなら、キューに積まずに拒否する', async () => {
@@ -5168,7 +5168,7 @@ describe('クローンの道具', () => {
 
       expect(reply).toContain('拒否した');
       expect(reply).toContain('gh issue edit');
-      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+      expect((await h.stores.jobs.listApprovals({ pendingOnly: true })).entries).toHaveLength(0);
     });
 
     it('denies が規則に一致してしまう例を含むなら、キューに積まずに拒否する', async () => {
@@ -5182,7 +5182,7 @@ describe('クローンの道具', () => {
       });
 
       expect(reply).toContain('拒否した');
-      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+      expect((await h.stores.jobs.listApprovals({ pendingOnly: true })).entries).toHaveLength(0);
     });
 
     it('規則の書式が不正なら、キューに積まずに拒否する', async () => {
@@ -5196,7 +5196,7 @@ describe('クローンの道具', () => {
       });
 
       expect(reply).toContain('拒否した');
-      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+      expect((await h.stores.jobs.listApprovals({ pendingOnly: true })).entries).toHaveLength(0);
     });
 
     /**
@@ -5214,7 +5214,7 @@ describe('クローンの道具', () => {
       };
       async function pendingQuestion(h: Harness): Promise<string> {
         await h.call('request_permission', request);
-        const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+        const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
         return pending?.question ?? '';
       }
 
@@ -5331,7 +5331,7 @@ describe('クローンの道具', () => {
     it('approval_withdraw: getApproval の後に行が読めなくなっても（updateApproval が投げても）同じ', async () => {
       const h = harness();
       await h.call('ask_human', { question: '質問' });
-      const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       const id = pending?.id as string;
       h.stores.jobs.updateApproval = async () => {
         throw new UnreadableApprovalError({ id });
@@ -5360,11 +5360,54 @@ describe('クローンの道具', () => {
     });
   });
 
+  describe('読めない承認の行が在る一覧（#2298）: 一覧から消さず、件数と id で言う', () => {
+    /** fs / pg が返す形（メモリ実装は壊れた行を持てないので差し替えで模す）。 */
+    function listWithUnreadable(unreadable: { id?: string; reason: string }[]) {
+      const h = harness();
+      const original = h.stores.jobs.listApprovals.bind(h.stores.jobs);
+      h.stores.jobs.listApprovals = async (options) => ({
+        ...(await original(options)),
+        unreadable,
+      });
+      return h;
+    }
+
+    it('読めた行は今までどおり並べ、末尾に「読めない承認待ちが N 件ある」を id つきで出す', async () => {
+      const h = listWithUnreadable([
+        { id: 'ap-bad-1', reason: '不正な欄: createdAt' },
+        { reason: '不正な欄: (root)' },
+      ]);
+      await h.call('ask_human', { question: '本番に出してよいか' });
+      const reply = await h.call('approvals_list', {});
+      expect(reply).toContain('本番に出してよいか');
+      expect(reply).toContain('読めない承認待ちが 2 件ある');
+      expect(reply).toContain('ap-bad-1');
+      expect(reply).toContain('id が取れない行が 1 件');
+      expect(reply).toContain('回答済み・取り下げ済みではない');
+    });
+
+    it('読めた行が0件でも「回答待ちは無い」とだけ言わない', async () => {
+      const h = listWithUnreadable([{ id: 'ap-bad-1', reason: '不正な欄: createdAt' }]);
+      const reply = await h.call('approvals_list', {});
+      expect(reply).toContain('読めない承認待ちが 1 件ある');
+      expect(reply).toContain('ap-bad-1');
+      expect(reply).not.toContain('（人間の回答待ちは無い）');
+    });
+
+    it('0件のときは何も出さない（0 の行を作らない）', async () => {
+      const h = listWithUnreadable([]);
+      await h.call('ask_human', { question: '本番に出してよいか' });
+      expect(await h.call('approvals_list', {})).not.toContain('読めない');
+      const empty = listWithUnreadable([]);
+      expect(await empty.call('approvals_list', {})).toBe('（人間の回答待ちは無い）');
+    });
+  });
+
   describe('approval_withdraw（issue #963）', () => {
     it('未回答の承認待ちを理由付きで取り下げ、一覧から消え、id で理由ごと読み戻せる', async () => {
       const h = harness();
       await h.call('ask_human', { question: '本番に出してよいか' });
-      const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       const id = pending?.id;
       expect(id).toBeDefined();
 
@@ -5375,7 +5418,7 @@ describe('クローンの道具', () => {
       expect(reply).toContain('取り下げた');
 
       // 受け入れ基準: 既定の一覧（pendingOnly）から消える。
-      expect(await h.stores.jobs.listApprovals({ pendingOnly: true })).toHaveLength(0);
+      expect((await h.stores.jobs.listApprovals({ pendingOnly: true })).entries).toHaveLength(0);
       expect(await h.call('approvals_list', {})).toContain('回答待ちは無い');
 
       // 受け入れ基準: id 指定で理由ごと読み戻せる。
@@ -5460,7 +5503,7 @@ describe('クローンの道具', () => {
     it('既に取り下げ済みの件を二重に取り下げようとしても断る（新しい行を積まない）', async () => {
       const h = harness();
       await h.call('ask_human', { question: '質問' });
-      const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       const id = pending?.id as string;
 
       await h.call('approval_withdraw', { id, reason: '最初の理由' });
@@ -5482,7 +5525,7 @@ describe('クローンの道具', () => {
         managerId: 'mgr-1',
         requestId: 'req-9',
       });
-      const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       const id = pending?.id as string;
 
       const reply = await h.call('approval_withdraw', { id, reason: '前提が消えた' });
@@ -5495,7 +5538,7 @@ describe('クローンの道具', () => {
     it('jobId が無い件を取り下げても、マネージャー宛の案内は出ない', async () => {
       const h = harness();
       await h.call('ask_human', { question: '質問' });
-      const [pending] = await h.stores.jobs.listApprovals({ pendingOnly: true });
+      const [pending] = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
       const id = pending?.id as string;
 
       const reply = await h.call('approval_withdraw', { id, reason: '理由' });
@@ -17116,7 +17159,7 @@ describe('一覧は例外なく件数で壊れない（`*_list` の総当たり�
     // **この試験の前提そのものを測る。** 積んだ量が上限より小さいと、
     // 上の2本は「上限が効いた」のではなく「そもそも短かった」で通る。
     // 生データの側が `OUTPUT_CAP` を大きく超えていることを、一覧を通さずに確かめる。
-    const approvals = await h.stores.jobs.listApprovals({ pendingOnly: true });
+    const approvals = (await h.stores.jobs.listApprovals({ pendingOnly: true })).entries;
     const raw = approvals.map((a) => a.question).join('\n');
     expect(raw.length).toBeGreaterThan(OUTPUT_CAP * 4);
   });
@@ -20898,7 +20941,7 @@ describe('ask_human の putApproval が失敗したとき（跡が消えない�
     expect(stderrJoined).not.toContain(CANARY);
 
     // 承認待ちキューには1行も残っていない（副作用ゼロ）。
-    expect(await stores.jobs.listApprovals()).toHaveLength(0);
+    expect((await stores.jobs.listApprovals()).entries).toHaveLength(0);
     // self_dropped の帳面にも跡が実在する（(2) の穴が埋まっていることの直接証拠）。
     const traces = recentDroppedTraces();
     expect(traces.some((line) => line.includes('承認待ちを記録できませんでした'))).toBe(true);
@@ -21449,7 +21492,7 @@ describe('説明文が実装のふるまいを数え直している箇所（#701
    * **C-7。`approvals_list` の「古い順に」。**
    *
    * ハンドラは並べ直しを**1行も持たない**（逐語
-   * `const pending = await stores.jobs.listApprovals({ pendingOnly: true });` の
+   * `const pending = (await stores.jobs.listApprovals({ pendingOnly: true })).entries;` の
    * 直後に `sort` が無い）。⟹ **順序はストアの実装に依存する。**
    *
    * - `packages/storage-pg/src/jobs.ts`: `.orderBy(asc(approvals.createdAt))`
