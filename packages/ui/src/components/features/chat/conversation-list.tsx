@@ -32,6 +32,8 @@ export type ConversationRenderLink = (
  *   件数で落とした会話がある）。**切ったことは切ったと分かる形で言う**ので、
  *   画面が組み立てて渡す
  * - `inDrawer` —— 狭い画面でドロワーの中に置くとき（枠と幅はドロワーが持つ）
+ * - `newConversationTabStop` —— 「新しい会話」のボタンを Tab の順路に残すか。既定は
+ *   外す（リンクの中のボタンなので、Tab が同じ行き先に2回止まる）。真なら残す
  */
 export function ConversationList({
   items,
@@ -41,6 +43,7 @@ export function ConversationList({
   error,
   notes,
   inDrawer = false,
+  newConversationTabStop = false,
 }: {
   items: readonly ConversationListItem[] | undefined;
   activeId: string | undefined;
@@ -49,11 +52,13 @@ export function ConversationList({
   error?: unknown;
   notes?: readonly ReactNode[];
   inDrawer?: boolean;
+  newConversationTabStop?: boolean;
 }) {
   return (
     <aside
       className={cn(
         'flex flex-col bg-card',
+        // ドロワーの中では枠と幅は Drawer 側が持っている。
         inDrawer ? 'min-h-0 flex-1' : 'w-64 shrink-0 border-r border-border',
       )}
     >
@@ -64,7 +69,12 @@ export function ConversationList({
           {
             className: '',
             children: (
-              <Button size="sm" variant="ghost" aria-label="新しい会話" tabIndex={-1}>
+              <Button
+                size="sm"
+                variant="ghost"
+                aria-label="新しい会話"
+                tabIndex={newConversationTabStop ? undefined : -1}
+              >
                 <Plus className="size-4" aria-hidden />
               </Button>
             ),
@@ -91,6 +101,7 @@ export function ConversationList({
                     ),
                     children: (
                       <>
+                        {/* 一覧の1行は Markdown 化の対象外（`components/markdown.tsx` の doc） */}
                         <p className="truncate text-xs">{item.preview}</p>
                         <p className="mt-0.5 text-[11px] text-muted-foreground">
                           {item.updatedLabel} · <span data-numeric>{item.messages}</span> 往復
