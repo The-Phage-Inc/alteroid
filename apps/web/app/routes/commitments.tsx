@@ -549,8 +549,8 @@ function ManagerRestBody({ rest, bodyMarkup }: { rest: string; bodyMarkup: strin
  * Markdown のままにする。** 理由は3つ:
  *
  * 1. **3種類のどれも、人間が打った文字ではない。** 人間の指示が守ろうとして
- *    いるもの（`apps/web/app/routes/chat.tsx`
- *    （`grep -Fn -- 'クローンの行だけを Markdown にする' apps/web/app/routes/chat.tsx`）
+ *    いるもの（`packages/ui/src/components/features/chat/chat-message.tsx`
+ *    （`grep -Fn -- 'クローンの行だけを Markdown にする' packages/ui/src/components/features/chat/chat-message.tsx`）
  *    の「自分が書いた文字が勝手に化けないため」）は、
  *    ここでは1件も当たらない
  * 2. **2 は既に本文に `**…**` を持っている**（上の逐語、`#restoreJobs` /
@@ -583,8 +583,8 @@ function ManagerRestBody({ rest, bodyMarkup }: { rest: string; bodyMarkup: strin
  * issue #287 に記録してある。**
  *
  * **`human` を素のままにする理由**: `event.text` は
- * `apps/web/app/routes/chat.tsx`
- * （`grep -Fn -- 'クローンの行だけを Markdown にする' apps/web/app/routes/chat.tsx`）
+ * `packages/ui/src/components/features/chat/chat-message.tsx`
+ * （`grep -Fn -- 'クローンの行だけを Markdown にする' packages/ui/src/components/features/chat/chat-message.tsx`）
  * が名指しで守っている文字列そのものである
  * ——「**クローンの行だけを Markdown にする。** 人間が打った本文
  * （`role === 'human'`）は素のテキストのままにする — 自分が書いた文字が
@@ -979,9 +979,9 @@ function OpenRow({ commitment }: { commitment: Commitment }) {
           onChange={(event) => setReason(event.target.value)}
           onKeyDown={(event) => {
             // IME 変換中の Enter を拾わない。ここは Enter 単体で送るので、
-            // 変換確定の Enter がそのまま誤送信になる（`chat.tsx` の
+            // 変換確定の Enter がそのまま誤送信になる（`ChatComposer` の
             // ⌘/Ctrl+Enter より直接踏む形）。門の形と理由（`event.nativeEvent.isComposing`
-            // を見る理由・`keyCode === 229` を併用する理由）は `chat.tsx` の
+            // を見る理由・`keyCode === 229` を併用する理由）は `packages/ui/src/components/features/chat/ime.ts` の `isImeConfirmEnter` と `packages/ui/src/components/features/chat/chat-composer.tsx` の
             // 「IME で変換している最中の Enter では送らない。」のコメントを参照。
             if (
               event.key === 'Enter' &&
@@ -1202,7 +1202,7 @@ function PlainClosedReason({ reason }: { reason: string }) {
  * | `closedBy` | 描き方 | 理由 |
  * | --- | --- | --- |
  * | `'clone'` | `<Markdown>` | AI が書いた |
- * | `'human'` | 素テキスト（`whitespace-pre-wrap` を保つ） | 人間が打った文字を化けさせない（`grep -Fn -- 'クローンの行だけを Markdown にする' apps/web/app/routes/chat.tsx` と同じ線） |
+ * | `'human'` | 素テキスト（`whitespace-pre-wrap` を保つ） | 人間が打った文字を化けさせない（`grep -Fn -- 'クローンの行だけを Markdown にする' packages/ui/src/components/features/chat/chat-message.tsx` と同じ線） |
  * | `undefined` | 素テキスト | **「そもそも無い」。** この欄が入る前に閉じられた行にはこの情報が存在しない |
  * | 上記以外（実行時のみ来うる） | 素テキスト＋`console.warn` | デーモンが先に新しい値を返す順序に備える。**`undefined` と同じ扱いにしない** — warn の有無で見分けが付く（`undefined` は warn しない） |
  *
@@ -1286,9 +1286,9 @@ function PushForm() {
           onChange={(event) => setBody(event.target.value)}
           onKeyDown={(event) => {
             // IME 変換中の Enter を拾わない。ここは Enter 単体で送るので、
-            // 変換確定の Enter がそのまま誤送信になる（`chat.tsx` の
+            // 変換確定の Enter がそのまま誤送信になる（`ChatComposer` の
             // ⌘/Ctrl+Enter より直接踏む形）。門の形と理由（`event.nativeEvent.isComposing`
-            // を見る理由・`keyCode === 229` を併用する理由）は `chat.tsx` の
+            // を見る理由・`keyCode === 229` を併用する理由）は `packages/ui/src/components/features/chat/ime.ts` の `isImeConfirmEnter` と `packages/ui/src/components/features/chat/chat-composer.tsx` の
             // 「IME で変換している最中の Enter では送らない。」のコメントを参照。
             if (
               event.key === 'Enter' &&
