@@ -3927,15 +3927,8 @@ describe('runner だけが入れ替わったとき（デプロイ）', () => {
       .poll(() => fake.state.resumes.some((r) => r.managerId === 'mgr-flaky'), { timeout: 8000 })
       .toBe(true);
 
-    // その間、broken は1回しか試されず、通知も1回だけ。
+    // その間、broken は1回しか試されない。
     expect(tries.broken).toBe(1);
-    const notices = s.inbox.filter(
-      (event) =>
-        event.type === 'manager_message' &&
-        (event as { managerId: string }).managerId === 'mgr-broken' &&
-        (event as { text: string }).text.includes('戻せなかった'),
-    );
-    expect(notices).toHaveLength(1);
 
     // **人間とクローンの明示的な経路は塞がない。** 諦めたのは自動の取り直しだけで、
     // 頼まれたら投げに行く（結果は呼び手へ返る。ここでは runner が 400 を返す）。
@@ -3943,6 +3936,21 @@ describe('runner だけが入れ替わったとき（デプロイ）', () => {
     expect(tries.broken).toBe(2);
 
     await s.pool.stop();
+
+    // 通知も1回だけ。**これは梯子の終わり（約3秒）には数えられない。** 通知は即配られず
+    // 合流窓（既定 3000ms）へ積まれるので、梯子の終わりと窓の満了がほぼ同じ時刻になり、
+    // その時点で数えると 0 件（まだ窓の中）にも 1 件にもなりうる（PR #2310 の作業者が上げた
+    // 範囲外の指摘）。`stop()` は窓に積んだ知らせを同期的に配り切る
+    // （`#flushSynthesizedNotices`）ので、**止めた後**に数えれば、窓の長さにも器の混み具合にも
+    // 依らず「積まれていたものは全部届いた後」を数えられる。明示の `send` の失敗は呼び手へ
+    // 返るだけで、この通知を足さない（足すなら、この歯が 2 件で落ちて知らせる）。
+    const notices = s.inbox.filter(
+      (event) =>
+        event.type === 'manager_message' &&
+        (event as { managerId: string }).managerId === 'mgr-broken' &&
+        (event as { text: string }).text.includes('戻せなかった'),
+    );
+    expect(notices).toHaveLength(1);
   });
 
   it('別の runner のジョブには手を出さない（M5 で runner が増えても混ざらない）', async () => {
@@ -4396,14 +4404,19 @@ describe('前のセッションへ戻れなかったとき（M4 受け入れ基�
     expect(await second.pool.restore()).toEqual([]);
     // resume を投げ直していない（同じ死体をもう一度起こしに行かない）。
     expect(second.opened).toHaveLength(0);
-    // 同じ通知も積み直さない（一度知らせたことを毎回言い直さない）。
-    expect(second.inbox.filter((event) => event.type === 'manager_message')).toEqual([]);
-
     // **「終わった」ではない。** クローンが起こし直す対象として見分けられる。
     const listed = (await second.pool.list()).find((m) => m.managerId === 'mgr-lost');
     expect(listed).toMatchObject({ status: 'lost', live: false });
 
+    // 同じ通知も積み直さない（一度知らせたことを毎回言い直さない）。
+    // **これは `restore()` の直後には測れない。** 戻せなかった知らせは即配られず
+    // 合流窓（既定 3000ms）へ積まれるので、積み直す回帰が入っても窓が満ちるまで
+    // 受信箱は空のままで、直後に見た `[]` は何も測らない（PR #2310 の作業者が上げた
+    // 範囲外の指摘）。`stop()` は窓に積んだ知らせを同期的に配り切る
+    // （`#flushSynthesizedNotices`）ので、**止めた後**に見れば、窓の長さにも
+    // 器の混み具合にも依らず「積まれていたものは全部届いた後」の受信箱を見られる。
     await second.pool.stop();
+    expect(second.inbox.filter((event) => event.type === 'manager_message')).toEqual([]);
   });
 
   it('送信に失敗した直後の一覧が、lost を live: true へ格上げしない', async () => {
