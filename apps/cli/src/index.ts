@@ -58,6 +58,7 @@ import {
   permissionRevokeCommand,
 } from './permission.js';
 import { resetCommand } from './reset.js';
+import { launchTui, opensTuiByDefault } from './tui/launch.js';
 import { interruptCommand } from './interrupt.js';
 import { runnersCommand, runnersVacateCommand } from './runners.js';
 import {
@@ -238,6 +239,15 @@ program
   .description('クローンと会話する（デーモンが居なければ起こす）')
   .action(async () => {
     await chatCommand();
+  });
+
+program
+  .command('tui')
+  .description(
+    '全画面の TUI を開く（いまは会話の画面。承認待ち・委譲・日誌・記憶は #2528 で順に足す。端末でだけ動く）',
+  )
+  .action(async () => {
+    await launchTui();
   });
 
 /**
@@ -968,7 +978,11 @@ function invokedDirectly(): boolean {
 }
 
 if (invokedDirectly()) {
-  program.parseAsync(process.argv).catch((error: unknown) => {
+  // 引数なし かつ stdin/stdout がともに TTY のときだけ TUI。そうでなければ従来どおり（help）。
+  const run = opensTuiByDefault(process.argv.slice(2), process.stdin, process.stdout)
+    ? launchTui()
+    : program.parseAsync(process.argv);
+  run.catch((error: unknown) => {
     process.stderr.write(`alteroid: ${String(error)}\n`);
     process.exit(1);
   });
