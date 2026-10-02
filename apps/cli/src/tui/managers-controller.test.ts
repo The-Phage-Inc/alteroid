@@ -3,7 +3,12 @@ import { describe, expect, it } from 'vitest';
 import { fakeApi, gate, managerRow } from './fake-api.js';
 import type { HeaderFeed } from './header-feed.js';
 import { MANAGERS_PAGE, ManagersController } from './managers-controller.js';
-import { managerListLine, managerNotes, detailStatusText } from './managers-view.js';
+import {
+  detailStatusText,
+  managerListLine,
+  managerListTitle,
+  managerNotes,
+} from './managers-view.js';
 import { waitFor } from './test-helpers.js';
 
 function setup(configure: (api: ReturnType<typeof fakeApi>) => void = () => undefined) {
@@ -124,6 +129,21 @@ describe('一覧', () => {
     // 立ったままだと、ここでの読み足しが即 return して一覧が増えない。
     await controller.loadOlder();
     expect(state().list.items.length).toBeGreaterThan(MANAGERS_PAGE);
+  });
+});
+
+describe('一覧の見出し', () => {
+  it('初回の読み込みが失敗したときは、0 件と言わず「空ではない」と言う', async () => {
+    const { api, controller, state } = setup();
+    api.managerListFails = '繋がらない';
+    await controller.loadList();
+    expect(state().list.status).toBe('error');
+    const title = managerListTitle(state().list);
+    expect(title).toContain('空ではない');
+    expect(title).not.toContain('0 件');
+    api.managerListFails = null;
+    await controller.loadList();
+    expect(managerListTitle(state().list)).toContain('0 件読み込み済み');
   });
 });
 
