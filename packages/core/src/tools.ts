@@ -160,6 +160,7 @@ import {
 } from './memory.js';
 import type { MemoryPart, MemorySection, MemorySectionLookup } from './memory.js';
 import { redactProfileFailure } from './profile.js';
+import { renderPermissionGrantList } from './permission-grant-list.js';
 import { ProfileRollbackFailedError, type ProfileService } from './profile-service.js';
 import {
   RESERVED_SCHEDULE_KINDS,
@@ -743,6 +744,7 @@ export const CLONE_TOOL_NAMES = [
   'practice_write',
   'practice_remove',
   'token_list',
+  'permission_grant_list',
   'self_read',
   'self_status',
   'self_dropped',
@@ -840,6 +842,7 @@ export const TRACELESS_CLONE_TOOLS = [
   'practice_read',
   'practice_history',
   'token_list',
+  'permission_grant_list',
   'self_read',
   'self_status',
   'self_dropped',
@@ -9532,6 +9535,46 @@ export function createCloneTools(context: ToolContext) {
             '（止まった理由は抜粋。全文は journal_read types=token_rotation の noticeText に在る）',
           ].join('\n'),
         );
+      },
+    ),
+
+    // --- 許可の記録（読むだけ） -------------------------------------------
+    //
+    // **書き込みは渡さない。** 取り消し（`POST /permission-grants/:id/revoke`）も、
+    // 読めない行を消す口（`remove-unreadable`）も人間の手に限る（#2522）。
+    // 人間の入口（`GET /permission-grants` / `alteroid permission list`）と同じ
+    // `PermissionGrantStore.list()` / `listUnreadable()` に乗せる。
+    tool(
+      'permission_grant_list',
+      [
+        '人間が承認した Bash 許可の記録の一覧（読むだけ）。',
+        '取り消し済みの行も出る（状態の札で分かる）。生きている許可だけが Bash 呼び出しを自動で通す。',
+        '**この道具に書き込みは無い。** 取り消しも、読めない行を消すことも人間の手に属する。',
+        '一覧の本文（規則・回答・allows / denies）は抜粋で、全文が要る1件は id を渡して取る。',
+        '切れたときは from で続きを取る。',
+      ].join(' '),
+      {
+        id: z
+          .string()
+          .optional()
+          .describe('この1件を全文で読む（一覧に出ている id）。他の条件は無視される'),
+        from: z
+          .number()
+          .optional()
+          .describe(
+            `一覧で、grantedAt 昇順の何件目から出すか（${formatIntRangeJa({ min: 0 })}、0 起点）`,
+          ),
+        offset: z
+          .number()
+          .optional()
+          .describe(`id で全文を読むとき、何文字目から読むか（${formatIntRangeJa({ min: 0 })}）`),
+      },
+      async ({ id, from = 0, offset = 0 }) => {
+        const fromError = describeIntRangeViolation('from', from, { min: 0 });
+        if (fromError !== null) return text(fromError);
+        const offsetError = describeIntRangeViolation('offset', offset, { min: 0 });
+        if (offsetError !== null) return text(offsetError);
+        return text(await renderPermissionGrantList(stores, { id, from, offset }));
       },
     ),
 
