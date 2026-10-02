@@ -3653,7 +3653,7 @@ export function createApp(deps: AppDeps) {
                     ? 'withdrawn'
                     : error instanceof UnreadableApprovalError
                       ? error.message
-                      : String(error),
+                      : reasonOf(error),
             });
           }
         }
