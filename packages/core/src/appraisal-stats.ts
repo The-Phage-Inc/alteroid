@@ -226,7 +226,7 @@ function sortWorkKindTallies(acc: WorkKindAccumulator): AppraisalWorkKindTally[]
  *
  * ここは以前 `journal.list({ types: ['decision'] })` を **`limit` 無指定**で
  * 呼んでいた。pg 実装は `limit` 省略時に `Number.MAX_SAFE_INTEGER` を渡す
- * （`grep -Fn -- 'query.limit ?? Number.MAX_SAFE_INTEGER' packages/storage-pg/src/journal.ts`）
+ * （`grep -Fn -- '? Number.MAX_SAFE_INTEGER' packages/storage-pg/src/journal.ts`）
  * ので、**該当行の全文が1クエリで JS のヒープへ載る**——#1283 の OOM の形その
  * ものである。`journal-scan.ts` がその穴を塞ぐ足場として既に在ったが、この口は
  * それより前に出た PR（#1321）で足されたため、規律が届いていなかった。
@@ -249,7 +249,7 @@ function sortWorkKindTallies(acc: WorkKindAccumulator): AppraisalWorkKindTally[]
  * `COUNT`）へ出すこと**——上限を足す道は、出力の意味を変えずには通れない。
  */
 export async function computeAppraisalJournalStats(
-  journal: Pick<JournalStore, 'list'>,
+  journal: Pick<JournalStore, 'listPage'>,
   prefixes: { commitmentPrefix: string; jobPrefix: string },
 ): Promise<AppraisalJournalStats> {
   const commitments = emptyTally();
@@ -413,7 +413,7 @@ export interface AppraisalReconciliationStats {
  * ストア側の集計へ出す」判断は、この関数にも同様に当てはまる。
  */
 export async function computeAppraisalReconciliation(
-  journal: Pick<JournalStore, 'list'>,
+  journal: Pick<JournalStore, 'listPage'>,
   prefixes: { commitmentPrefix: string; jobPrefix: string },
 ): Promise<AppraisalReconciliationStats> {
   const commitments = emptyReconciliationAccumulator();
