@@ -9,13 +9,18 @@
  * （`@alteroid/core/usage` / `@alteroid/core/journal-search` など）を使うこと。
  * 本体（`@alteroid/core`）の値はサーバ専用のドメイン層ごとバンドルへ入る
  * （`eslint.config.js` の `no-restricted-imports` が止める）。
+ *
+ * ⚠️ **中の相対 import には `.js` 拡張子を付けること**（#2558）。このパッケージはビルドせず
+ * `.ts` をそのまま export するので、NodeNext の `apps/cli` が読むとき、拡張子の無い相対
+ * import は `TS2835` で型検査を落とす（`apps/cli/src/logic-import.test.ts` が見張る）。
  */
-export * from './appraisal-labels';
-export * from './auth';
-export * from './config';
-export * from './format';
-export * from './journal-window';
-export * from './managers-links';
-export * from './tokens-links';
-export * from './types';
-export * from './usage-links';
+export * from './appraisal-labels.js';
+export * from './auth.js';
+export * from './config.js';
+export * from './format.js';
+export * from './journal-summary.js';
+export * from './journal-window.js';
+export * from './managers-links.js';
+export * from './tokens-links.js';
+export * from './types.js';
+export * from './usage-links.js';
