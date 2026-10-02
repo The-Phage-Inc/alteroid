@@ -436,11 +436,18 @@ describe('GITHUB_CREDENTIAL_NAMES（クローンの器の env が正本より勝
     // テストしない。** 一致するのは「たまたま」であって「そう作られている
     // から」ではない——ROTATABLE_CREDENTIAL_KEYS に GitHub 以外の非プールの
     // 名前が増えても、この配列は自動では広がらない（doc の主張そのもの）。
-    // ここでは「現状は一致する」という1つの事実だけを固定する。
+    // ここでは「差は何か」を1つの事実として固定する。
+    //
+    // **#486 S5 で `CODEX_API_KEY` を回せる鍵に足した** ので、もう一致しない——
+    // これは上の主張が実際に起きた最初の例である。差は `CODEX_API_KEY` だけで、
+    // **GitHub 優先は広がっていない**（`GITHUB_CREDENTIAL_NAMES` は GH_TOKEN /
+    // GITHUB_TOKEN のまま）。旧い期待（一致）を、差の名指しへ強めて置き換えた。
     const rotatableMinusPool = ROTATABLE_CREDENTIAL_KEYS.filter(
       (name) => !POOL_OWNED_CREDENTIAL_NAMES.includes(name),
     );
-    expect([...GITHUB_CREDENTIAL_NAMES].sort()).toEqual([...rotatableMinusPool].sort());
+    const notGitHub = rotatableMinusPool.filter((name) => !GITHUB_CREDENTIAL_NAMES.includes(name));
+    expect(notGitHub).toEqual(['CODEX_API_KEY']);
+    expect([...GITHUB_CREDENTIAL_NAMES].sort()).toEqual(['GITHUB_TOKEN', 'GH_TOKEN'].sort());
   });
 });
 
@@ -525,5 +532,52 @@ describe('credentialNamesShadowedByProfile', () => {
         'CLAUDE_CODE_OAUTH_TOKEN',
       ]),
     ).toEqual(['GH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']);
+  });
+});
+
+/**
+ * Codex の API キー（`CODEX_API_KEY`）を袋に入れた（Issue #486 M7 段 S5）。
+ * 足して変わるのは、器のファイルになることと所在の env が増えることだけで、
+ * プール・GitHub 優先・正本が器の env のもの・伏せる鍵のどれにも入らない。
+ */
+describe('CODEX_API_KEY を袋（回せる鍵）に入れる', () => {
+  it('回せる鍵の一覧に入っている', () => {
+    expect(ROTATABLE_CREDENTIAL_KEYS).toContain('CODEX_API_KEY');
+  });
+
+  it('プール・GitHub 優先・器の env が正本のどの一覧にも入らない（足した効果が袋だけに留まる）', () => {
+    expect(POOL_OWNED_CREDENTIAL_NAMES).not.toContain('CODEX_API_KEY');
+    expect(GITHUB_CREDENTIAL_NAMES).not.toContain('CODEX_API_KEY');
+    expect(ENV_FILE_OWNED_CREDENTIAL_NAMES).not.toContain('CODEX_API_KEY');
+  });
+
+  it('伏せる鍵ではなく、名前の検査で落とされない', () => {
+    expect(CREDENTIAL_NAME.test('CODEX_API_KEY')).toBe(true);
+    expect(isWithheldCredentialName('CODEX_API_KEY', WITHHELD_ENV_KEYS)).toBe(false);
+  });
+
+  it('種として取り込み、値として子へ渡し、所在の env だけが増える', () => {
+    const store = createCredentialStore({
+      dir: '/run/alteroid/credentials',
+      seed: { CODEX_API_KEY: 'fake-codex-key-0000000000' },
+    });
+    expect(store.values().CODEX_API_KEY).toBe('fake-codex-key-0000000000');
+    const env = store.env();
+    expect(env.ALTEROID_CODEX_API_KEY_FILE).toBe('/run/alteroid/credentials/CODEX_API_KEY');
+    expect(JSON.stringify(env)).not.toContain('fake-codex-key');
+  });
+
+  it('指紋には出るが、値そのものは出ない', () => {
+    const store = createCredentialStore({
+      dir: '/tmp/does-not-matter',
+      seed: { CODEX_API_KEY: 'fake-codex-key-0000000000' },
+    });
+    const fingerprints = store.fingerprints();
+    expect(fingerprints.map((f) => f.name)).toContain('CODEX_API_KEY');
+    expect(JSON.stringify(fingerprints)).not.toContain('fake-codex-key');
+  });
+
+  it('CODEX_HOME は袋に入れていない（決め打ちしない。auth.json の置き場は後の段）', () => {
+    expect(ROTATABLE_CREDENTIAL_KEYS).not.toContain('CODEX_HOME');
   });
 });
