@@ -1898,6 +1898,45 @@
                                 },
                                 "truncated": {
                                   "type": "boolean"
+                                },
+                                "ci": {
+                                  "type": "object",
+                                  "properties": {
+                                    "pulls": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "success": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "failure": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "pending": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "checks": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 500
+                                    },
+                                    "truncated": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": ["pulls", "success", "failure", "pending", "checks"]
+                                },
+                                "ciUnavailable": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 1000
                                 }
                               },
                               "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -4768,6 +4807,51 @@
                                       },
                                       "truncated": {
                                         "type": "boolean"
+                                      },
+                                      "ci": {
+                                        "type": "object",
+                                        "properties": {
+                                          "pulls": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "success": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "failure": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "pending": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "checks": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 500
+                                          },
+                                          "truncated": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "pulls",
+                                          "success",
+                                          "failure",
+                                          "pending",
+                                          "checks"
+                                        ]
+                                      },
+                                      "ciUnavailable": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1000
                                       }
                                     },
                                     "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -8050,6 +8134,51 @@
                                         },
                                         "truncated": {
                                           "type": "boolean"
+                                        },
+                                        "ci": {
+                                          "type": "object",
+                                          "properties": {
+                                            "pulls": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "success": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "failure": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "pending": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "checks": {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 500
+                                            },
+                                            "truncated": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "pulls",
+                                            "success",
+                                            "failure",
+                                            "pending",
+                                            "checks"
+                                          ]
+                                        },
+                                        "ciUnavailable": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 1000
                                         }
                                       },
                                       "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -9313,6 +9442,51 @@
                                         },
                                         "truncated": {
                                           "type": "boolean"
+                                        },
+                                        "ci": {
+                                          "type": "object",
+                                          "properties": {
+                                            "pulls": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "success": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "failure": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "pending": {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            "checks": {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 500
+                                            },
+                                            "truncated": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "pulls",
+                                            "success",
+                                            "failure",
+                                            "pending",
+                                            "checks"
+                                          ]
+                                        },
+                                        "ciUnavailable": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 1000
                                         }
                                       },
                                       "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -10568,6 +10742,51 @@
                                       },
                                       "truncated": {
                                         "type": "boolean"
+                                      },
+                                      "ci": {
+                                        "type": "object",
+                                        "properties": {
+                                          "pulls": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "success": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "failure": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "pending": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "checks": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 500
+                                          },
+                                          "truncated": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "pulls",
+                                          "success",
+                                          "failure",
+                                          "pending",
+                                          "checks"
+                                        ]
+                                      },
+                                      "ciUnavailable": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1000
                                       }
                                     },
                                     "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -11819,6 +12038,51 @@
                                       },
                                       "truncated": {
                                         "type": "boolean"
+                                      },
+                                      "ci": {
+                                        "type": "object",
+                                        "properties": {
+                                          "pulls": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "success": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "failure": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "pending": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "checks": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 500
+                                          },
+                                          "truncated": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "pulls",
+                                          "success",
+                                          "failure",
+                                          "pending",
+                                          "checks"
+                                        ]
+                                      },
+                                      "ciUnavailable": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1000
                                       }
                                     },
                                     "required": ["status", "openIssues", "openPulls", "truncated"]
@@ -19115,6 +19379,47 @@
                                           },
                                           "truncated": {
                                             "type": "boolean"
+                                          },
+                                          "ci": {
+                                            "type": "object",
+                                            "properties": {
+                                              "pulls": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                                "maximum": 9007199254740991
+                                              },
+                                              "success": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                                "maximum": 9007199254740991
+                                              },
+                                              "failure": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                                "maximum": 9007199254740991
+                                              },
+                                              "pending": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                                "maximum": 9007199254740991
+                                              },
+                                              "checks": {
+                                                "type": "string"
+                                              },
+                                              "truncated": {
+                                                "type": "boolean"
+                                              }
+                                            },
+                                            "required": [
+                                              "pulls",
+                                              "success",
+                                              "failure",
+                                              "pending",
+                                              "checks"
+                                            ]
+                                          },
+                                          "ciUnavailable": {
+                                            "type": "string"
                                           }
                                         },
                                         "required": [
@@ -19317,6 +19622,45 @@
                           },
                           "truncated": {
                             "type": "boolean"
+                          },
+                          "ci": {
+                            "type": "object",
+                            "properties": {
+                              "pulls": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "success": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "failure": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "pending": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "checks": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500
+                              },
+                              "truncated": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": ["pulls", "success", "failure", "pending", "checks"]
+                          },
+                          "ciUnavailable": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 1000
                           }
                         },
                         "required": ["status", "openIssues", "openPulls", "truncated"]

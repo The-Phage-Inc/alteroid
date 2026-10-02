@@ -32,7 +32,7 @@ import {
   type UsageLayer,
   type UsageSite,
 } from '@alteroid/core';
-import { ARCHIVE_REMOVED_BYTES_UNIT_NOTE } from '@alteroid/core';
+import { ARCHIVE_REMOVED_BYTES_UNIT_NOTE, describeGithubCi } from '@alteroid/core';
 import {
   CGROUP_EVENTS_UNKNOWN_NOTE,
   formatCgroupEventsNote,
@@ -3743,6 +3743,8 @@ function summarizeGithubObservation(entry: Record<string, unknown>): string {
         status?: string;
         openIssues?: number;
         openPulls?: number;
+        ci?: Parameters<typeof describeGithubCi>[0]['ci'];
+        ciUnavailable?: string;
         truncated?: boolean;
         reason?: string;
       }
@@ -3751,7 +3753,8 @@ function summarizeGithubObservation(entry: Record<string, unknown>): string {
   if (result?.status === 'ok') {
     return (
       `${head} open Issue ${String(result.openIssues)} 件 / open PR ${String(result.openPulls)} 件` +
-      (result.truncated === true ? '（limit に達した。下限）' : '')
+      (result.truncated === true ? '（limit に達した。下限）' : '') +
+      ` / ${describeGithubCi(result)}`
     );
   }
   if (result?.status === 'failed')
