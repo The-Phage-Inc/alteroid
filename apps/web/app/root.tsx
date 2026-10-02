@@ -21,6 +21,13 @@ export function meta() {
   ];
 }
 
+export function links() {
+  return [
+    // サイドバー左上の印（`BrandMark`）と同じ形。中身と色の決め方は `public/favicon.svg` の注釈に在る。
+    { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' },
+  ];
+}
+
 export function Layout({ children }: { children: ReactNode }) {
   return (
     /*
