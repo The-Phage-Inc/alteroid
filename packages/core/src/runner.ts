@@ -928,14 +928,22 @@ class Host implements RunnerHost {
     return cwd;
   }
 
-  #create(managerId: string, request: string, cwd: string): RunnerSession {
+  #create(
+    managerId: string,
+    request: string,
+    cwd: string,
+    provider?: AgentProviderId,
+  ): RunnerSession {
     const session = new RunnerSession({
       managerId,
       request,
       cwd: this.#resolveCwd(cwd),
       emit: this.#emit,
       ...(this.#queryFn === undefined ? {} : { queryFn: this.#queryFn }),
-      managerProvider: this.#managerProvider,
+      // 命令が名指ししていればそれ（#486 S7）。無ければ host の既定＝従来どおり。
+      managerProvider: provider ?? this.#managerProvider,
+      // 置かれたモデルが効くのは host の既定 provider のセッションだけ（#486 S7。下の `RunnerSessionOptions`）。
+      hostManagerProvider: this.#managerProvider,
       env: this.#env,
       withheldEnvKeys: this.#withheldEnvKeys,
       ...(this.#childUser === undefined ? {} : { childUser: this.#childUser }),
@@ -971,7 +979,7 @@ class Host implements RunnerHost {
     if (this.#sessions.has(command.managerId)) {
       throw new Error(`${command.managerId} は既に走っている`);
     }
-    const session = this.#create(command.managerId, command.request, command.cwd);
+    const session = this.#create(command.managerId, command.request, command.cwd, command.provider);
     try {
       // **新しいセッションなので拒む判定は起きない。** `checkFence` は
       // 「まだ世代を覚えていない」ときは無条件に覚えるだけである
@@ -1056,7 +1064,7 @@ class Host implements RunnerHost {
         this.#sessions.delete(command.managerId);
       }
     }
-    const session = this.#create(command.managerId, command.request, command.cwd);
+    const session = this.#create(command.managerId, command.request, command.cwd, command.provider);
     // **この Host インスタンスにとっては初めて見るセッション**（器の入れ替え・
     // デーモンの再起動後の resume、または上の待ちを経て名簿から消えた直後）
     // なので、比べる前の世代が無い。拒む判定は起きず、覚えるだけになる
@@ -1466,6 +1474,13 @@ interface RunnerSessionOptions {
   driver?: AgentManagerDriver;
   /** このセッションを動かす provider。省略は `claude`。 */
   managerProvider?: AgentProviderId;
+  /**
+   * この runner の既定 provider（`ALTEROID_MANAGER_PROVIDER`。#486 S7）。`ALTEROID_MANAGER_MODEL` /
+   * `ALTEROID_WORKER_MODEL` はその provider のモデルとして人間が置いたものなので、**`managerProvider`
+   * がこれと違うセッション（クローンが指名した、もう一方の provider）には効かせない**。そちらは
+   * 置かれなかったものとして扱う（Codex は Codex の既定、Claude は正典の既定帯）。省略は `managerProvider` と同じ。
+   */
+  hostManagerProvider?: AgentProviderId;
   env: NodeJS.ProcessEnv;
   withheldEnvKeys: readonly string[];
   childUser?: RunnerChildUser;
@@ -1587,6 +1602,8 @@ class RunnerSession {
   readonly #cwd: string;
   readonly #emit: (event: RunnerEvent) => void;
   readonly #driver: AgentManagerDriver;
+  /** 置かれたモデル（`ALTEROID_MANAGER_MODEL` など）がこのセッションに効くか（`hostManagerProvider` の doc）。 */
+  readonly #placedModelApplies: boolean;
   readonly #env: NodeJS.ProcessEnv;
   readonly #withheldEnvKeys: readonly string[];
   readonly #childUser: RunnerChildUser | undefined;
@@ -1841,6 +1858,9 @@ class RunnerSession {
 
   constructor(options: RunnerSessionOptions) {
     this.#id = options.managerId;
+    this.#placedModelApplies =
+      options.hostManagerProvider === undefined ||
+      (options.managerProvider ?? DEFAULT_AGENT_PROVIDER_ID) === options.hostManagerProvider;
     this.#request = options.request;
     this.#cwd = options.cwd;
     this.#emit = options.emit;
@@ -2366,9 +2386,11 @@ class RunnerSession {
       // （設定ではなく承認の置き場。`model-tier.ts`）。**ここが正本である** —
       // デーモン側の自己認識に出るのは同じ env から解いた宣言であって、
       // 実際にセッションへ渡っているのはこの値である。
-      model: resolveManagerModel(this.#env),
+      model: resolveManagerModel(this.#placedModelApplies ? this.#env : {}),
       // 人間が置いたか。Claude 以外の駆動役は、置かれたときだけモデルを provider へ渡す。
-      modelPlaced: placedModelTier(this.#env, MANAGER_MODEL_ENV_KEY) !== null,
+      // host の既定と違う provider のセッションでは、置かれたモデルは別の provider のものなので置かれていない扱い。
+      modelPlaced:
+        this.#placedModelApplies && placedModelTier(this.#env, MANAGER_MODEL_ENV_KEY) !== null,
       // 人間が開く Claude Code と同じ既定（Auto）。`canUseTool` は下に残してあり、
       // `default` へ戻せば1件ずつクローンへ確認が回る。
       permissionMode: this.#permissionMode,
@@ -2381,7 +2403,7 @@ class RunnerSession {
       workerPrompt: buildWorkerPrompt(),
       // **省略しない。** SDK の既定は親（マネージャー）の継承なので、
       // 省けばマネージャーを差し替えた人が作業者まで巻き添えで動かすことになる。
-      workerModel: resolveWorkerModel(this.#env),
+      workerModel: resolveWorkerModel(this.#placedModelApplies ? this.#env : {}),
       cwd: this.#cwd,
       env: this.#childEnv(),
       // 既定は閉じる。人間が `ALTEROID_MANAGER_AUTO_MEMORY=true` を置いたときだけ

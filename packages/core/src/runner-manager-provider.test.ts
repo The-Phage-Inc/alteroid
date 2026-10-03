@@ -6,7 +6,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { AgentChildProcess } from './agent-session.js';
 import { createRunnerHost } from './runner.js';
-import type { RunnerEvent } from './runner-protocol.js';
+import {
+  runnerResumeCommandSchema,
+  runnerStartCommandSchema,
+  type RunnerEvent,
+} from './runner-protocol.js';
 
 /**
  * マネージャー層の provider が runner の駆動役の選択まで届くこと（#486 S6）。
@@ -36,19 +40,25 @@ function untouchedQuery(): { fn: typeof sdkQuery; calls: () => number } {
 }
 
 /** `codex app-server` の最小の偽物（ChatGPT ログイン済み・thread/start に答えるだけ）。 */
-function fakeAppServer(): AgentChildProcess & { received: string[] } {
+function fakeAppServer(): AgentChildProcess & { received: string[]; threadStarts: unknown[] } {
   const emitter = new EventEmitter();
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const received: string[] = [];
+  const threadStarts: unknown[] = [];
   let buffer = '';
   stdin.setEncoding('utf8');
   stdin.on('data', (chunk: string) => {
     buffer += chunk;
     for (let i = buffer.indexOf('\n'); i !== -1; i = buffer.indexOf('\n')) {
-      const message = JSON.parse(buffer.slice(0, i)) as { id?: number; method?: string };
+      const message = JSON.parse(buffer.slice(0, i)) as {
+        id?: number;
+        method?: string;
+        params?: unknown;
+      };
       buffer = buffer.slice(i + 1);
       if (message.method !== undefined) received.push(message.method);
+      if (message.method === 'thread/start') threadStarts.push(message.params);
       if (message.id === undefined) continue;
       const result: Record<string, unknown> =
         message.method === 'account/read'
@@ -70,11 +80,12 @@ function fakeAppServer(): AgentChildProcess & { received: string[] } {
     stdin,
     stdout,
     received,
+    threadStarts,
     killed: false,
     exitCode: null,
     pid: 5151,
     kill: () => true,
-  }) as unknown as AgentChildProcess & { received: string[] };
+  }) as unknown as AgentChildProcess & { received: string[]; threadStarts: unknown[] };
 }
 
 async function until(condition: () => boolean, what: string): Promise<void> {
@@ -139,5 +150,154 @@ describe('runner: マネージャー層の provider の選択', () => {
       expect.arrayContaining(['initialize', 'initialized', 'account/read', 'thread/start']),
     );
     await host.shutdown();
+  });
+
+  /**
+   * #486 S7: 命令（start / resume）が provider を名指しすれば、host の既定ではなくそれで動く。
+   */
+  it('start の provider: codex は、既定が claude の host でも Codex の駆動役で起こす', async () => {
+    const sdk = untouchedQuery();
+    const events: RunnerEvent[] = [];
+    const spawned: string[] = [];
+    const host = createRunnerHost({
+      runnerId: 'runner-test',
+      workspacePath: '/work',
+      emit: (event) => events.push(event),
+      queryFn: sdk.fn,
+      env: {},
+      childUser: { uid: 1000, gid: 1000 },
+      spawnAgentProcessFn: (options) => {
+        spawned.push(options.command);
+        return fakeAppServer();
+      },
+    });
+    await host.start({ managerId: 'mgr-1', request: 'やって', cwd: '/work', provider: 'codex' });
+    await until(
+      () => events.some((e) => e.type === 'session' && e.sessionId === 'thr-codex'),
+      'session イベント',
+    );
+    expect(sdk.calls()).toBe(0);
+    expect(spawned).toEqual(['codex']);
+    await host.shutdown();
+  });
+
+  it('start の provider: claude は、既定が codex の host でも Claude の駆動役で起こす', async () => {
+    const sdk = untouchedQuery();
+    const spawned: string[] = [];
+    const host = createRunnerHost({
+      runnerId: 'runner-test',
+      workspacePath: '/work',
+      emit: () => undefined,
+      queryFn: sdk.fn,
+      managerProvider: 'codex',
+      env: {},
+      childUser: { uid: 1000, gid: 1000 },
+      spawnAgentProcessFn: (options) => {
+        spawned.push(options.command);
+        return fakeAppServer();
+      },
+    });
+    await host.start({ managerId: 'mgr-1', request: 'やって', cwd: '/work', provider: 'claude' });
+    expect(sdk.calls()).toBe(1);
+    expect(spawned).toEqual([]);
+    await host.shutdown();
+  });
+
+  it('resume の provider: codex も、既定が claude の host で Codex として開き直す。省略なら既定', async () => {
+    const sdk = untouchedQuery();
+    const spawned: string[] = [];
+    const host = createRunnerHost({
+      runnerId: 'runner-test',
+      workspacePath: '/work',
+      emit: () => undefined,
+      queryFn: sdk.fn,
+      env: {},
+      childUser: { uid: 1000, gid: 1000 },
+      spawnAgentProcessFn: (options) => {
+        spawned.push(options.command);
+        return fakeAppServer();
+      },
+    });
+    await host.resume({
+      managerId: 'mgr-1',
+      sessionId: 'thr-codex',
+      request: 'つづき',
+      cwd: '/work',
+      provider: 'codex',
+    });
+    await until(() => spawned.length === 1, 'codex の起動');
+    expect(sdk.calls()).toBe(0);
+    await host.shutdown();
+
+    const sdk2 = untouchedQuery();
+    const host2 = createRunnerHost({
+      runnerId: 'runner-test',
+      workspacePath: '/work',
+      emit: () => undefined,
+      queryFn: sdk2.fn,
+      env: {},
+      childUser: { uid: 1000, gid: 1000 },
+    });
+    await host2.resume({
+      managerId: 'mgr-2',
+      sessionId: 'sess-claude',
+      request: 'つづき',
+      cwd: '/work',
+    });
+    await until(() => sdk2.calls() === 1, 'claude の起動');
+    await host2.shutdown();
+  });
+
+  it('命令の provider は知らない値を断り（400 の元）、省略は従来どおり通る', () => {
+    const base = { managerId: 'm', request: 'r', cwd: '/w' };
+    expect(runnerStartCommandSchema.safeParse(base).success).toBe(true);
+    expect(runnerStartCommandSchema.safeParse({ ...base, provider: 'codex' }).success).toBe(true);
+    expect(runnerStartCommandSchema.safeParse({ ...base, provider: 'gemini' }).success).toBe(false);
+    expect(
+      runnerResumeCommandSchema.safeParse({ ...base, sessionId: 's', provider: 'gemini' }).success,
+    ).toBe(false);
+  });
+});
+
+describe('runner: 置かれたモデルは host の既定 provider のセッションにだけ効く（#486 S7）', () => {
+  async function codexThreadStartParams(
+    env: NodeJS.ProcessEnv,
+    managerProvider: 'claude' | 'codex',
+  ): Promise<Record<string, unknown>> {
+    const events: RunnerEvent[] = [];
+    const children: ReturnType<typeof fakeAppServer>[] = [];
+    const host = createRunnerHost({
+      runnerId: 'runner-test',
+      workspacePath: '/work',
+      emit: (event) => events.push(event),
+      queryFn: untouchedQuery().fn,
+      managerProvider,
+      env,
+      childUser: { uid: 1000, gid: 1000 },
+      spawnAgentProcessFn: () => {
+        const child = fakeAppServer();
+        children.push(child);
+        return child;
+      },
+    });
+    await host.start({
+      managerId: 'mgr-1',
+      request: 'やって',
+      cwd: '/work',
+      provider: 'codex',
+    });
+    await until(() => children[0]?.threadStarts.length === 1, 'thread/start');
+    await host.shutdown();
+    return children[0]?.threadStarts[0] as Record<string, unknown>;
+  }
+
+  it('claude 既定の host で ALTEROID_MANAGER_MODEL が置かれていても、指名された codex には model を渡さない', async () => {
+    const params = await codexThreadStartParams({ ALTEROID_MANAGER_MODEL: 'sonnet' }, 'claude');
+    expect(params).not.toHaveProperty('model');
+  });
+
+  it('対照: codex 既定の host で置かれたモデルは、従来どおり codex へ渡る', async () => {
+    const params = await codexThreadStartParams({ ALTEROID_MANAGER_MODEL: 'sonnet' }, 'codex');
+    expect(params).toHaveProperty('model', 'sonnet');
   });
 });
