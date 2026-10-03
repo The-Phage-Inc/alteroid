@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 
 import { redactedExcerpt } from '@alteroid/core/redact';
+import {
+  LEGACY_PROFILE_NOTICE,
+  normalizeProfile,
+  type NormalizedProfile,
+  type ProfileState,
+} from '@alteroid/logic';
 
+import { describeScope } from './credential.js';
 import { describeAuthFailure, forbiddenKindOf, resolveTarget, type Target } from './target.js';
 
 /**
@@ -16,7 +23,11 @@ import { describeAuthFailure, forbiddenKindOf, resolveTarget, type Target } from
  * 1行足せば済ませていることを実装作業に変えてしまっている、ということである。
  * それはデグレードなので、口をここに開けてある。
  *
- * 置いたものはクローンにもマネージャーにも作業者にも効き、**器を作り直さずに
+ * **プロファイルは名前付きの行の集まりである**（`/etc/profile.d` と同じ。名前を省くと
+ * `default`）。行ごとに本文（何行でもよい）と撒く先を持ち、名前のコード単位順につなげて効く。
+ * 置いたものは既定ではクローンにもマネージャーにも作業者にも効き（撒く先 `--scope`
+ * で `app`＝クローンだけ / `runner`＝マネージャー・作業者だけに絞れる。環境変数
+ * （`alteroid credential set --scope`）と同じ3値）、**器を作り直さずに
  * 差し替えられる**（これから起こす仕事には即座に。走行中の仕事は `gh` / `git` が
  * 次の呼び出しから拾う）。
  */
@@ -25,12 +36,31 @@ import { describeAuthFailure, forbiddenKindOf, resolveTarget, type Target } from
 const ERROR_LIMIT = 512;
 const DETAIL_LIMIT = 2000;
 
-interface ProfileView {
+/**
+ * 行の名前の形。**`packages/core/src/store.ts` の `PROFILE_ENTRY_NAME` と揃える**
+ * （CLI は core 本体を import せず、軽い subpath だけを使う。ずれてもデーモンが 400 で
+ * 弾くので、ここは**通信の前に分かりやすく落とす**ためのもの）。
+ */
+const PROFILE_ENTRY_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+const EMPTY_BODY_MESSAGE =
+  '本文が空では行を置けない。外すなら alteroid profile rm <名前>（全部外すなら clear）。';
+
+/** 名前を省略したときの行（旧来の「1本のプロファイル」がここへ載る）。 */
+const DEFAULT_ENTRY = 'default';
+
+type ProfileScope = 'all' | 'app' | 'runner';
+
+interface ProfileEntryView {
+  name: string;
   script: string;
-  updatedAt?: string;
-  sha256?: string;
-  bytes?: number;
+  scope: ProfileScope;
+  updatedAt: string;
+  sha256: string;
+  bytes: number;
 }
+
+type ProfileView = NormalizedProfile;
 
 interface ApplyResult {
   ok: boolean;
@@ -41,36 +71,124 @@ interface ApplyResult {
 
 interface UpdateView {
   updatedAt: string;
-  sha256?: string;
-  bytes?: number;
+  /** 古いデーモン（旧 `PUT /profile`）の応答には無い。 */
+  entries?: ProfileEntryView[];
+  composed?: { clone: ProfileView['clone']; runner: ProfileView['runner'] };
   clone: ApplyResult;
   runners: (ApplyResult & { runnerId: string })[];
 }
 
-export async function profileShowCommand(): Promise<void> {
-  const target = await resolveTarget();
-  const profile = (await request(target, '/profile')) as ProfileView;
+/** `--scope` を検査する。省略は undefined（＝既存の行の撒く先を保つ）。 */
+function parseScope(raw: string | undefined): ProfileScope | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === 'all' || raw === 'app' || raw === 'runner') return raw;
+  throw new Error(`--scope は all / app / runner のいずれかである（渡されたのは ${raw}）`);
+}
 
-  if (profile.script.length === 0) {
+/** 名前を検査する。省略は `default`。**通信の前に落とす。** */
+function parseName(raw: string | undefined): string {
+  const name = raw ?? DEFAULT_ENTRY;
+  if (!PROFILE_ENTRY_NAME.test(name)) {
+    throw new Error(
+      `行の名前の形が不正である（${PROFILE_ENTRY_NAME.source}。渡されたのは ${name}）`,
+    );
+  }
+  return name;
+}
+
+/**
+ * `GET /profile` を読み、**古いデーモンの形（`entries` 無し）も `default` 1行として**
+ * 読める形にする（`@alteroid/logic` の `normalizeProfile`）。新しい CLI から古い
+ * デーモンを叩く窓（デーモンは1日1回夜に入る）で落ちないための実行時の倒れ先である。
+ */
+async function fetchProfile(target: Target): Promise<ProfileView> {
+  return normalizeProfile((await request(target, '/profile')) as ProfileState);
+}
+
+/** 旧形式のとき、行ごとの操作ができない旨を出す。 */
+function noteLegacy(profile: ProfileView): void {
+  if (profile.legacy) stdout.write(`（${LEGACY_PROFILE_NOTICE}）\n`);
+}
+
+/**
+ * 古いデーモンで行ごとの操作（名前が default でない・撒く先を指定する）をしようとしたとき、
+ * 生の 404 / 400 にせず「デーモンが古い」と分かる文言で落とす。
+ */
+function assertLegacySupports(profile: ProfileView, name: string, scope?: ProfileScope): void {
+  if (!profile.legacy) return;
+  if (name !== 'default' || (scope !== undefined && scope !== 'all')) {
+    throw new Error(`デーモンが古いので、この操作はできない。${LEGACY_PROFILE_NOTICE}`);
+  }
+}
+
+function describeEntry(entry: ProfileEntryView): string {
+  return (
+    `${entry.name}  ${describeScope(entry.scope)}  ${String(entry.bytes)} バイト` +
+    `  更新 ${entry.updatedAt}`
+  );
+}
+
+/** 置かれている行の一覧（**本文は出さない**）。 */
+export async function profileListCommand(): Promise<void> {
+  const target = await resolveTarget();
+  const profile = await fetchProfile(target);
+
+  if (profile.entries.length === 0) {
+    stdout.write('プロファイルは置かれていません。\n');
+    stdout.write('置くには: alteroid profile set [名前] --scope <all|app|runner>\n');
+    return;
+  }
+  for (const entry of profile.entries) stdout.write(`${describeEntry(entry)}\n`);
+  noteLegacy(profile);
+  stdout.write('（名前のコード単位順につなげて効きます。本文は alteroid profile show <名前>）\n');
+}
+
+/**
+ * 1行の本文を出す。**標準出力は本文だけ**（パイプで `set` へ戻せる。撒く先は
+ * `list` / `status` で見る）。
+ */
+export async function profileShowCommand(name?: string): Promise<void> {
+  const wanted = parseName(name);
+  const target = await resolveTarget();
+  const profile = await fetchProfile(target);
+
+  if (profile.entries.length === 0) {
     stdout.write('プロファイルは置かれていません。\n');
     stdout.write('置くには: alteroid profile edit\n');
     return;
   }
-  stdout.write(profile.script.endsWith('\n') ? profile.script : `${profile.script}\n`);
+  const entry = profile.entries.find((row) => row.name === wanted);
+  if (entry === undefined) {
+    throw new Error(
+      `プロファイルに行 ${wanted} は無い。行の一覧は alteroid profile list で見られる。`,
+    );
+  }
+  stdout.write(entry.script.endsWith('\n') ? entry.script : `${entry.script}\n`);
 }
 
 export async function profileStatusCommand(): Promise<void> {
   const target = await resolveTarget();
-  const profile = (await request(target, '/profile')) as ProfileView;
+  const profile = await fetchProfile(target);
 
-  if (profile.script.length === 0) {
+  if (profile.entries.length === 0) {
     stdout.write('プロファイル: 置かれていません\n');
   } else {
-    stdout.write(
-      `プロファイル: ${String(profile.bytes ?? 0)} バイト` +
-        ` (sha256 ${profile.sha256 ?? '?'} / 更新 ${profile.updatedAt ?? '?'})\n`,
-    );
+    stdout.write(`プロファイル: ${String(profile.entries.length)} 行\n`);
+    for (const entry of profile.entries) {
+      stdout.write(`  ${describeEntry(entry)} (sha256 ${entry.sha256})\n`);
+    }
+    // **つないだあとの指紋を、掛かる側ごとに出す。** 届いた先の指紋はこれと見比べる。
+    if (!profile.legacy)
+      stdout.write(
+        `クローン用（合成後）: ${profile.clone.sha256 === undefined ? '掛かる行なし' : `${String(profile.clone.bytes ?? 0)} バイト (sha256 ${profile.clone.sha256})`}\n`,
+      );
+    if (!profile.legacy)
+      stdout.write(
+        `runner 用（合成後）: ${profile.runner.sha256 === undefined ? '掛かる行なし' : `${String(profile.runner.bytes ?? 0)} バイト (sha256 ${profile.runner.sha256})`}\n`,
+      );
   }
+
+  noteLegacy(profile);
 
   // **どの runner に何が届いているかを見せる。** 見えないと「置いた」「効いて
   // いない」のすれ違いが起きて、鍵の権限の問題なのか配布の問題なのかを誰も
@@ -83,35 +201,70 @@ export async function profileStatusCommand(): Promise<void> {
       profile?: { sha256: string; updatedAt: string };
     }[];
   };
+  // 旧形式では合成後の指紋が無い。古いデーモンは全文を runner へ降ろすので、本文の指紋と見る。
+  const expected = profile.legacy ? profile.sha256 : profile.runner.sha256;
   for (const runner of runners) {
     // 繋がるまで runner_id は分からない。宛先（label）なら登録した時点で言える。
     const name = runner.runnerId ?? runner.label;
+    // **runner に掛かる行が0なら、載っていないのが正しい。** 食い違いとして見せると、
+    // 直せない（直すと撒く先の意味が消える）ものを直させる。逆に載っているなら、
+    // 外しの降ろしが済んでいないので、それは言う。
+    if (runner.profile === undefined) {
+      stdout.write(
+        profile.entries.length > 0 && expected === undefined
+          ? `  ${name}: プロファイル無し（runner に掛かる行が無いので、載っていないのが正しい。${runner.state}）\n`
+          : `  ${name}: プロファイル無し（${runner.state}）\n`,
+      );
+      continue;
+    }
+    const note =
+      expected === undefined
+        ? '（runner に掛かる行が無いので載っているはずがない — 外しの降ろしが済んでいない）'
+        : runner.profile.sha256 === expected
+          ? '（runner 用の合成と一致）'
+          : `（runner 用の合成 ${expected} と食い違う — 降ろし直しが済んでいない）`;
     stdout.write(
-      runner.profile === undefined
-        ? `  ${name}: プロファイル無し（${runner.state}）\n`
-        : `  ${name}: sha256 ${runner.profile.sha256} (${runner.profile.updatedAt})\n`,
+      `  ${name}: sha256 ${runner.profile.sha256} (${runner.profile.updatedAt})${note}\n`,
     );
   }
 }
 
-/** ファイルか標準入力から丸ごと置き換える。 */
-export async function profileSetCommand(options: { file?: string }): Promise<void> {
+/** ファイルか標準入力から、1行を丸ごと置き換える。 */
+export async function profileSetCommand(
+  nameArg: string | undefined,
+  options: { file?: string; scope?: string },
+): Promise<void> {
+  // 先に検査する（標準入力を読み終えてから「綴りが違う」で落とさない）。
+  const name = parseName(nameArg);
+  const scope = parseScope(options.scope);
   const script =
     options.file === undefined || options.file === '-'
       ? await readAll()
       : await readFile(options.file, 'utf8');
-  await put(script);
+  // 空の本文は通信の前に断る（`put` も同じ検査を持つ）。
+  if (script.trim().length === 0) throw new Error(EMPTY_BODY_MESSAGE);
+  const target = await resolveTarget();
+  const profile = await fetchProfile(target);
+  assertLegacySupports(profile, name, scope);
+  await put(name, script, target, scope, profile.legacy);
 }
 
-/** いま置いてあるものを `$EDITOR` で開いて、閉じたら反映する。 */
-export async function profileEditCommand(): Promise<void> {
+/** いま置いてある行を `$EDITOR` で開いて、閉じたら反映する。 */
+export async function profileEditCommand(
+  nameArg?: string,
+  options: { scope?: string } = {},
+): Promise<void> {
+  const name = parseName(nameArg);
+  const scope = parseScope(options.scope);
   const target = await resolveTarget();
-  const current = (await request(target, '/profile')) as ProfileView;
+  const profile = await fetchProfile(target);
+  assertLegacySupports(profile, name, scope);
+  const current = profile.entries.find((row) => row.name === name);
 
   const dir = await mkdtemp(join(tmpdir(), 'alteroid-profile-'));
-  const path = join(dir, 'profile.sh');
+  const path = join(dir, `${name}.sh`);
   try {
-    await writeFile(path, current.script.length > 0 ? current.script : TEMPLATE, {
+    await writeFile(path, current !== undefined ? current.script : TEMPLATE, {
       encoding: 'utf8',
       // 中身は人間が置いた鍵そのものになりうる。一時ファイルでも絞る。
       mode: 0o600,
@@ -119,32 +272,85 @@ export async function profileEditCommand(): Promise<void> {
     await openEditor(path);
     const edited = await readFile(path, 'utf8');
 
-    if (edited === current.script) {
+    // 撒く先だけを変えるのも更新である（本文が同じでも、外れる側が出る）。
+    const scopeChanged = current !== undefined && scope !== undefined && scope !== current.scope;
+    if (current !== undefined && edited === current.script && !scopeChanged) {
       stdout.write('変更はありません。\n');
       return;
     }
-    await put(edited, target);
+    await put(name, edited, target, scope, profile.legacy);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
 
-export async function profileClearCommand(): Promise<void> {
-  await put('');
+/** 1行を外す。他の行は変えない。 */
+export async function profileRemoveCommand(nameArg: string): Promise<void> {
+  const name = parseName(nameArg);
+  const target = await resolveTarget();
+  const profile = await fetchProfile(target);
+  assertLegacySupports(profile, name);
+  // 古いデーモンには DELETE /profile/:name が無い。default の行は全部外す口（空の PUT）へ倒す。
+  const result = (await (profile.legacy
+    ? request(target, '/profile', { method: 'PUT', body: JSON.stringify({ script: '' }) })
+    : request(target, `/profile/${encodeURIComponent(name)}`, { method: 'DELETE' }))) as UpdateView;
+  stdout.write(`プロファイルの行 ${name} を外しました。\n`);
+  describeComposed(result);
+  report('クローン', result.clone);
+  for (const runner of result.runners) report(runner.runnerId, runner);
 }
 
-async function put(script: string, known?: Target): Promise<void> {
-  const target = known ?? (await resolveTarget());
+/**
+ * 全行を外す（旧来の `clear` の意味）。**旧来の全文置換の口（`PUT /profile`、空）を
+ * 1回で叩く** — 行ごとに `DELETE` を並べると、途中で落ちたとき半端に残る。
+ */
+export async function profileClearCommand(): Promise<void> {
+  const target = await resolveTarget();
   const result = (await request(target, '/profile', {
     method: 'PUT',
-    body: JSON.stringify({ script }),
+    body: JSON.stringify({ script: '' }),
   })) as UpdateView;
+  stdout.write('プロファイルを全部外しました。\n');
+  report('クローン', result.clone);
+  for (const runner of result.runners) report(runner.runnerId, runner);
+}
 
+function describeComposed(result: UpdateView): void {
+  // 古いデーモンの応答には無い。
+  if (result.composed === undefined) return;
+  const { clone, runner } = result.composed;
+  stdout.write(
+    `  合成後の指紋: クローン用 ${clone.sha256 ?? '掛かる行なし'} / runner 用 ${runner.sha256 ?? '掛かる行なし'}\n`,
+  );
+}
+
+async function put(
+  name: string,
+  script: string,
+  known?: Target,
+  scope?: ProfileScope,
+  legacy = false,
+): Promise<void> {
   if (script.trim().length === 0) {
-    stdout.write('プロファイルを外しました。\n');
-  } else {
-    stdout.write(`プロファイルを更新しました (sha256 ${result.sha256 ?? '?'})\n`);
+    throw new Error(EMPTY_BODY_MESSAGE);
   }
+  const target = known ?? (await resolveTarget());
+  // 古いデーモン（行ごとの口が無い）へは、従来の全文置換 PUT /profile {script} へ倒す。
+  const result = (await (legacy
+    ? request(target, '/profile', { method: 'PUT', body: JSON.stringify({ script }) })
+    : request(target, `/profile/${encodeURIComponent(name)}`, {
+        method: 'PUT',
+        // 省略は「既存の行の撒く先を保つ」（デーモン側の約束）。
+        body: JSON.stringify({ script, ...(scope === undefined ? {} : { scope }) }),
+      }))) as UpdateView;
+
+  const row = result.entries?.find((entry) => entry.name === name);
+  stdout.write(
+    `プロファイルの行 ${name} を更新しました (sha256 ${row?.sha256 ?? (result as { sha256?: string }).sha256 ?? '?'})\n`,
+  );
+  stdout.write(`  撒く先: ${describeScope(row?.scope ?? 'all')}\n`);
+  if (legacy) stdout.write(`（${LEGACY_PROFILE_NOTICE}）\n`);
+  describeComposed(result);
 
   report('クローン', result.clone);
   for (const runner of result.runners) report(runner.runnerId, runner);
@@ -154,10 +360,8 @@ async function put(script: string, known?: Target): Promise<void> {
   // は非対話の bash なら `bash -c` でも読まれるものの、実測では届く相手と届かない
   // 相手が混在する（`packages/core/src/profile.ts` のモジュール doc）。
   // ここを大きく書くと、効いていない相手が居ることに誰も気づけなくなる。
-  if (script.trim().length > 0) {
-    stdout.write('（これから起こす仕事には即座に効きます。走行中の仕事は gh / git だけが\n');
-    stdout.write('  次の呼び出しから拾います — それ以外は次の仕事から）\n');
-  }
+  stdout.write('（これから起こす仕事には即座に効きます。走行中の仕事は gh / git だけが\n');
+  stdout.write('  次の呼び出しから拾います — それ以外は次の仕事から）\n');
 }
 
 function report(label: string, result: ApplyResult): void {
@@ -277,7 +481,10 @@ async function request(target: Target, path: string, init: RequestInit = {}): Pr
  */
 const TEMPLATE = `# alteroid 実行環境プロファイル（人間の ~/.zprofile に当たるもの）
 #
-# ここに書いたものは、クローン・マネージャー・作業者のすべてに効きます。
+# ここに書いたものは、既定ではクローン・マネージャー・作業者のすべてに効きます
+# （プロファイルは名前付きの行の集まりで、名前のコード単位順につなげて効きます）
+# （alteroid profile edit --scope runner のように撒く先を絞れます。
+#  all=両方 / app=クローンだけ / runner=マネージャー・作業者だけ）。
 # 器（コンテナ）を作り直す必要はありません。
 #
 # 例:

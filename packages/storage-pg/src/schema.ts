@@ -334,15 +334,44 @@ export const daemonState = pgTable('daemon_state', {
 });
 
 /**
- * 実行環境プロファイル（人間の `.zprofile` に当たるもの）。**高々1行**。
+ * 実行環境プロファイルの**旧形式**（人間の `.zprofile` に当たるもの。高々1行）。
  *
- * 用途ごとに行を増やせる形にしない。増やせるようにした瞬間、「どの行がどの層に
- * 効くか」の対応表が要るようになり、それは行為ごとの許可一覧と同じ形をしている
- * （AGENTS.md 地雷3）。効かせ分けが要るなら、本文の中でシェルとして分岐すればよい。
+ * **新しい `envProfileEntries` へ移した（2026-10-03）が、この表は消さない。**
+ * 巻き戻した旧デーモンがここを読むので、消すと旧版が「プロファイルが無い」と読み、
+ * 次の起動で環境が黙って痩せる。**新版はここへ書かない**（`clear()` だけはここも空に
+ * する）。写し方は `migrate.ts`（1度だけ。印は `daemon_state`）。
  */
 export const envProfile = pgTable('env_profile', {
   id: text('id').primaryKey(),
   script: text('script').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+});
+
+/**
+ * 実行環境プロファイル（人間の `.zprofile` / `/etc/profile.d/*.sh` に当たるもの）。
+ * **名前付きの行を複数持つ。** 1行 ＝ 名前・本文（何行でもよい）・撒く先・更新日時。
+ * つなげる順番は名前のコード単位順（`core` の `composeProfileScript`）。
+ *
+ * かつては「高々1行。用途ごとに行を増やせる形にしない — 増やせるようにした瞬間、
+ * 『どの行がどの層に効くか』の対応表が要るようになり、それは行為ごとの許可一覧と
+ * 同じ形をしている（AGENTS.md 地雷3）。効かせ分けが要るなら本文の中でシェルとして
+ * 分岐すればよい」という形だった。**この判断は人間の明示的な決定で上書きした**
+ * （2026-10-03。オーナーの逐語:「env-profileを環境変数と同じように指定できるように
+ * して欲しい」「デフォルトは両方です」、続く決定: DB の行ごとに設定できる・1行には
+ * 何行でもシェルスクリプトを入れられ行ごとに撒く先を持つ・つなげる順番は名前の
+ * 辞書順）。本文の中での分岐が効かないのは、器（app と runner）の違いが本文から
+ * 見えない（同じ本文が両方へ降りる）からである。
+ *
+ * **`manager_credentials.scope`（2026-09-14）と同じ理由・同じ形**で、`scope` は
+ * 確認・許可の話ではなく**プロセストポロジーの表現**である
+ * （`packages/core/src/store.ts` の `EnvProfileEntry` の doc）。**runner から読ませない**
+ * （M4 受け入れ基準3）— runner へはデーモンが制御面で降ろす。
+ */
+export const envProfileEntries = pgTable('env_profile_entries', {
+  name: text('name').primaryKey(),
+  script: text('script').notNull(),
+  /** 撒く先（`'all' | 'app' | 'runner'`）。既定は `'all'`。 */
+  scope: text('scope').notNull().default('all'),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 });
 
