@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 
 import { Bot, Brain, Database, Hammer, User, type LucideIcon } from 'lucide-react';
 
@@ -33,11 +33,44 @@ export type {
 
 export interface SystemTopologyProps extends TopologyScene {
   /**
-   * 配置。`auto` は狭い画面（`useIsMobile`）で `narrow`（上から下への木）、それ以外で
-   * `wide`（左から右）。見本帳で両方を並べるために外から固定できる。
+   * 配置。`auto` は**置かれた枠の幅**で決める（{@link WIDE_MIN_WIDTH} 以上なら `wide`＝左から右、
+   * 未満なら `narrow`＝上から下への木）。枠の幅を測れない環境（jsdom）では狭い画面
+   * （`useIsMobile`）で決める。見本帳で両方を並べるために外から固定できる。
    */
   layout?: 'auto' | 'wide' | 'narrow';
   className?: string;
+}
+
+/**
+ * 図の描画幅の上限（CSS px）。**図は viewBox を枠いっぱいに伸ばして描くので、上限が無いと広い画面で
+ * 図も文字も枠に比例して大きくなる**（1920px では札の 13px が 18px になっていた）。
+ * 上限は自然寸（倍率 1.0）にした。ラップトップ幅（1366px、サイドバーあり）では倍率 0.93 で、
+ * 以前と同じ大きさのまま、それより広い画面でだけ止まる:
+ * `wide` は viewBox 幅 1152 に対し 1152px（倍率 1.0）、`narrow` は viewBox 幅 360 の等倍。
+ * 上限を超えた枠の余りは**中央に置く**（左に寄せると、広い画面で片側だけ空く）。
+ */
+const WIDE_MAX_WIDTH = 1152;
+const NARROW_MAX_WIDTH = 360;
+/**
+ * `auto` で `wide` にする枠の最小幅。`wide`（viewBox 幅 1152）をこれ未満に縮めると倍率が
+ * 0.8 を割り、11px の文字が 9px を下回って読めなくなる。それより狭い枠は木（`narrow`）へ倒す。
+ */
+export const WIDE_MIN_WIDTH = 920;
+
+/** 要素の実測の幅（CSS px）。測れない環境（`ResizeObserver` が無い）では 0 のまま。 */
+function useMeasuredWidth(): [React.RefCallback<HTMLElement>, number] {
+  const [node, setNode] = useState<HTMLElement | null>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    if (node === null || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry !== undefined) setWidth(entry.contentRect.width);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [node]);
+  return [setNode, width];
 }
 
 const STATUS = {
@@ -63,7 +96,7 @@ const KIND: Record<NodeKind, { icon: LucideIcon; role: string }> = {
 };
 
 /**
- * 稼働の地図。**いま誰が何をしていて、どの線を指示と報告が行き来しているか**を1枚で見せる。
+ * 稼働状況の図。**いま誰が何をしていて、どの線を指示と報告が行き来しているか**を1枚で見せる。
  *
  * 器（デーモン・manager-runner・DB）を枠で、層（人間・クローン・マネージャー・作業者）を
  * 札で描き、線の上を流れる光で「いま動いている経路」を言う。下りの光（指示）は
@@ -83,7 +116,13 @@ export function SystemTopology({ layout = 'auto', className, ...rawScene }: Syst
   const scene = redactScene(rawScene, body);
   const summaryId = useId();
   const isMobile = useIsMobile();
-  const narrow = layout === 'narrow' || (layout === 'auto' && isMobile);
+  const [frameRef, frameWidth] = useMeasuredWidth();
+  // 札の押下の出し方（下からのシート）は画面の狭さで、配置（木か横か）は枠の幅で決める。
+  const sheet = layout === 'narrow' || (layout === 'auto' && isMobile);
+  const narrow =
+    layout === 'auto' && frameWidth > 0
+      ? frameWidth < WIDE_MIN_WIDTH
+      : layout === 'narrow' || sheet;
   const laid = narrow ? layoutNarrow(scene) : layoutWide(scene);
 
   const [hovered, setHovered] = useState<string | null>(null);
@@ -93,83 +132,88 @@ export function SystemTopology({ layout = 'auto', className, ...rawScene }: Syst
   const selectedNode = laid.nodes.find((n) => n.key === selected);
 
   return (
-    <figure className={cn('w-full', narrow && 'mx-auto max-w-[480px]', className)}>
-      <svg
-        viewBox={`0 0 ${laid.width} ${laid.height}`}
-        className="h-auto w-full"
-        role="img"
-        aria-labelledby={summaryId}
+    <div ref={frameRef} className="w-full min-w-0">
+      <figure
+        className={cn('mx-auto w-full', className)}
+        style={{ maxWidth: narrow ? NARROW_MAX_WIDTH : WIDE_MAX_WIDTH }}
       >
-        <defs>
-          <filter id="system-topology-glow" x="-200%" y="-200%" width="500%" height="500%">
-            <feGaussianBlur stdDeviation="3" />
-          </filter>
-        </defs>
-
-        {laid.containers.map((c) => (
-          <Container key={c.key} container={c} />
-        ))}
-
-        {/* 線は札より先に描いて、札の下へ潜らせる */}
-        {laid.edges.map((e) => (
-          <Edge key={e.key} edge={e} dim={focus !== null && !focusEdges.has(e.key)} />
-        ))}
-
-        {laid.nodes.map((n) => (
-          <Node
-            key={n.key}
-            node={n}
-            selected={selected === n.key}
-            popover={!narrow}
-            onHover={(on) => setHovered(on ? n.key : null)}
-            onSelect={() => setSelected((cur) => (cur === n.key ? null : n.key))}
-            onClose={() => setSelected(null)}
-          />
-        ))}
-
-        {laid.empty ? (
-          <foreignObject
-            x={laid.empty.x}
-            y={laid.empty.y}
-            width={laid.empty.w}
-            height={laid.empty.h}
-          >
-            <div className="flex h-full items-center justify-center rounded-md border border-dashed text-xs text-muted-foreground">
-              走っているマネージャーはいません
-            </div>
-          </foreignObject>
-        ) : null}
-      </svg>
-      <figcaption id={summaryId} className="sr-only">
-        {summarize(scene)}
-      </figcaption>
-
-      {narrow ? (
-        <Sheet
-          open={selectedNode !== undefined}
-          onOpenChange={(open) => !open && setSelected(null)}
+        <svg
+          viewBox={`0 0 ${laid.width} ${laid.height}`}
+          className="h-auto w-full"
+          role="img"
+          aria-labelledby={summaryId}
         >
-          <SheetContent
-            side="bottom"
-            className="max-h-[80dvh] gap-0 overflow-y-auto pb-[var(--safe-bottom)]"
+          <defs>
+            <filter id="system-topology-glow" x="-200%" y="-200%" width="500%" height="500%">
+              <feGaussianBlur stdDeviation="3" />
+            </filter>
+          </defs>
+
+          {laid.containers.map((c) => (
+            <Container key={c.key} container={c} />
+          ))}
+
+          {/* 線は札より先に描いて、札の下へ潜らせる */}
+          {laid.edges.map((e) => (
+            <Edge key={e.key} edge={e} dim={focus !== null && !focusEdges.has(e.key)} />
+          ))}
+
+          {laid.nodes.map((n) => (
+            <Node
+              key={n.key}
+              node={n}
+              selected={selected === n.key}
+              popover={!sheet}
+              onHover={(on) => setHovered(on ? n.key : null)}
+              onSelect={() => setSelected((cur) => (cur === n.key ? null : n.key))}
+              onClose={() => setSelected(null)}
+            />
+          ))}
+
+          {laid.empty ? (
+            <foreignObject
+              x={laid.empty.x}
+              y={laid.empty.y}
+              width={laid.empty.w}
+              height={laid.empty.h}
+            >
+              <div className="flex h-full items-center justify-center rounded-md border border-dashed text-xs text-muted-foreground">
+                走っているマネージャーはいません
+              </div>
+            </foreignObject>
+          ) : null}
+        </svg>
+        <figcaption id={summaryId} className="sr-only">
+          {summarize(scene)}
+        </figcaption>
+
+        {sheet ? (
+          <Sheet
+            open={selectedNode !== undefined}
+            onOpenChange={(open) => !open && setSelected(null)}
           >
-            {selectedNode ? (
-              <>
-                <SheetHeader className="pb-2">
-                  <SheetTitle className="flex items-center gap-2">
-                    <NodeIcon node={selectedNode} />
-                    {selectedNode.label}
-                  </SheetTitle>
-                </SheetHeader>
-                <div className="px-4 pb-6">
-                  <NodeDetail node={selectedNode} />
-                </div>
-              </>
-            ) : null}
-          </SheetContent>
-        </Sheet>
-      ) : null}
-    </figure>
+            <SheetContent
+              side="bottom"
+              className="max-h-[80dvh] gap-0 overflow-y-auto pb-[var(--safe-bottom)]"
+            >
+              {selectedNode ? (
+                <>
+                  <SheetHeader className="pb-2">
+                    <SheetTitle className="flex items-center gap-2">
+                      <NodeIcon node={selectedNode} />
+                      {selectedNode.label}
+                    </SheetTitle>
+                  </SheetHeader>
+                  <div className="px-4 pb-6">
+                    <NodeDetail node={selectedNode} />
+                  </div>
+                </>
+              ) : null}
+            </SheetContent>
+          </Sheet>
+        ) : null}
+      </figure>
+    </div>
   );
 }
 
@@ -212,17 +256,27 @@ function summarize({ clone, db, runner, managers }: TopologyScene): string {
   return parts.join('。');
 }
 
-function Container({ container: { box, label, down, labelAlign } }: { container: LaidContainer }) {
+function Container({
+  container: { key, box, label, state, labelAlign },
+}: {
+  container: LaidContainer;
+}) {
+  const down = state === 'offline';
+  const unknown = state === 'unknown';
   return (
-    <g>
+    <g data-container={key} data-state={state}>
       <rect
         x={box.x}
         y={box.y}
         width={box.w}
         height={box.h}
         rx={12}
-        className={cn('fill-muted/30 stroke-border', down && 'stroke-destructive/70')}
-        strokeDasharray={down ? '6 4' : undefined}
+        className={cn(
+          'fill-muted/30 stroke-border',
+          down && 'stroke-destructive/70',
+          unknown && 'stroke-muted-foreground/60',
+        )}
+        strokeDasharray={down || unknown ? '6 4' : undefined}
       />
       <text
         x={labelAlign === 'end' ? box.x + box.w - 12 : box.x + 12}
@@ -231,7 +285,7 @@ function Container({ container: { box, label, down, labelAlign } }: { container:
         className="fill-muted-foreground font-mono text-[11px] tracking-wide"
       >
         {label}
-        {down ? ' — 未接続' : ''}
+        {down ? ' — 未接続' : unknown ? ' — 不明' : ''}
       </text>
     </g>
   );

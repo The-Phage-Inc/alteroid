@@ -1,14 +1,13 @@
 // @vitest-environment jsdom
 /**
- * ホーム（`dashboard.tsx`）の小さなカードと、「あなたを待っている」の段。
+ * ホーム（`dashboard.tsx`）の小さなカードと、「承認待ち一覧」の段。
  *
  * 旧ダッシュボードのテストから引き継いだ保証（どこへ移ったか）:
  * - 「今日の利用」の嘘をつかない規約・「詳しく見る」の行き先・デーモンの暦の今日・読めずに外した行
  *   → 「今日の利用」カードの describe 群（中身は同じ）
- * - 「最新の日報」: 印の付いた行を日報として描かない → 同じ。**本文は Markdown ではなく平文の抜粋に
- *   なった**ので、「Markdown の描画経路を通る」の1本は「記法の記号を落とした抜粋を出す・全文へ
- *   リンクする」に置き換えた
- * - 承認待ちの打ち切り・「答える」を読めていないときに出さない → 「あなたを待っている」の describe
+ * - 「最新の日報」: 印の付いた行を日報として描かない → 同じ。**全幅の枠で本文を Markdown として描く**
+ *   ようになった（`dashboard-report.tsx`）
+ * - 承認待ちの打ち切り・「答える」を読めていないときに出さない → 「承認待ち一覧」の describe
  * - 「次の自動実行」の出口・読めないとき・読めない継続中の依頼 → 同じ
  * - 「稼働中のマネージャー」カードと「いま届いている出来事」は**ホームから外した**。前者の
  *   「読めない委譲を隠さない」は地図の下の断りへ、「知らない status を静かに落とさない」は
@@ -68,7 +67,7 @@ describe('ホームの構成', () => {
     renderHome();
 
     expect(await screen.findByRole('heading', { name: 'ホーム' })).toBeTruthy();
-    expect(screen.getByText('いま動いているもの')).toBeTruthy();
+    expect(screen.getByText('稼働状況')).toBeTruthy();
     for (const title of ['最新の日報', '作業の進捗', '次の自動実行', '今日の利用']) {
       expect(screen.getByText(title)).toBeTruthy();
     }
@@ -286,21 +285,26 @@ describe('「最新の日報」', () => {
     ...extra,
   });
 
-  it('本文は記法の記号を落とした平文の抜粋で出て、全文（その日報）へリンクする', async () => {
+  it('本文は Markdown として描かれ（見出し・強調）、全文（その日報）へリンクする', async () => {
     renderHome({ reports: [report({ body: '## 今日やったこと\n\n- **進捗**があった。' })] });
 
-    // 見出し記法・強調の記号は出ない（Markdown の見出し要素にもしない）。
-    expect(await screen.findByText('今日やったこと 進捗があった。')).toBeTruthy();
-    expect(screen.queryByRole('heading', { name: '今日やったこと' })).toBeNull();
-    const link = screen.getByRole('link', { name: '全文を読む' });
+    expect(await screen.findByRole('heading', { name: '今日やったこと' })).toBeTruthy();
+    expect(screen.getByText('進捗').tagName).toBe('STRONG');
+    const link = screen.getByRole('link', { name: '続きを読む（全文）' });
     expect(link.getAttribute('href')).toBe('/reports/2026-08-14/r1');
+    expect(screen.getByRole('link', { name: '日報一覧' }).getAttribute('href')).toBe('/reports');
   });
 
-  it('長い本文は … で切ったと分かる形で切る（全文は日報のページ）', async () => {
-    renderHome({ reports: [report({ body: 'あ'.repeat(400) })] });
+  it('長い本文でも、本文の枠は高さで切られ（overflow-hidden・max-h）、全文へのリンクが残る', async () => {
+    const body = Array.from({ length: 80 }, (_, i) => `段落 ${i}`).join('\n\n');
+    renderHome({ reports: [report({ body })] });
 
-    const excerpt = await screen.findByText(/^あ+…$/);
-    expect(excerpt.textContent!.length).toBeLessThan(200);
+    await screen.findByText('段落 0');
+    const frame = document.querySelector('[data-slot="home-report-body"]')!;
+    expect(frame.className).toContain('overflow-hidden');
+    expect(frame.className).toContain('max-h-96');
+    expect(frame.className).toContain('min-w-0');
+    expect(screen.getByRole('link', { name: '続きを読む（全文）' })).toBeTruthy();
   });
 
   it('本文の秘密は描画の直前に伏せる（偽のトークン。40桁の sha は残す）', async () => {
@@ -329,7 +333,8 @@ describe('「最新の日報」', () => {
 
     expect(await screen.findByText('この日の日報は作れなかった')).toBeTruthy();
     expect(screen.getByText(reason)).toBeTruthy();
-    // 抜粋としても出ない（日報の抜粋の `<p>` が無い）。
+    // 本文としても出ない（Markdown の描画を通らない）。
+    expect(screen.queryByRole('link', { name: '続きを読む（全文）' })).toBeNull();
     expect(screen.queryByText(`## ${reason}`)).toBeNull();
     expect(screen.queryByRole('heading', { name: reason })).toBeNull();
   });
@@ -349,7 +354,7 @@ describe('「最新の日報」', () => {
  * - **ちょうど上限のときは出ない** — 常に出る但し書きは、出ていることが情報にならない
  *   （「残り 0 件」を作ると、取れない軸に 0 の行を作るのと同じになる）
  */
-describe('「あなたを待っている」が打ち切ったことを言う', () => {
+describe('「承認待ち一覧」が打ち切ったことを言う', () => {
   const approval = (n: number) => ({
     id: `approval-${n}`,
     createdAt: '2026-08-14T09:00:00.000Z',
@@ -373,7 +378,7 @@ describe('「あなたを待っている」が打ち切ったことを言う', (
   });
 });
 
-describe('「あなたを待っている」', () => {
+describe('「承認待ち一覧」', () => {
   const approval = (n: number) => ({
     id: `approval-${n}`,
     createdAt: '2026-08-14T09:00:00.000Z',
@@ -383,8 +388,8 @@ describe('「あなたを待っている」', () => {
   it('承認待ちが0件なら、1行に畳む（見出しも「答える」も出さない）', async () => {
     renderHome({ approvals: [] });
 
-    expect(await screen.findByText('あなたを待っているものはない')).toBeTruthy();
-    expect(screen.queryByText('あなたを待っている')).toBeNull();
+    expect(await screen.findByText('承認待ちはない')).toBeTruthy();
+    expect(screen.queryByText('承認待ち一覧')).toBeNull();
     expect(screen.queryByRole('link', { name: '答える' })).toBeNull();
   });
 
@@ -444,7 +449,7 @@ describe('「あなたを待っている」', () => {
  * `focus` イベント（SWR 既定の `revalidateOnFocus` が拾う）で再取得を起こし、`data` が古いまま
  * 残る状態を作る。
  */
-describe('「あなたを待っている」が読めないとき、「答える」を出さない（issue #2138 の2）', () => {
+describe('「承認待ち一覧」が読めないとき、「答える」を出さない（issue #2138 の2）', () => {
   it('一度取れた後に /approvals が失敗すると、古い件数のまま「答える」を出し続けない', async () => {
     const stub = renderHome({
       approvals: [{ id: 'approval-0', createdAt: '2026-08-14T09:00:00.000Z', question: '質問 0' }],

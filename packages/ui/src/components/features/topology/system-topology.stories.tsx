@@ -8,13 +8,14 @@ import {
   idleScene,
   liveFrames,
   runnerDownScene,
+  runnerUnknownScene,
   storageDownScene,
   unknownScene,
 } from './samples';
 import { SystemTopology } from './system-topology';
 
 /**
- * 稼働の地図。器（デーモン・manager-runner・DB）と層（人間・クローン・マネージャー・作業者）を
+ * 稼働状況の図。器（デーモン・manager-runner・DB）と層（人間・クローン・マネージャー・作業者）を
  * 1枚に描き、指示（下り・紫）と報告（上り・青）が行き来している線に光を流す。
  * 札に触れるとその線だけが浮き、押すと詳細が出る（広い画面は Popover、狭い画面はシート）。
  */
@@ -36,6 +37,9 @@ export const Idle: Story = { args: idleScene };
 
 /** runner へ届かない。そこへ向かう線は破線にして、光を流さない。 */
 export const RunnerOffline: Story = { args: runnerDownScene };
+
+/** runner が登録されていない。器の枠も破線にして「— 不明」と言う（正常に見せない）。 */
+export const RunnerUnknown: Story = { args: runnerUnknownScene };
 
 /** 確かめられない軸は「不明」（破線の札）。待機・正常とは描かない。 */
 export const Unknown: Story = { args: unknownScene };
