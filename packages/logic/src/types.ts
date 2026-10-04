@@ -4,12 +4,12 @@
  * 手で書き写した型を置くと `apps/daemon/openapi.json` と二重管理になり、必ずずれる
  * （api-client がそうしないのと同じ理由）。経路が変われば、ここが壊れて気づく。
  */
-import type { JournalEntry, paths } from '@alteroid/api-client';
+import type { JournalEntry, paths, TopologySnapshot } from '@alteroid/api-client';
 
 type Json<T> = T extends { content: { 'application/json': infer B } } ? B : never;
 type Ok<T> = T extends { responses: { 200: infer R } } ? Json<R> : never;
 
-export type { ChatStreamEvent, JournalEntry } from '@alteroid/api-client';
+export type { ChatStreamEvent, JournalEntry, TopologySnapshot } from '@alteroid/api-client';
 
 export type JournalEntryType = JournalEntry['type'];
 
@@ -347,3 +347,6 @@ export type InboxRemoveManyResult = Ok<paths['/inbox/remove']['post']>;
  * （`apps/daemon/src/openapi.ts` の `inboxBacklogResponseSchema`）。
  */
 export type InboxBacklog = Ok<paths['/inbox']['get']>;
+
+/** 稼働の地図の1スナップショット（`GET /topology`）の委譲1行。 */
+export type TopologySnapshotManager = TopologySnapshot['managers'][number];

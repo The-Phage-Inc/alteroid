@@ -5,6 +5,7 @@ import { Bot, Brain, Database, Hammer, User, type LucideIcon } from 'lucide-reac
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { useIsMobile } from '@/hooks/use-is-mobile';
+import { useDisplayText } from '@/lib/display-text';
 import { cn } from '@/lib/utils';
 
 import { KeyValueList } from '../key-value-list';
@@ -41,8 +42,14 @@ export interface SystemTopologyProps extends TopologyScene {
 
 const STATUS = {
   idle: { tone: 'neutral', label: '待機' },
+  // 走る・走らないの無い対象（記憶ストア・runner の器）が繋がっている。
+  ok: { tone: 'ok', label: '正常' },
+  // 確かめられない。**待機・正常とは別の札にする**（確かめたように読ませない）。
+  unknown: { tone: 'neutral', label: '不明' },
   running: { tone: 'accent', label: '実行中' },
-  waiting: { tone: 'warn', label: '承認待ち' },
+  // 人間の返事待ち・利用枠の上限など、**自分では進めない**止まり方の総称。理由は札の task と
+  // 詳細に出す（「承認待ち」と固定すると、利用枠で止まったクローンまで承認待ちに読める）。
+  waiting: { tone: 'warn', label: '止まっている' },
   error: { tone: 'danger', label: '失敗' },
   offline: { tone: 'danger', label: '未接続' },
 } as const;
@@ -71,7 +78,9 @@ const KIND: Record<NodeKind, { icon: LucideIcon; role: string }> = {
  *   下から出るシート（Popover を置く横の余白が無い）
  * - 読み上げには、図の代わりに層ごとの状態の一覧を渡す。札はボタンとして焦点が当たる
  */
-export function SystemTopology({ layout = 'auto', className, ...scene }: SystemTopologyProps) {
+export function SystemTopology({ layout = 'auto', className, ...rawScene }: SystemTopologyProps) {
+  const { body } = useDisplayText();
+  const scene = redactScene(rawScene, body);
   const summaryId = useId();
   const isMobile = useIsMobile();
   const narrow = layout === 'narrow' || (layout === 'auto' && isMobile);
@@ -162,6 +171,32 @@ export function SystemTopology({ layout = 'auto', className, ...scene }: SystemT
       ) : null}
     </figure>
   );
+}
+
+/**
+ * 自由文（依頼の抜粋・返事待ちの要旨・道具名）を、描画の直前に伏せ字へ通す
+ * （`@/lib/display-text`。データそのものは書き換えない）。**名前（`label`）・id・時刻は
+ * 通さない**（id や sha を壊さない）。
+ */
+function redactScene(scene: TopologyScene, body: (text: string) => string): TopologyScene {
+  const details = (rows: TopologyScene['clone']['details']) =>
+    rows?.map((row) => (row.mono ? row : { ...row, value: body(row.value) }));
+  const text = (value: string | undefined) => (value === undefined ? undefined : body(value));
+  return {
+    ...scene,
+    clone: { ...scene.clone, task: text(scene.clone.task), details: details(scene.clone.details) },
+    db: { ...scene.db, task: text(scene.db.task), details: details(scene.db.details) },
+    managers: scene.managers.map((manager) => ({
+      ...manager,
+      task: text(manager.task),
+      details: details(manager.details),
+      workers: manager.workers?.map((worker) => ({
+        ...worker,
+        task: text(worker.task),
+        details: details(worker.details),
+      })),
+    })),
+  };
 }
 
 function summarize({ clone, db, runner, managers }: TopologyScene): string {
@@ -331,6 +366,7 @@ function Node({
         'hover:border-foreground/30 focus-visible:ring-2 focus-visible:ring-ring',
         busy && 'border-primary/60 shadow-[0_0_18px_-4px_var(--primary)]',
         status === 'waiting' && 'border-warn/60',
+        status === 'unknown' && 'border-dashed',
         (status === 'error' || status === 'offline') && 'border-destructive/60',
         selected && 'ring-2 ring-primary',
       )}
