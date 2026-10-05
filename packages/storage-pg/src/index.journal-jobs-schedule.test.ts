@@ -903,6 +903,13 @@ describe('PgJobStore', () => {
     const t = (offsetMs: number) =>
       new Date(Date.parse('2026-01-01T00:00:00.000Z') + offsetMs).toISOString();
 
+    /**
+     * SQL を数えるアサーションの失敗メッセージ（#3025）。落ちたとき、実際に出た本数と文だけで
+     * 切り分けられるようにする。**文だけでパラメータは載せない。**
+     */
+    const dump = (label: string, qs: readonly string[]): string =>
+      `${label}: ${qs.length} 本\n${qs.map((q, i) => `  [${i}] ${q}`).join('\n')}`;
+
     async function seedFour(): Promise<void> {
       await stores.jobs.putJob({
         id: 'zeta',
@@ -984,6 +991,27 @@ describe('PgJobStore', () => {
       expect(mid?.lastReport).toBe('mid の書き換え後の報告');
     });
 
+    /**
+     * **時刻に依らないことの直接の歯（#3025）。** 版は `xmin` と `updated_at` の連結なので、
+     * 同じ `updatedAt`（同じミリ秒）で2回書いても、`xmin` が進むので覚えは古い値を返さない。
+     * 時刻を固定して同じミリ秒を決定的に作る。
+     */
+    it('同じ updatedAt（同じミリ秒）で書き換えても、覚えは古い値を返さない（xmin が版を分ける）', async () => {
+      const base = {
+        id: 'same-ms',
+        createdAt: t(0),
+        updatedAt: t(0),
+        status: 'running' as const,
+        summary: '同じ要旨',
+      };
+      await stores.jobs.putJob({ ...base, lastReport: '最初の報告' });
+      expect((await stores.jobs.listJobs())[0]?.lastReport).toBe('最初の報告'); // 覚えを温める
+
+      await stores.jobs.putJob({ ...base, lastReport: '書き換え後の報告' });
+
+      expect((await stores.jobs.listJobs())[0]?.lastReport).toBe('書き換え後の報告');
+    });
+
     it('壊れた行: 2回目の呼び出しでも同じ跡が同じ文言で出る（覚えが「壊れていた」を忘れない）', async () => {
       const bodyMarker = '跡には載ってはいけない本文の目印-QZXW';
       await stores.jobs.putJob({
@@ -1059,10 +1087,16 @@ describe('PgJobStore', () => {
       const secondCallQueries = [...queries];
 
       // 1回目は段2（jsonb を引く SELECT）が出る。
-      expect(firstCallQueries.some((q) => /select .*"job".* from "jobs"/i.test(q))).toBe(true);
+      expect(
+        firstCallQueries.some((q) => /select .*"job".* from "jobs"/i.test(q)),
+        dump('1回目', firstCallQueries),
+      ).toBe(true);
       // 2回目は段1（id/xmin/updated_at だけ）しか出ない——jsonb 列を選ぶ形が無い。
-      expect(secondCallQueries.some((q) => /select .*"job".* from "jobs"/i.test(q))).toBe(false);
-      expect(secondCallQueries.length).toBe(1);
+      expect(
+        secondCallQueries.some((q) => /select .*"job".* from "jobs"/i.test(q)),
+        dump('2回目', secondCallQueries),
+      ).toBe(false);
+      expect(secondCallQueries.length, dump('2回目', secondCallQueries)).toBe(1);
     });
 
     /**
@@ -1098,8 +1132,8 @@ describe('PgJobStore', () => {
       await localStores.jobs.listJobs();
       const coldCallQueries = [...queries];
       const coldStage2 = coldCallQueries.filter((q) => /select .*"job".* from "jobs"/i.test(q));
-      expect(coldStage2).toHaveLength(1);
-      expect(coldStage2[0]).not.toMatch(/where/i);
+      expect(coldStage2, dump('冷たい1回目', coldCallQueries)).toHaveLength(1);
+      expect(coldStage2[0], dump('冷たい1回目', coldCallQueries)).not.toMatch(/where/i);
 
       // b だけ書き換える ⟹ 2回目は a が温かい・b だけ stale(一部)。
       await localStores.jobs.putJob({
@@ -1117,8 +1151,10 @@ describe('PgJobStore', () => {
       const partialStage2 = partialCallQueries.filter((q) =>
         /select .*"job".* from "jobs"/i.test(q),
       );
-      expect(partialStage2).toHaveLength(1);
-      expect(partialStage2[0]).toMatch(/where "jobs"\."id" in/i);
+      expect(partialStage2, dump('一部 stale の2回目', partialCallQueries)).toHaveLength(1);
+      expect(partialStage2[0], dump('一部 stale の2回目', partialCallQueries)).toMatch(
+        /where "jobs"\."id" in/i,
+      );
     });
 
     /**
