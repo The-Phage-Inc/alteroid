@@ -702,6 +702,15 @@ export function resolveMergedBatchSizeLimit(env: NodeJS.ProcessEnv = process.env
  * **これは回数制限ではない**（AGENTS.md 地雷2）。器が一瞬揺れただけで1周期ぶんの
  * 仕事を落とさないための拾い直しであって、仕事の量を絞るものではない。
  */
+/**
+ * ターンが失敗で終わった定期の発火を、同じプロセスの中で配り直す間隔（#2739）。失敗のたびに
+ * 後退する（毎分1ターンにしない）。使い切ったら印を残したまま次の周期か再起動に任せる。
+ * 本来の次回より遠くには置かれない（`Scheduler.retrySoon`）。
+ */
+const FAILED_TURN_RETRY_DELAYS_MS: readonly number[] = [10, 30, 120, 360, 720].map(
+  (minutes) => minutes * 60_000,
+);
+
 const SCHEDULE_STORE_ATTEMPTS = 3;
 const SCHEDULE_STORE_RETRY_MS = 200;
 
@@ -1340,7 +1349,7 @@ export interface CloneOptions {
    * 次回を1周期先へ進めてあるので、これが無いと再起動まで取り戻されない。
    * 定刻の発火（`schedule`）だけが呼ぶ。手で起こした1回（`manual`）は再試行しない。
    */
-  onScheduledRunNotStarted?: (kind: string) => void;
+  onScheduledRunNotStarted?: (kind: string, delayMs?: number) => void;
   /**
    * いま自分がどう走っているかの事実（記憶の器・作業ディレクトリ・委譲先・
    * 入口・モデル帯）。システムプロンプトの自己認識の節に載る。
@@ -2326,7 +2335,9 @@ class Clone implements CloneHost {
   readonly #withheldEnvKeys: readonly string[];
   readonly #accountUsage: (() => AccountUsageState) | undefined;
   readonly #scheduler: (() => ScheduleStatus[]) | undefined;
-  readonly #onScheduledRunNotStarted: ((kind: string) => void) | undefined;
+  readonly #onScheduledRunNotStarted: ((kind: string, delayMs?: number) => void) | undefined;
+  /** 失敗したターンの再試行を数える（kind → 元の回の時刻と回数）。プロセス内だけ。#2739 */
+  readonly #timerTurnRetries = new Map<string, { at: string; attempts: number }>();
   /** {@link CloneOptions.redeliveryGate}。必須（{@link CloneOptions.redeliveryGate} の doc）。 */
   readonly #redeliveryGate: RedeliveryGate;
 
@@ -8552,7 +8563,7 @@ class Clone implements CloneHost {
             digest: timerDigest,
           }),
         );
-        await this.#runInternal(
+        const outcome = await this.#runInternal(
           buildTimerPrompt({
             kind: event.kind,
             ...(event.target === undefined ? {} : { target: event.target }),
@@ -8568,7 +8579,42 @@ class Clone implements CloneHost {
         // **終わったことを記録するのはここ。** claim（引き受けた印）とは別に置く。
         // ここまで来ないうちに器が落ちたら、印が残っているので配り直される
         // （日次なら翌日・週次なら翌週まで消える、を作らない）。
-        if (plan !== null) await this.#completeScheduledRun(event.kind, event.at, cause);
+        //
+        // **失敗で終わったターンは「終わった」ではない（#2739）。** 枠切れ以外の失敗
+        // （API エラー・文脈窓・SDK の失敗）で `completeRun` を呼ぶと、印が消えて基準が
+        // 進み、週次なら次の週まで誰も気づかない。印を残せば、次の起動の
+        // `#firstDue` と、次の周期の刻み（`#resumable`）で元の発火として配り直される。
+        // 受信箱の合図は失敗として settle される（決定的に失敗する合図を起動のたびに
+        // 焼かない線）ので、配り直しを担うのは印の側である。枠での保持（`heldForUsage`）は
+        // 従来どおり `#pump` の `defer` が配り直す。
+        if (plan !== null) {
+          if (outcome.status === 'failed' && !outcome.heldForUsage) {
+            await this.#journal({
+              type: 'exchange',
+              with: 'self',
+              role: 'outbound',
+              text:
+                `${EXCHANGE_KIND_FAILURE_PREFIX}定期の依頼 ${event.kind}（${event.at}）のターンが失敗で終わった` +
+                `ので「終わった」とは記録しない（引き受けた印が残り、次の起動か次の周期の刻みで配り直される）: ` +
+                outcome.reason,
+            });
+            // 同じプロセスの中でも、次の周期を待たずに後退しながら配り直す。
+            // 元の回（`pendingRun.at`）のまま配り直される（`Scheduler.#resumable`）。
+            // 手で起こした1回は再試行しない。使い切ったら印を残したまま次の周期か再起動に任せる。
+            if (cause !== 'manual') {
+              const prior = this.#timerTurnRetries.get(event.kind);
+              const attempts = prior?.at === event.at ? prior.attempts : 0;
+              const delayMs = FAILED_TURN_RETRY_DELAYS_MS[attempts];
+              if (delayMs !== undefined) {
+                this.#timerTurnRetries.set(event.kind, { at: event.at, attempts: attempts + 1 });
+                this.#onScheduledRunNotStarted?.(event.kind, delayMs);
+              }
+            }
+          } else {
+            this.#timerTurnRetries.delete(event.kind);
+            await this.#completeScheduledRun(event.kind, event.at, cause);
+          }
+        }
         return;
       }
 
