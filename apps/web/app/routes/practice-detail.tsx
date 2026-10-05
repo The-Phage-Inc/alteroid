@@ -128,6 +128,7 @@ export default function PracticeDetail({ loaderData }: Route.ComponentProps) {
 
   return (
     <Page
+      documentTitle={`${slug} - やり方`}
       title={
         <span className="flex items-baseline gap-2">
           <Link
