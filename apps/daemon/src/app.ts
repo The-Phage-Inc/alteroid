@@ -62,6 +62,10 @@ import {
   approvalUpdatedAt,
   chatStreamEventSchema,
   collectConversations,
+  countUnread,
+  countUnreadConversations,
+  effectiveReadThrough,
+  loadConversationReadView,
   commitmentActiveDelegationIds,
   commitmentPosition,
   commitmentRespondedAt,
@@ -171,7 +175,10 @@ import {
   progressResponseSchema,
   commitmentOpenedResponseSchema,
   conversationDetailResponseSchema,
+  conversationReadRequestSchema,
+  conversationReadResponseSchema,
   conversationsResponseSchema,
+  unreadConversationCountResponseSchema,
   credentialsResponseSchema,
   credentialsUpdateRequestSchema,
   credentialsUpdateResponseSchema,
@@ -2698,10 +2705,24 @@ export function createApp(deps: AppDeps) {
          * なった欠陥そのものである。日誌の順序をそのまま会話の順序にする理由
          * （同じミリ秒の前後は時刻からは決められない）も、移設先に書いてある。
          */
-        const allConversations = collectConversations(entries);
-        const conversations = allConversations.slice(0, limit);
+        /**
+         * 既読の記録は全員で1組（`ConversationReadStore`）。基準時刻が無ければここで決める
+         * （どの経路でも決まる）。数え方は `collectConversations` が持つ——ここで数え直さない。
+         */
+        const readView = await loadConversationReadView(
+          stores.conversationReads,
+          (deps.now ?? (() => new Date()))().toISOString(),
+        );
+        const allConversations = collectConversations(entries, readView);
+        const conversations = allConversations.slice(0, limit).map(({ unread, ...summary }) => ({
+          ...summary,
+          unreadCount: unread,
+        }));
         return c.json({
           conversations,
+          ...(readView.unreadable === undefined
+            ? {}
+            : { readStateUnreadable: readView.unreadable }),
           /**
            * 遡った範囲。**#418 より前は「日誌の `exchange` を何件見たか」
            * だったが、いまは「人間との往復を何件見たか」である**
@@ -2735,6 +2756,41 @@ export function createApp(deps: AppDeps) {
            */
           hiddenByLimit: allConversations.length - conversations.length,
         });
+      },
+    )
+
+    /**
+     * 未読のある会話の数だけを返す軽い口（左ナビの札用。全ページから呼ばれる）。
+     * **`/conversations/:id` より前に置くこと**（`:id` に `unread-count` が食われる）。
+     */
+    .get(
+      '/conversations/unread-count',
+      describeRoute({
+        tags: ['conversations'],
+        summary: '未読のある会話の数',
+        description:
+          '未読のある会話の数（全会話で数える。直近の一覧には限らない）。**日誌を広く遡らない** — ' +
+          '会話ごとの最後のクローン側発言の時刻の索引（日誌の写し）を、前回の続きから' +
+          '新しく積まれた分だけ足して数える。未読の会話が上限（99）を超えるとき、または長い' +
+          '不在のあとの取り込みが1回に収まらないときは `capped: true`（`count` は下限。UI は「N+」）。' +
+          '一覧の `unreadCount` との差が出うるのは、編集で畳まれた返答が会話の最後のクローン側発言のとき' +
+          '（その会話を開いて既読にすれば揃う）。既読の記録が読めないときは `readStateUnreadable` が載る。',
+        responses: {
+          200: {
+            description: '未読のある会話の数。',
+            content: {
+              'application/json': { schema: resolver(unreadConversationCountResponseSchema) },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        const result = await countUnreadConversations({
+          journal: stores.journal,
+          reads: stores.conversationReads,
+          now: (deps.now ?? (() => new Date()))().toISOString(),
+        });
+        return c.json(result);
       },
     )
 
@@ -2852,9 +2908,23 @@ export function createApp(deps: AppDeps) {
         if (messages.length === 0 && reached) {
           return c.json({ error: 'not found' as const }, 404);
         }
+        const readView = await loadConversationReadView(
+          stores.conversationReads,
+          (deps.now ?? (() => new Date()))().toISOString(),
+        );
+        const readThrough = effectiveReadThrough(readView, id);
         return c.json({
           conversationId: id,
           messages,
+          readThrough,
+          // 既定ビューで見えている発言で数える（`includeSuperseded` に左右されない）。
+          unreadCount: countUnread(
+            allMessages.filter((message) => message.supersededBy === undefined),
+            readThrough,
+          ),
+          ...(readView.unreadable === undefined
+            ? {}
+            : { readStateUnreadable: readView.unreadable }),
           /** 人間との往復を何件遡ったか（`scanned` の意味は上のコメントに書いた）。 */
           scanned: entries.length,
           reachedStart: reached,
@@ -2864,6 +2934,73 @@ export function createApp(deps: AppDeps) {
            * クローンだけでなく人間の側の器も畳まれた版の存在に気づけない）。
            */
           supersededCount,
+        });
+      },
+    )
+
+    /**
+     * 会話を既読にする。**`through` は発言の id で、時刻は日誌から引く**（クライアントから
+     * 時刻を受け取らない——「いま」で既読にして、見ていない分まで既読にする誤りを構造で防ぐ）。
+     */
+    .post(
+      '/conversations/:id/read',
+      describeRoute({
+        tags: ['conversations'],
+        summary: '会話を既読にする（位置を進める）',
+        description:
+          '既読の位置（全員で1組）を、`through` で指した発言の時刻まで進める。**`through` は' +
+          '発言の id**（`GET /conversations/:id` の `messages[].id`）で、時刻はサーバが日誌から' +
+          '引く。**戻らない**——いまの位置より古い発言を指しても何も変わらず、200 でいまの' +
+          '位置を返す。発言が無い・人間との往復でないときは 404、別の会話の発言のときは 400。' +
+          '応答は進めた後の実効の位置と未読数（一覧・詳細と同じ数え方。窓は既定の `scan`）。',
+        responses: {
+          200: {
+            description: '進めた後の実効の既読の位置と未読数。',
+            content: { 'application/json': { schema: resolver(conversationReadResponseSchema) } },
+          },
+          400: {
+            description: '本文が不正、または `through` の発言がこの会話のものでない。',
+            content: { 'application/json': { schema: resolver(errorResponseSchema) } },
+          },
+          404: {
+            description: '`through` の発言が日誌に無い（人間との往復でない場合を含む）。',
+            content: { 'application/json': { schema: resolver(errorResponseSchema) } },
+          },
+        },
+      }),
+      jsonBody(conversationReadRequestSchema),
+      async (c) => {
+        const id = c.req.param('id');
+        const { through } = c.req.valid('json');
+        const target = await stores.journal.get(through);
+        if (target === null || target.type !== 'exchange' || target.with !== 'human') {
+          return c.json({ error: `発言 ${through} は見つからない` as const }, 404);
+        }
+        if (target.conversationId !== id) {
+          return c.json(
+            {
+              error: `発言 ${through} はこの会話のものではない。**既読の位置は動かしていない。**`,
+            },
+            400,
+          );
+        }
+        const now = (deps.now ?? (() => new Date()))().toISOString();
+        // 基準時刻が無ければ先に決める（位置より後に基準時刻が決まる順を作らない）。
+        await stores.conversationReads.ensureBaseline(now);
+        await stores.conversationReads.advance(id, target.at);
+        const readView = await loadConversationReadView(stores.conversationReads, now);
+        const entries = await readConversationWindow(stores.journal, {
+          scan: conversationsQuery.shape.scan.parse(undefined),
+        });
+        const readThrough = effectiveReadThrough(readView, id);
+        const visible = conversationMessages(entries, id);
+        return c.json({
+          conversationId: id,
+          readThrough,
+          unreadCount: countUnread(visible, readThrough),
+          ...(readView.unreadable === undefined
+            ? {}
+            : { readStateUnreadable: readView.unreadable }),
         });
       },
     )
