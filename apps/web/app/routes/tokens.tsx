@@ -1,4 +1,5 @@
 import { SettingsTabs } from '~/components/group-tabs';
+import { LoadError } from '~/components/load-error';
 import { settingsDocumentTitle } from '~/lib/nav';
 import { AlertTriangle } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -146,7 +147,7 @@ function AddTokenForm() {
 // ---------------------------------------------------------------------------
 
 function PoolAndSettings() {
-  const { data, error, isLoading } = useTokens();
+  const { data, error, isLoading, isValidating, mutate } = useTokens();
   // 使用量の画面（`usage.tsx`「認証トークン別」）から飛んできたときの、
   // 行き先の id（issue #2109。`packages/logic/src/tokens-links.ts` の `tokensHref`）。
   const [searchParams] = useSearchParams();
@@ -176,7 +177,12 @@ function PoolAndSettings() {
 
   return (
     <>
-      <ErrorNote error={error} />
+      <LoadError
+        what="トークンの一覧"
+        error={error}
+        onRetry={() => mutate()}
+        retrying={isValidating}
+      />
       {isLoading ? (
         <Card>
           <Spinner />
@@ -1101,7 +1107,9 @@ function describeRecoveredSource(
 }
 
 function RotationHistory() {
-  const { data, error, isLoading } = useJournal(JOURNAL_LIMIT, ['token_rotation']);
+  const { data, error, isLoading, isValidating, mutate } = useJournal(JOURNAL_LIMIT, [
+    'token_rotation',
+  ]);
   // **`GET /journal` の型はサーバ側の絞り込みを反映しない**（応答の形は全種別の
   // 合併型のまま）ので、`type` で狭めて使う。実際の絞り込みはサーバ側の
   // `?type=token_rotation` が行っている——ここでの filter は型を狭めるためで
@@ -1111,7 +1119,7 @@ function RotationHistory() {
   );
   /**
    * **取れなかったのを0件と描かない**（issue #2324）。履歴をまだ一度も読めていないまま
-   * 失敗したとき、失敗は下の `ErrorNote` が言う。再検証の失敗で `data` が残っている
+   * 失敗したとき、失敗は `LoadError` が言う。再検証の失敗で `data` が残っている
    * ときは当たらず、履歴をそのまま出す。
    */
   const listUnavailable = data === undefined && error !== undefined;
@@ -1123,7 +1131,13 @@ function RotationHistory() {
         subtitle="トークンの切り替えの記録を新しい順に表示する。出来事は省かずに全部出す"
         action={listUnavailable ? undefined : <Badge>{entries.length}</Badge>}
       />
-      <ErrorNote error={error} className="m-4" />
+      <LoadError
+        what="回転の履歴"
+        error={error}
+        onRetry={() => mutate()}
+        retrying={isValidating}
+        className="m-4"
+      />
       {isLoading ? (
         <Spinner />
       ) : listUnavailable ? null : entries.length === 0 ? (
