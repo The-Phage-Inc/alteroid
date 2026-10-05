@@ -82,6 +82,11 @@ export function startManagerPolling(options: ManagerPollerOptions): ManagerPolle
   const probe = (): Promise<void> => {
     // 重ねない。前の回がまだ生ログを読んでいる間は次を始めない。
     if (inFlight !== null) return inFlight;
+    // **退避 ref の後始末（`sweepRescueRefs()`。Issue #1266）は連鎖に繋がない。** 削除は runner へ
+    // 1本ずつ待つ（1本最大約1分）ので、GitHub 障害の初回などで連鎖に繋ぐと他の3つの関心事の
+    // 次の周期が止まる。待たずに起こし、多重起動はプール側（`#rescueSweeping`・10分の間隔）が
+    // 止める。口を持たない実装（テストの偽物）は飛ばす。失敗でデーモンを落とさない。
+    void Promise.resolve(options.managers.sweepRescueRefs?.()).catch(() => undefined);
     inFlight = options.managers
       .probeTurnEnds()
       .catch(() => undefined) // 例外でプロセスを落とさない。
