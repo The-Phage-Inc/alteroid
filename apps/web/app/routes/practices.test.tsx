@@ -188,9 +188,9 @@ describe('slug 欄の補足文', () => {
   });
 });
 
-/** 行全体をリンクにしない（#2808）。リンクは題名だけで、slug と日時の文字は `<a>` の外に在る。 */
-describe('一覧の行は題名だけがリンク', () => {
-  it('題名はリンク、slug と文字数・日時の文字はリンクの外', async () => {
+/** 行全体をリンクにしない（#2808）。リンクは題だけで、slug と文字数・日時の文字は `<a>` の外に在る。 */
+describe('一覧の行は題だけがリンク', () => {
+  it('題はリンク、slug と文字数・日時の文字はリンクの外', async () => {
     renderPractices([practice({ slug: 'daily-report', title: '日報の書き方' })]);
 
     const link = await screen.findByRole('link', { name: '日報の書き方' });
