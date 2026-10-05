@@ -144,6 +144,19 @@ export const runnerManagerStateSchema = z.object({
    * 欄付きの応答を古いデーモンが読んでも壊れない。
    */
   liveBackgroundTasks: z.number().int().nonnegative().optional(),
+  /**
+   * **このセッションの子プロセスが起動時に掴んだ認証トークンの指紋**（Issue #2877 PR2。
+   * `token_list` の `sha256` と同じ `fingerprintOf`——sha256 の先頭12桁。**値そのものは載せない**）。
+   *
+   * 読み手は `manager.ts` の `send()` で、**台帳が「繋がっていない」のに runner に旧プロセスが
+   * 生きているとき**（デーモン再起動後の done など）、その鍵が現役かを確かめる。食い違えば #2875 と
+   * 同じく畳んで起こし直す（背景処理・確認待ちが残っていれば断る）。
+   *
+   * **`undefined` は「分からない」。** 欄を持たない古い runner・まだ鍵を掴んでいないセッション。
+   * デーモンはそのとき**断らず、流して世代は書かない**（再起動後の done へ送れなくなるのは能力の
+   * 削除になる）。古いデーモンの schema は未知の欄を捨てるだけで落ちない。
+   */
+  tokenFingerprint: z.string().optional(),
 });
 
 /**
@@ -2987,6 +3000,13 @@ export interface RunnerEntry {
    */
   sessionBackgroundTasks?: Readonly<Record<string, number>>;
   /**
+   * `sessions` と同じ観測で、各委譲のセッションが起動時に掴んだ鍵の**指紋**
+   * （`RunnerManagerState.tokenFingerprint`。Issue #2877 PR2）。**欄を名乗った委譲だけが載る**——
+   * 古い runner・まだ鍵を掴んでいないセッションはキーが無い（「分からない」）。**値は持たない。**
+   * `sessionsObservedAt` と対で読むこと（最大10秒古い）。
+   */
+  sessionTokenFingerprints?: Readonly<Record<string, string>>;
+  /**
    * runner→デーモンの `/events` の脚（このデーモン自身の側の端）の状態
    * （{@link RunnerLegState}）。`entry.client.legState` の写し——**`entries()`
    * が呼ばれるたびに読み直す。** 過去の観測を保持するフィールドではないので、
@@ -3559,6 +3579,8 @@ interface RegistryEntry {
   sessionsObservedAt?: string;
   /** `RunnerEntry.sessionBackgroundTasks` の正本。`sessions` と同じ観測から書く（#2851）。 */
   sessionBackgroundTasks?: ReadonlyMap<string, number>;
+  /** `RunnerEntry.sessionTokenFingerprints` の正本。`sessions` と同じ観測から書く（#2877 PR2）。 */
+  sessionTokenFingerprints?: ReadonlyMap<string, string>;
   /**
    * `list()` の探りがいま飛んでいるか。**周期より遅い応答を積み上げない**ための
    * 錠で、`true` の間はこの entry へ次の探りを投げない（`#probeSessions`）。
@@ -3727,6 +3749,9 @@ class Registry implements RunnerRegistry {
       ...(entry.sessionBackgroundTasks === undefined || entry.sessionsObservedAt === undefined
         ? {}
         : { sessionBackgroundTasks: Object.fromEntries(entry.sessionBackgroundTasks) }),
+      ...(entry.sessionTokenFingerprints === undefined || entry.sessionsObservedAt === undefined
+        ? {}
+        : { sessionTokenFingerprints: Object.fromEntries(entry.sessionTokenFingerprints) }),
       // runner→デーモンの脚の状態。**`entry.client` からその場で読む——
       // 保存も間引きもしない**（`RunnerEntry.legState` の doc）。`client` が
       // 無い、または `legState` を持たない実装では出ない。
@@ -4285,6 +4310,7 @@ class Registry implements RunnerRegistry {
       if (identity?.managers === 0) {
         entry.sessions = new Set();
         entry.sessionBackgroundTasks = new Map();
+        entry.sessionTokenFingerprints = new Map();
         entry.sessionsObservedAt = new Date(at).toISOString();
         return;
       }
@@ -4338,6 +4364,11 @@ class Registry implements RunnerRegistry {
           state.liveBackgroundTasks === undefined
             ? []
             : [[state.managerId, state.liveBackgroundTasks]],
+        ),
+      );
+      entry.sessionTokenFingerprints = new Map(
+        states.flatMap((state): [string, string][] =>
+          state.tokenFingerprint === undefined ? [] : [[state.managerId, state.tokenFingerprint]],
         ),
       );
       entry.sessionsObservedAt = new Date(at).toISOString();
