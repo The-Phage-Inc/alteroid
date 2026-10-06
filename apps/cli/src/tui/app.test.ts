@@ -1005,7 +1005,49 @@ describe('承認待ち（一覧と詳細・答える）', () => {
     await press(h.stdin, DOWN);
     await press(h.stdin, ENTER);
     await waitFor(() => h.frame().includes('二行目の説明'));
+    // 未回答から開いた詳細の案内は今までどおり
+    expect(h.frame()).toContain('Esc 一覧へ');
   }
+
+  it('d で回答済み: 決着した日 → その日の件 → 詳細 → Esc でその日へ → Esc で日付へ → Esc で未回答へ（#3340）', async () => {
+    const h = start((api) => {
+      fixture(api);
+      const done = approvalRow('ap-done', {
+        question: '夜のリリースを待つか',
+        answeredAt: '2026-09-30T10:00:00.000Z',
+        answer: '待たない',
+      });
+      const gone = approvalRow('ap-gone', {
+        question: '取り下げた確認',
+        withdrawnAt: '2026-09-30T05:00:00.000Z',
+        withdrawnReason: '自分で見つけた',
+      });
+      api.answeredDateRows = [{ date: '2026-09-30', count: 2 }];
+      api.answeredOnRows = { '2026-09-30': [done, gone] };
+      api.approvalRows = [...api.approvalRows, done, gone];
+    });
+    await openList(h);
+    await press(h.stdin, 'd');
+    await waitFor(() => h.frame().includes('2026-09-30  2 件'));
+    expect(h.frame()).toContain('決着した日 1 日');
+    await press(h.stdin, ENTER);
+    await waitFor(() => h.frame().includes('ap-gone'));
+    const frame = h.frame();
+    expect(frame).toContain('回答済み');
+    expect(frame).toContain('回答: 待たない');
+    expect(frame).toContain('取り下げた理由: 自分で見つけた');
+    await press(h.stdin, ENTER);
+    await waitFor(() => h.frame().includes('[回答済み] ap-done'));
+    // フッタの案内も、Esc の戻り先（その日）に合わせる
+    expect(h.frame()).toContain('Esc その日へ');
+    expect(h.frame()).not.toContain('Esc 一覧へ');
+    h.stdin.write(ESC);
+    await waitFor(() => h.frame().includes('2026-09-30 に決着した承認'));
+    h.stdin.write(ESC);
+    await waitFor(() => h.frame().includes('2026-09-30  2 件'));
+    h.stdin.write(ESC);
+    await waitFor(() => h.frame().includes('承認待ち（未回答 2 件'));
+  });
 
   it('一覧は古い順に 1 件 1 行。設問が在れば要約、無ければ質問の抜粋。全文や設問の中身は載せない', async () => {
     const h = start(fixture);
