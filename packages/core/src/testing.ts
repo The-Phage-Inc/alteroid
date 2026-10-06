@@ -1,3 +1,4 @@
+import { MemoryAttachmentStore } from './attachment-memory.js';
 import {
   classifyArchiveContinuity,
   fingerprintArchiveBody,
@@ -2070,6 +2071,7 @@ export function createMemoryStores(): Stores {
     conversationReads,
     tokens,
     usage,
+    attachments: new MemoryAttachmentStore(),
   };
 }
 
