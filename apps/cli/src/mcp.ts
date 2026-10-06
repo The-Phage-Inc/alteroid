@@ -1,7 +1,8 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { stdin, stdout } from 'node:process';
+import { stdin } from 'node:process';
+import { stdout } from './terminal-out.js';
 
 import { maskUrl } from '@alteroid/core/mask-url';
 import { hasMcpPushProblem } from '@alteroid/logic';
@@ -118,10 +119,10 @@ export async function mcpShowCommand(options: { reveal?: boolean } = {}): Promis
   const target = await resolveTarget();
   const view = await read(target);
   if (options.reveal === true) {
-    stdout.write(`${JSON.stringify({ mcpServers: view.mcpServers }, null, 2)}\n`);
+    stdout.writeRaw(`${JSON.stringify({ mcpServers: view.mcpServers }, null, 2)}\n`);
     return;
   }
-  stdout.write(`${JSON.stringify({ mcpServers: maskMcpServers(view.mcpServers) }, null, 2)}\n`);
+  stdout.writeRaw(`${JSON.stringify({ mcpServers: maskMcpServers(view.mcpServers) }, null, 2)}\n`);
   stdout.write(
     '（env / headers / args の値と URL のクエリ・認証情報は伏せました。' +
       '全部見るには: alteroid mcp show --reveal）\n',
