@@ -17063,7 +17063,7 @@
                                   "minutes": {
                                     "type": "integer",
                                     "minimum": 1,
-                                    "maximum": 9007199254740991
+                                    "maximum": 525600
                                   }
                                 },
                                 "required": ["type", "minutes"]
@@ -17219,7 +17219,7 @@
                           "minutes": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": 9007199254740991
+                            "maximum": 525600
                           }
                         },
                         "required": ["type", "minutes"]
