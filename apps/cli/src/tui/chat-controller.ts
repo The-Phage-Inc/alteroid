@@ -20,6 +20,7 @@ import {
   AttachmentDraft,
   AttachmentMissingError,
   attachmentLinesOf,
+  interpretAttachPath,
   describeAttachment,
   expireUploads,
   type DraftFile,
@@ -119,7 +120,7 @@ export class ChatController {
 
   /** `/attach <path>`。 */
   async attach(args: string): Promise<void> {
-    const path = args.trim().replace(/^(['"])(.*)\1$/, '$2');
+    const path = interpretAttachPath(args);
     if (path === '') {
       this.addSystem('使い方: /attach <path>');
       return;
