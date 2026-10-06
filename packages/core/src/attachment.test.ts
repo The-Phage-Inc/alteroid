@@ -162,6 +162,8 @@ describe('添付: ファイル名', () => {
 
 describe('添付: インメモリ実装の契約', () => {
   it('verifyAttachmentStoreContract を通る', async () => {
-    await verifyAttachmentStoreContract(createMemoryStores().attachments);
+    await verifyAttachmentStoreContract(createMemoryStores().attachments, {
+      createStore: (options) => new MemoryAttachmentStore(options),
+    });
   });
 });
