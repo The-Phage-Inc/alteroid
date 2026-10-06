@@ -5299,13 +5299,12 @@ export function createApp(deps: AppDeps) {
           if (localDayRange(answeredOn) === null) {
             return c.json({ error: 'answeredOn は YYYY-MM-DD で指定する' as const }, 400);
           }
-          const settled = await stores.jobs.listApprovals({ pendingOnly: false });
-          const onDay = approvalsSettledOn(
-            conversationId === undefined
-              ? settled.entries
-              : settled.entries.filter((approval) => approval.conversationId === conversationId),
-            answeredOn,
-          );
+          // 会話の絞りはここでもストアに渡す（#3290）。
+          const settled = await stores.jobs.listApprovals({
+            pendingOnly: false,
+            ...(conversationId === undefined ? {} : { conversationId }),
+          });
+          const onDay = approvalsSettledOn(settled.entries, answeredOn);
           // `unreadable` は載せない: 読めない行は決着の日時も分からず、どの日にも置けない
           // （未回答の画面が言う）。
           return c.json(
@@ -5318,16 +5317,16 @@ export function createApp(deps: AppDeps) {
           );
         }
 
-        const approvalList = await stores.jobs.listApprovals({ pendingOnly: pending !== 'false' });
-        const byPending = approvalList.entries;
-        // **`conversationId` は `pending` の直後、`total` を数える前に当てる。**
-        // `total` は「この呼びが対象にしている集合」の件数であって、絞り込みを
-        // 当てる前の全件ではない——`pending` が既にそうしている（未回答のみに
-        // 絞ってから数える）のと同じ順序に揃える。
-        const approvals =
-          conversationId === undefined
-            ? byPending
-            : byPending.filter((approval) => approval.conversationId === conversationId);
+        // **`conversationId` の絞りはストアに渡す**（issue #3290。全件を取ってメモリで
+        // 絞ると、会話を開くたびの費用が承認の総数に比例する）。`pending` の直後、
+        // `total` を数える前に当たる——`total` は「この呼びが対象にしている集合」の件数で
+        // あって、絞り込みを当てる前の全件ではない（`pending` が既にそうしている）。
+        // `unreadable` は会話で絞られない（`JobStore.listApprovals` の doc）。
+        const approvalList = await stores.jobs.listApprovals({
+          pendingOnly: pending !== 'false',
+          ...(conversationId === undefined ? {} : { conversationId }),
+        });
+        const approvals = approvalList.entries;
         // **`total` は `limit` / `cursor` を当てる前の件数。** opt-in していない
         // ときは応答に載せないので、ここで数えておくだけで並べ替えは行わない。
         const total = approvals.length;
