@@ -275,6 +275,13 @@ export interface FindGitDirsResult {
    * 載っているときだけ載る。
    */
   readonly unreadableDirSample?: string;
+  /**
+   * 深さ上限に当たって**降りなかった**子ディレクトリの数とサンプル（`reportDepthLimit: true` を
+   * 渡したときだけ載る。既存の呼び出し元は渡さず、挙動は変わらない）。この下に `.git` が在るかは
+   * 分からない——片付け（`scratch-sweep.ts`）は「判定できない」として残す。
+   */
+  readonly depthLimitedCount?: number;
+  readonly depthLimitedSample?: string;
 }
 
 /**
@@ -297,7 +304,12 @@ export interface FindGitDirsResult {
  */
 export async function findGitDirs(
   root: string,
-  options: { maxDepth?: number; maxCount?: number; readdirFn?: ReaddirFn } = {},
+  options: {
+    maxDepth?: number;
+    maxCount?: number;
+    readdirFn?: ReaddirFn;
+    reportDepthLimit?: boolean;
+  } = {},
 ): Promise<FindGitDirsResult> {
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   const maxCount = options.maxCount ?? DEFAULT_MAX_WORKTREES;
@@ -307,6 +319,8 @@ export async function findGitDirs(
   let rootUnreadable: string | undefined;
   let unreadableDirCount = 0;
   let unreadableDirSample: string | undefined;
+  let depthLimitedCount = 0;
+  let depthLimitedSample: string | undefined;
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (truncated) return;
@@ -344,7 +358,13 @@ export async function findGitDirs(
       }
       if (entry.isDirectory()) subdirs.push(entry.name);
     }
-    if (depth >= maxDepth) return;
+    if (depth >= maxDepth) {
+      if (options.reportDepthLimit === true && subdirs.length > 0) {
+        depthLimitedCount += subdirs.length;
+        depthLimitedSample ??= path.join(dir, subdirs[0] ?? '');
+      }
+      return;
+    }
     for (const name of subdirs) {
       if (truncated) return;
       await walk(path.join(dir, name), depth + 1);
@@ -357,6 +377,7 @@ export async function findGitDirs(
     paths: found,
     ...(truncated ? { truncatedAtCount: maxCount } : {}),
     ...(unreadableDirCount > 0 ? { unreadableDirCount, unreadableDirSample } : {}),
+    ...(depthLimitedCount > 0 ? { depthLimitedCount, depthLimitedSample } : {}),
   };
 }
 
@@ -385,6 +406,14 @@ export function matchesManagerScratchDirName(name: string, managerId: string): b
   const hex = match[1];
   if (hex === undefined) return false;
   return managerId.startsWith(`mgr-${hex}`);
+}
+
+/**
+ * 名前が「マネージャーの作業場」の規則（`mgr-<hex 4桁以上>…`）に当たるか。特定の
+ * 委譲 id を問わない版（`/tmp` の片付け `scratch-sweep.ts` が候補を選ぶのに使う）。
+ */
+export function isManagerScratchDirName(name: string): boolean {
+  return MANAGER_SCRATCH_DIR_NAME_PATTERN.test(name);
 }
 
 /** {@link findManagerScratchRoots} の戻り値。 */
@@ -529,14 +558,14 @@ async function findGitDirsAcrossRoots(
   };
 }
 
-interface GitRunResult {
+export interface GitRunResult {
   readonly stdout: string;
   readonly exitCode: number | null;
   readonly timedOut: boolean;
 }
 
 /** `git` を1回、期限つきで起こして出力を集める。例外は投げない。 */
-async function runGit(
+export async function runGit(
   spawnFn: ProcessSpawnFn,
   args: string[],
   cwd: string,
