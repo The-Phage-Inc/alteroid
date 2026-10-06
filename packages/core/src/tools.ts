@@ -164,8 +164,8 @@ import {
   resolveMemoryDocKind,
   scanMemorySections,
 } from './memory.js';
-import type { MemoryPart, MemorySection, MemorySectionLookup } from './memory.js';
 import { stripNul } from './nul-guard.js';
+import type { MemoryPart, MemorySection, MemorySectionLookup } from './memory.js';
 import { redactProfileFailure } from './profile.js';
 import { renderAccountList } from './account-list.js';
 import { renderPermissionGrantList } from './permission-grant-list.js';
@@ -8551,7 +8551,10 @@ export function createCloneTools(context: ToolContext) {
       async ({ body, source }) => {
         // **issue #1752（#1651/#1689/#1720 の揃え漏れ。非数値の欄。issue 本文の
         // 再現テスト対象）。**
-        const bodyError = describeStringLengthViolation('body', body, { min: 1 });
+        // **NUL を落とした後の値で検める**（Issue #3388）。台帳の入口は本文から NUL を落として
+        // 残す（`nul-guard.ts`）ので、生の値で数えると NUL だけの本文が通り、空の本文になる。
+        // 落とした後に本文が残るなら、今までどおり通す（保存するのは落とす前の値のまま）。
+        const bodyError = describeStringLengthViolation('body', stripNul(body), { min: 1 });
         if (bodyError !== null) return text(bodyError);
         const entry = {
           id: randomUUID(),
@@ -8840,7 +8843,10 @@ export function createCloneTools(context: ToolContext) {
       },
       async ({ id, body }) => {
         // **issue #1752（#1651/#1689/#1720 の揃え漏れ。非数値の欄）。**
-        const bodyError = describeStringLengthViolation('body', body, { min: 1 });
+        // **NUL を落とした後の値で検める**（Issue #3388）。台帳の入口は本文から NUL を落として
+        // 残す（`nul-guard.ts`）ので、生の値で数えると NUL だけの本文が通り、空の本文になる。
+        // 落とした後に本文が残るなら、今までどおり通す（保存するのは落とす前の値のまま）。
+        const bodyError = describeStringLengthViolation('body', stripNul(body), { min: 1 });
         if (bodyError !== null) return text(bodyError);
         // **読めない行は本文の書き直しを通さず「名乗る」だけにとどめる**
         // （issue #2148 の決定 (2)(3)）。読める本文が無い以上、書き直した後に
