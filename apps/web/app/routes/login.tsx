@@ -22,7 +22,24 @@ import {
   startLogin,
   type ClaimOutcome,
 } from '@alteroid/swr';
-import { readPendingLogin, storePendingLogin } from '@alteroid/logic';
+import { readPendingLogin, storePendingLogin, type PendingLogin } from '@alteroid/logic';
+
+/** 小さい補足の文字（この画面で繰り返す class）。 */
+const NOTE = 'text-xs text-muted-foreground';
+
+/** 画面の見出し（タブの題と同じ文言）。 */
+function Heading({ children }: { children: string }) {
+  return (
+    <>
+      <DocumentTitle>{children}</DocumentTitle>
+      <h1 className="text-sm font-semibold">{children}</h1>
+    </>
+  );
+}
+
+function Code({ children }: { children: React.ReactNode }) {
+  return <code className="font-mono">{children}</code>;
+}
 
 export default function Login() {
   const auth = useAuth();
@@ -53,8 +70,7 @@ export default function Login() {
   if (auth.error !== undefined && auth.status === 'checking') {
     return (
       <Shell>
-        <DocumentTitle>接続先のサーバに繋がらない</DocumentTitle>
-        <h1 className="text-sm font-semibold">接続先のサーバに繋がらない</h1>
+        <Heading>接続先のサーバに繋がらない</Heading>
         <LoadError
           what="接続先のサーバの状態"
           error={auth.error}
@@ -102,9 +118,7 @@ function Shell({ children }: { children: React.ReactNode }) {
       <div className="w-full max-w-md">
         <div className="mb-6 text-center">
           <p className="font-mono text-lg font-semibold tracking-tight">alteroid</p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            クローンの様子を見て、指示を出し、記憶を直す
-          </p>
+          <p className={`mt-1 ${NOTE}`}>クローンの様子を見て、指示を出し、記憶を直す</p>
         </div>
         <Card className="p-5">{children}</Card>
         <div className="mt-4">
@@ -161,6 +175,17 @@ function SignIn({ notice }: { notice: React.ReactNode }) {
     abortRef.current = undefined;
   }, []);
 
+  /** 引き取りを待って結末を反映する。**やめた（中断した）後に届いた結果は反映しない。** */
+  const settle = useCallback(
+    (pending: PendingLogin, controller: AbortController) =>
+      claimUntilReady(client, pending, { signal: controller.signal })
+        .then((outcome) => (controller.signal.aborted ? undefined : applyOutcome(outcome)))
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) fail(error);
+        }),
+    [client, applyOutcome, fail],
+  );
+
   /**
    * 戻ってきたら引き取りを続ける。
    *
@@ -172,44 +197,50 @@ function SignIn({ notice }: { notice: React.ReactNode }) {
     if (resumed === null) return;
     const controller = new AbortController();
     abortRef.current = controller;
-    claimUntilReady(client, resumed, { signal: controller.signal }).then(applyOutcome).catch(fail);
+    void settle(resumed, controller);
     return () => controller.abort();
-  }, [resumed, client, applyOutcome, fail]);
+  }, [resumed, settle]);
+
+  /**
+   * 待ちをやめる。中断し、待ちの記録も消して、ボタンを押せる状態へ戻す
+   * （読み直しで再開した待ちも同じ）。
+   */
+  function cancel() {
+    abortRef.current?.abort();
+    abortRef.current = undefined;
+    storePendingLogin(null);
+    setBusy(false);
+    setManualUrl(undefined);
+  }
 
   async function begin(provider: string) {
     setBusy(true);
     setFailure(undefined);
     setManualUrl(undefined);
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const started = await startLogin(client, provider);
+      if (controller.signal.aborted) {
+        // 始める要求の最中にやめた。`startLogin` が控えた記録を残さない。
+        storePendingLogin(null);
+        return;
+      }
       const popup = openAuthorization(started.authorizationUrl);
       // 塞がれたら黙って失敗させない。人間が自分で開けるようにする。
       if (popup === null) setManualUrl(started.authorizationUrl);
 
-      const controller = new AbortController();
-      abortRef.current = controller;
-      const outcome = await claimUntilReady(
-        client,
-        {
-          requestId: started.requestId,
-          claimSecret: started.claimSecret,
-          expiresAt: started.expiresAt,
-          provider,
-        },
-        { signal: controller.signal },
-      );
-      await applyOutcome(outcome);
+      await settle({ ...started, provider }, controller);
     } catch (error) {
-      fail(error);
+      if (!controller.signal.aborted) fail(error);
     }
   }
 
   return (
     <Shell>
       {notice}
-      <DocumentTitle>ログイン</DocumentTitle>
-      <h1 className="text-sm font-semibold">ログイン</h1>
-      <p className="mt-1 text-xs text-muted-foreground">
+      <Heading>ログイン</Heading>
+      <p className={`mt-1 ${NOTE}`}>
         接続先: <span className="font-mono">{baseUrl}</span>
       </p>
 
@@ -220,9 +251,9 @@ function SignIn({ notice }: { notice: React.ReactNode }) {
           <p className="mb-1.5 font-medium text-foreground">ログイン手段が設定されていない</p>
           <p>
             接続先のサーバは認証を要求しているが、ログインできるプロバイダが1つも登録されていない。
-            サーバ側に <code className="font-mono">ALTEROID_GOOGLE_CLIENT_ID</code> と{' '}
-            <code className="font-mono">ALTEROID_GOOGLE_CLIENT_SECRET</code>{' '}
-            を設定するか、認証を切る（<code className="font-mono">ALTEROID_AUTH=off</code>）。
+            サーバ側に <Code>ALTEROID_GOOGLE_CLIENT_ID</Code> と{' '}
+            <Code>ALTEROID_GOOGLE_CLIENT_SECRET</Code> を設定するか、認証を切る（
+            <Code>ALTEROID_AUTH=off</Code>）。
           </p>
         </div>
       ) : (
@@ -242,10 +273,13 @@ function SignIn({ notice }: { notice: React.ReactNode }) {
       )}
 
       {busy && (
-        <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+        <div className={`mt-3 flex items-center gap-2 ${NOTE}`}>
           <Badge tone="accent">待機中</Badge>
-          別ウィンドウで認証を終えると、この画面が自動で進む
-        </p>
+          <span className="min-w-0 flex-1">別ウィンドウで認証を終えると、この画面が自動で進む</span>
+          <Button size="sm" onClick={cancel}>
+            やめる
+          </Button>
+        </div>
       )}
 
       {manualUrl !== undefined && (
@@ -263,8 +297,8 @@ function SignIn({ notice }: { notice: React.ReactNode }) {
       <p className="mt-4 border-t border-border pt-3 text-[11px] leading-relaxed text-muted-foreground">
         ログインしただけでは使えない。
         <strong className="text-foreground">使う許可は人間が CLI から与える</strong>（
-        <code className="font-mono">alteroid access grant &lt;id&gt;</code>）。 端末から使うだけなら{' '}
-        <code className="font-mono">alteroid login</code> でも同じ。
+        <Code>alteroid access grant &lt;id&gt;</Code>）。 端末から使うだけなら{' '}
+        <Code>alteroid login</Code> でも同じ。
       </p>
     </Shell>
   );
@@ -297,8 +331,7 @@ function Ungranted({ notice }: { notice: React.ReactNode }) {
   return (
     <Shell>
       {notice}
-      <DocumentTitle>まだ使う許可が無い</DocumentTitle>
-      <h1 className="text-sm font-semibold">まだ使う許可が無い</h1>
+      <Heading>まだ使う許可が無い</Heading>
       {/*
           **「単一の持ち主のもの」と書かないこと。** 2026-09-09 のオーナー決定で
           許可できるアカウントの数に上限が無くなったので、その文言は嘘になる。
@@ -327,7 +360,7 @@ function Ungranted({ notice }: { notice: React.ReactNode }) {
         ]}
       />
 
-      <p className="mt-3 text-xs text-muted-foreground">接続先のサーバと同じ環境で次を実行する:</p>
+      <p className={`mt-3 ${NOTE}`}>接続先のサーバと同じ環境で次を実行する:</p>
       <Input readOnly value={command} className="mt-1.5 font-mono text-xs" />
 
       <div className="mt-4 flex items-center gap-2">
