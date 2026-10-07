@@ -804,6 +804,7 @@ export {
   type RunnerManagerEntry,
   type RunnerOverview,
   type RunnerPushHealth,
+  type RunnerManagerPeers,
   type RunnerPushOutcome,
   resolveWorkspacePolicy,
   type WorkerToolEvent,
@@ -1133,6 +1134,9 @@ export {
   runnerProfileResultSchema,
   runnerAttachmentSchema,
   RUNNER_CAPABILITY_MANAGER_ATTACHMENTS,
+  RUNNER_CAPABILITY_MANAGER_PEERS,
+  runnerManagerPeerSchema,
+  type RunnerManagerPeer,
   runnerResumeCommandSchema,
   runnerSessionOpenResultSchema,
   runnerSetCredentialsCommandSchema,
@@ -1317,9 +1321,14 @@ export {
 } from './retired-provider-env.js';
 export {
   MANAGER_PEERS_ENV_KEY,
+  MANAGER_PEER_CODEX_MODELS_ENV_KEY,
   isPeerAllowed,
+  managerPeerModelsEnvKey,
+  parsePeerModels,
   parsePeers,
+  resolvePeerModels,
   resolvePeers,
+  type PeerModelsResolution,
   type PeersResolution,
 } from './agent-provider-peers.js';
 /** `type: 'exchange'` の本文が持つ種類の接頭辞（issue #1332）。本文の先頭に固定の印を置き、前方一致で復元する（`exchange-kind.ts` の doc）。 */
@@ -1469,6 +1478,10 @@ export {
   PEER_MCP_SERVER_NAME,
   PEER_SYSTEM_PROMPT_APPEND,
   PEER_TOOL_NAMES,
+  PEER_APPROVAL_DECISIONS,
+  type PeerApprovalDecision,
+  type PeerApprovalRecord,
+  type PeerPendingApproval,
   type PeerBroker,
   type PeerBrokerDeps,
   type PeerTurnResult,
@@ -1631,3 +1644,8 @@ export {
   ManagerAttachmentsRefusedError,
   type LoadedManagerAttachments,
 } from './manager-attachments.js';
+export {
+  describeManagerPeers,
+  peerProviderLabel,
+  type ManagerPeersView,
+} from './manager-peers-format.js';
