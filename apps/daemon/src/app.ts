@@ -108,6 +108,7 @@ import {
   noteDroppedRecord,
   reasonOf,
   redactErrorText,
+  managerModelsOf,
   readConversationPage,
   readConversationWindow,
   decodeConversationCursor,
@@ -368,6 +369,10 @@ export interface AppDeps {
    * GitHub の書き込み権が並ぶ（railway/README.md「daemon 側には置かない」）。
    */
   runners?: RunnerRegistry;
+  /**
+   * クローン層のモデルの表記（`self.models.clone`）。無ければ地図に欄を載せない（＝不明）。
+   */
+  cloneModel?: string;
   /**
    * 日誌の追記を購読する口（`GET /journal/stream`）。
    *
@@ -1725,6 +1730,8 @@ function managerView(managers: ManagerPool, summary: ManagerSummary) {
   return {
     ...summary,
     ...(denials.length === 0 ? {} : { denials }),
+    // 取れなければ欄ごと載せない（クローンの道具と同じ読み方。既定の帯で埋めない）。
+    ...managerModelsOf(managers, summary),
   };
 }
 
@@ -2555,6 +2562,8 @@ export function createApp(deps: AppDeps) {
     unreadableJobs: () => stores.jobs.listUnreadableJobs(),
     activity: topologyActivity,
     storage: topologyStorage,
+    modelsOf: (summary) => managerModelsOf(clone.managers, summary),
+    ...(deps.cloneModel === undefined ? {} : { cloneModel: deps.cloneModel }),
   });
   const topologyTickMs = deps.topologyTickMs ?? 2000;
   const topologyDebounceMs = deps.topologyDebounceMs ?? 200;

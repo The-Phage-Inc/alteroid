@@ -846,6 +846,7 @@ export {
   type RunnerHostOptions,
   type RunnerPeerOptions,
 } from './runner.js';
+export { managerModelsOf, type ManagerModels } from './manager-models.js';
 export { createLocalRunner, type LocalRunnerOptions } from './runner-local.js';
 /**
  * マネージャーの道具の鍵。**器を作り直さずに回せる形**で持つ（`credentials.ts`）。
