@@ -1141,6 +1141,9 @@ export {
   runnerSessionOpenResultSchema,
   runnerSetCredentialsCommandSchema,
   runnerSetMcpServersCommandSchema,
+  runnerSetCodexAuthCommandSchema,
+  runnerTakeCodexAuthWriteBackCommandSchema,
+  runnerCodexAuthWriteBackSchema,
   runnerSetProfileCommandSchema,
   runnerStartCommandSchema,
   runnerWaitingSchema,
@@ -1506,6 +1509,25 @@ export {
   verifyCredentialVaultContract,
 } from './credential-contract.js';
 export { verifyTokenPoolContract } from './token-pool-contract.js';
+/** Codex の ChatGPT ログインの正本の約束（#3939）。3実装が呼ぶ。 */
+export { verifyCodexChatgptAuthContract } from './codex-chatgpt-auth-contract.js';
+/** Codex の ChatGPT ログイン（#3939）。正本の形・状態・デバイスコードのログイン。 */
+export * from './codex-chatgpt-auth.js';
+export {
+  createCodexChatgptAuthService,
+  type CodexChatgptAuthService,
+  type CodexChatgptAuthServiceOptions,
+  type CodexLoginView,
+} from './codex-chatgpt-auth-service.js';
+export { RunnerCodexAuthUnsupportedError } from './runner-protocol.js';
+export {
+  CODEX_DEVICE_LOGIN_TIMEOUT_MS,
+  startCodexDeviceLogin,
+  type CodexDeviceLogin,
+  type CodexDeviceLoginOptions,
+  type CodexDeviceLoginOutcome,
+  type CodexDeviceLoginStarted,
+} from './codex-device-login.js';
 /** 消費の台帳の入口の NUL の扱い（issue #2927。鍵列も断らず落として残す。teto の判断、2026-10-05）。 */
 export {
   USAGE_NUL_ONLY_TOKEN_ID,
