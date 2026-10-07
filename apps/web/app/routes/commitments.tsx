@@ -1144,6 +1144,8 @@ function OpenRow({ commitment }: { commitment: Commitment }) {
   // 「N分前」を分の時計で動かす（#3748。刻みは全行で1本）。
   const now = useMinuteNow();
   const [reason, setReason] = useState('');
+  // 片付けた理由の書きかけも離れる前の確認へ知らせる（#3750）。本文の編集（`commitment.id`）とは別の id。
+  useReportDirty(`close-reason:${commitment.id}`, reason.trim() !== '');
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<unknown>(undefined);
   /*
