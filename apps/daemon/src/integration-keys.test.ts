@@ -35,6 +35,10 @@ function fakeClone(): CloneHost {
       posted.push(event);
       return 'conversation-1';
     },
+    postPersisted: async (event: InboxEvent) => {
+      posted.push(event);
+      return 'persisted' as const;
+    },
     subscribe: () => () => undefined,
     stop: () => Promise.resolve(),
     // `GET /topology` が読む分（#3676 の稼働状況の図の歯）。

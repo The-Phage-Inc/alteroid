@@ -1544,6 +1544,26 @@ function integrationKeyEventResponses() {
 }
 
 /**
+ * 受信箱へ永続化できなかったときの断り（`POST /events` と `POST /events/:source`。#3679）。
+ * **受信箱のメモリにも積んでいない**ので、同じイベントを送り直してよい（二重には届かない）。
+ * 他の 503 と同じく `Retry-After` は付けない（器の瞬断で、待ち時間の目安を持たない）。
+ */
+function eventNotPersistedResponse() {
+  return {
+    description:
+      '受信箱へ永続化できなかった（器への書き込みが、拾い直しの後も失敗した）。**イベントは受け付けていない** — ' +
+      '受信箱のメモリにも積んでいないので、送り直してよい（二重には届かない）。',
+    content: { 'application/json': { schema: resolver(errorResponseSchema) } },
+  } as const;
+}
+
+function eventNotPersistedBody() {
+  return {
+    error: '受信箱へ書けなかったので、イベントを受け付けていない（送り直してよい）' as const,
+  };
+}
+
+/**
  * 本文検査が無い POST（`deliberateClient` のみ）に共通の 415 応答。
  *
  * **関数にしてあるのは意図的。** `app.ts` と `openapi.ts` は互いを import する
@@ -3203,6 +3223,10 @@ export function createApp(deps: AppDeps) {
         summary: 'クローンと話す（SSE）',
         description:
           '人間の発言をクローンの受信箱へ積み、クローンの応答を SSE で流す。' +
+          '**⚠️ `open`（200）は「受け付けた」であって、受信箱（器）への永続化の完了ではない。** ' +
+          '発言は `open` を書く前にクローンへ渡すが、器への書き込みは待たない（失敗しても応答は成功のままで、' +
+          '失敗は stderr にだけ残る。書けなかった発言はこのプロセスが生きているあいだは配達されるが、' +
+          '再起動・デプロイを挟むと失われる）。永続化できたときだけ成功を返す口は `POST /events`・`POST /events/:source`。' +
           '**SSE。** `event:` にイベント名（`open` / `queued` / `text` / `thinking` / `tool` / ' +
           '`ask_human` / `done` / `error`）、`data:` に対応する JSON が入る。`data:` の ' +
           '形は下記スキーマ（`open` は `{conversationId, clientMessageId?}`（重複の再送のときは `duplicate: true` も）で別枠、他は ' +
@@ -6498,9 +6522,11 @@ export function createApp(deps: AppDeps) {
           '人間・operator は `POST /chat` と同じ規則（上げた主体は問わない）。結び付いた添付は別のイベント・会話へ使い回せない。',
         responses: {
           200: {
-            description: '受信箱へ積んだ。',
+            description:
+              '受信箱へ**永続化できた**（器へ書けてから返す。以後は配達される）。**この応答を受けたら送り直さない**（二重に届く）。',
             content: { 'application/json': { schema: resolver(eventAcceptedResponseSchema) } },
           },
+          503: eventNotPersistedResponse(),
           403: {
             description:
               '連携の鍵の source と、本文の source が違う（連携の鍵でだけ起きる。人間・operator は任意の source を名乗れる）。',
@@ -6530,7 +6556,8 @@ export function createApp(deps: AppDeps) {
         const attached = await bindEventAttachments(attachmentIds, id, principal);
         if (!attached.ok) return c.json(attached.body, attached.status);
         const at = new Date().toISOString();
-        clone.post({
+        // **受信箱へ永続化できたときだけ 200 を返す**（#3679）。書けなかったら 503 で、受信箱のメモリにも積まない。
+        const outcome = await clone.postPersisted({
           type: 'external',
           id,
           at,
@@ -6541,6 +6568,7 @@ export function createApp(deps: AppDeps) {
             : {}),
           ...(attached.refs.length === 0 ? {} : { attachments: attached.refs }),
         });
+        if (outcome === 'unavailable') return c.json(eventNotPersistedBody(), 503);
         // 稼働の地図の「外部サービス → クローン」を、受け付けた時刻で光らせる（#3676。
         // 日誌の external_event はクローンが取り出した時刻なので使わない。`topology-activity.ts` の冒頭）。
         if (principal.kind === 'integration') {
@@ -6580,9 +6608,11 @@ export function createApp(deps: AppDeps) {
         ),
         responses: {
           200: {
-            description: '受信箱へ積んだ。',
+            description:
+              '受信箱へ**永続化できた**（器へ書けてから返す。以後は配達される）。**この応答を受けたら送り直さない**（二重に届く）。',
             content: { 'application/json': { schema: resolver(eventAcceptedResponseSchema) } },
           },
+          503: eventNotPersistedResponse(),
           403: {
             description:
               '連携の鍵の source と、パスの source が違う（連携の鍵でだけ起きる。人間・operator は任意の source を名乗れる）。',
@@ -6626,7 +6656,8 @@ export function createApp(deps: AppDeps) {
         const attached = await bindEventAttachments(attachmentIds, id, principal);
         if (!attached.ok) return c.json(attached.body, attached.status);
         const at = new Date().toISOString();
-        clone.post({
+        // **受信箱へ永続化できたときだけ 200 を返す**（#3679）。書けなかったら 503 で、受信箱のメモリにも積まない。
+        const outcome = await clone.postPersisted({
           type: 'external',
           id,
           at,
@@ -6637,6 +6668,7 @@ export function createApp(deps: AppDeps) {
             : {}),
           ...(attached.refs.length === 0 ? {} : { attachments: attached.refs }),
         });
+        if (outcome === 'unavailable') return c.json(eventNotPersistedBody(), 503);
         // `POST /events` と同じ（#3676）。
         if (principal.kind === 'integration') {
           topologyActivity.recordExternal({
