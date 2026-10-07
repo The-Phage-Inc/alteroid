@@ -967,6 +967,17 @@ export {
   type PluginSummary,
   type StoredPlugin,
 } from './plugins.js';
+export {
+  extractedPluginDirName,
+  extractPluginsForScopes,
+  PLUGIN_SCOPES_FOR_CLONE,
+  pruneExtractedPluginsAgainstStore,
+  type ExtractForScopesResult,
+  type PluginExtractFailure,
+  type PluginScope,
+  type PrunePluginsResult,
+  type RemovedItem,
+} from './plugin-extract.js';
 /**
  * MCP の登録を置いて runner へ配る1本道（#325 段3。`profile-service.ts` の写し）。
  */

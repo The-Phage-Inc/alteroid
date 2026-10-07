@@ -95,6 +95,7 @@ import {
   createTokenSpread,
 } from './token-spread.js';
 import { resolvePort } from './port.js';
+import { pruneExtractedPluginsOnBoot } from './plugin-prune.js';
 import { openStorage } from './storage.js';
 
 export { createApp, parseAllowedOrigins, type AppDeps, type AppType } from './app.js';
@@ -435,6 +436,7 @@ export async function main(): Promise<void> {
   await migrateEnvBaseCredentialsOnce(stores, bootEnvSnapshot);
   const localRunnerEnv: NodeJS.ProcessEnv = { ...bootEnvSnapshot };
   await applyAppScopedEnvVars(stores, process.env, localRunnerEnv);
+  await pruneExtractedPluginsOnBoot({ root: paths.root, store: stores.plugins });
 
   const workspace = process.env.ALTEROID_WORKSPACE || process.cwd();
 
