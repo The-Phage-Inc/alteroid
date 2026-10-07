@@ -1,5 +1,10 @@
 import type { Options, Query, SDKMessage, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
+import { chmodSync, lstatSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { makeTempDirSync } from '../../../vitest.tmpdir.js';
 
 import { createManagerPool, type ManagerPool } from './manager.js';
 import { createPluginDistributionService } from './plugin-distribution-service.js';
@@ -76,16 +81,53 @@ interface Setup {
   runner: RunnerClient;
   pool: ManagerPool;
   service: ReturnType<typeof createPluginDistributionService>;
+  /** 走っている展開の完了と、その後の promise の連鎖を待つ。 */
+  settle: () => Promise<void>;
 }
+
+const pluginBases: string[] = [];
+
+/** 展開先は読み取り専用（0o555）なので、掃除が消せるように書込み可へ戻す。 */
+function makeWritableSync(dir: string): void {
+  const info = lstatSync(dir, { throwIfNoEntry: false });
+  if (info === undefined || !info.isDirectory()) return;
+  chmodSync(dir, 0o700);
+  for (const name of readdirSync(dir)) makeWritableSync(join(dir, name));
+}
+
+afterEach(() => {
+  for (const base of pluginBases.splice(0)) makeWritableSync(base);
+});
 
 function setup(): Setup {
   const stores = createMemoryStores();
+  const pluginsBase = makeTempDirSync('alteroid-plugin-distribution-');
+  pluginBases.push(pluginsBase);
   const runner = createLocalRunner({
     runnerId: 'runner-test',
+    pluginsRoot: join(pluginsBase, 'alteroid-plugins'),
     workspacePath: '/work/project',
     queryFn: fakeSdk(),
     env: { PATH: '/usr/bin' },
   });
+  // 展開は実ファイル I/O で、偽の時計では進まない。完了の promise を握って、時間ではなく完了を待つ。
+  const pending = new Set<Promise<unknown>>();
+  const realSetPlugin = runner.setPlugin?.bind(runner);
+  if (realSetPlugin !== undefined) {
+    runner.setPlugin = (plugin) => {
+      const p = realSetPlugin(plugin);
+      pending.add(p);
+      return p;
+    };
+  }
+  const settle = async (): Promise<void> => {
+    await flushMicrotasks();
+    while (pending.size > 0) {
+      await Promise.allSettled([...pending]);
+      pending.clear();
+      await flushMicrotasks();
+    }
+  };
   const registry = createRunnerRegistry([runner]);
   const service = createPluginDistributionService({ stores, runners: registry });
   const pool = createManagerPool({
@@ -94,7 +136,7 @@ function setup(): Setup {
     runners: registry,
     plugins: service,
   });
-  return { stores, runner, pool, service };
+  return { stores, runner, pool, service, settle };
 }
 
 describe('plugin を配る（apply / syncRunner）', () => {
@@ -438,6 +480,7 @@ describe('plugin の降ろし直しと挑み直し（名乗り）', () => {
 
     broken = false;
     await vi.advanceTimersByTimeAsync(10_000);
+    await s.settle();
     expect(s.pool.pushHealthOf('runner-test')?.plugins?.status).toBe('ok');
     expect((await s.runner.plugins?.())?.plugins.map((p) => p.name)).toEqual(['p-all']);
     await s.pool.stop();
@@ -491,6 +534,7 @@ describe('plugin の降ろし直しと挑み直し（名乗り）', () => {
 
     broken = false;
     await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await s.settle();
     expect(s.pool.pushHealthOf('runner-test')?.plugins?.status).toBe('ok');
     await s.pool.stop();
   });
