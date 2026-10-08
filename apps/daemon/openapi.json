@@ -1987,6 +1987,10 @@
                           "text": {
                             "type": "string"
                           },
+                          "delivery": {
+                            "type": "string",
+                            "enum": ["withdrawn"]
+                          },
                           "supersedes": {
                             "type": "string"
                           },
@@ -2478,6 +2482,9 @@
                           }
                         },
                         "clientMessageId": {
+                          "type": "string"
+                        },
+                        "withdrawnClientMessageId": {
                           "type": "string"
                         },
                         "turnFailure": {
@@ -7301,6 +7308,9 @@
                               "clientMessageId": {
                                 "type": "string"
                               },
+                              "withdrawnClientMessageId": {
+                                "type": "string"
+                              },
                               "turnFailure": {
                                 "type": "string",
                                 "enum": ["failed", "held"]
@@ -8851,6 +8861,9 @@
                           }
                         },
                         "clientMessageId": {
+                          "type": "string"
+                        },
+                        "withdrawnClientMessageId": {
                           "type": "string"
                         },
                         "turnFailure": {
@@ -12597,6 +12610,9 @@
                                 "clientMessageId": {
                                   "type": "string"
                                 },
+                                "withdrawnClientMessageId": {
+                                  "type": "string"
+                                },
                                 "turnFailure": {
                                   "type": "string",
                                   "enum": ["failed", "held"]
@@ -14018,6 +14034,9 @@
                                   }
                                 },
                                 "clientMessageId": {
+                                  "type": "string"
+                                },
+                                "withdrawnClientMessageId": {
                                   "type": "string"
                                 },
                                 "turnFailure": {
@@ -15443,6 +15462,9 @@
                               "clientMessageId": {
                                 "type": "string"
                               },
+                              "withdrawnClientMessageId": {
+                                "type": "string"
+                              },
                               "turnFailure": {
                                 "type": "string",
                                 "enum": ["failed", "held"]
@@ -16852,6 +16874,9 @@
                                 }
                               },
                               "clientMessageId": {
+                                "type": "string"
+                              },
+                              "withdrawnClientMessageId": {
                                 "type": "string"
                               },
                               "turnFailure": {
