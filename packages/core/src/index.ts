@@ -1772,6 +1772,7 @@ export {
   attachmentCopiesDir,
   fetchAttachmentCopy,
   pruneAttachmentCopies,
+  removeAttachmentCopy,
   type AttachmentCopy,
   type AttachmentFetchResult,
 } from './attachment-fetch.js';
