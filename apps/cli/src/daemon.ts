@@ -116,9 +116,16 @@ function daemonEntrypoint(): string {
   return fileURLToPath(import.meta.resolve('@alteroid/daemon'));
 }
 
-export async function start(): Promise<DaemonRuntimeInfo> {
+// 呼び出し側が「起こした」と「既に居た」を言い分けられるように、どちらかを返す
+export type StartOutcome =
+  | { kind: 'already-present'; info: DaemonRuntimeInfo }
+  | { kind: 'started'; info: DaemonRuntimeInfo };
+
+export async function start(): Promise<StartOutcome> {
   const current = await status();
-  if (current.presence === 'present' && current.info) return current.info;
+  if (current.presence === 'present' && current.info) {
+    return { kind: 'already-present', info: current.info };
+  }
   if (current.presence === 'unknown') {
     // 2本目を起こさない: 確かめられなかっただけで生きているかもしれず、ポート衝突や記憶ストアへの二重書き込みになるため
     throw new Error(
@@ -143,7 +150,7 @@ export async function start(): Promise<DaemonRuntimeInfo> {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     await sleep(250);
     const next = await status();
-    if (next.presence === 'present' && next.info) return next.info;
+    if (next.presence === 'present' && next.info) return { kind: 'started', info: next.info };
   }
   throw new Error(`デーモンの起動を確認できませんでした（ログ: ${logPath}）`);
 }
@@ -223,7 +230,7 @@ export async function ensureRunning(): Promise<DaemonRuntimeInfo> {
   const current = await status();
   if (current.presence === 'present' && current.info) return current.info;
   // `startWithRecovery()` を呼ばない: 回復は人間が明示のフラグを付けたときだけ起きる操作で、毎回通るこの経路の既定にしてはいけないため
-  return start();
+  return (await start()).info;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -277,7 +284,7 @@ export async function startWithRecovery(): Promise<StartWithRecoveryOutcome> {
     return { kind: 'already-present', info: current.info };
   }
   if (current.presence === 'absent') {
-    return { kind: 'started', info: await start() };
+    return start();
   }
   if (!current.info) {
     throw new Error('内部エラー: unknown と判定されたのに状態ファイルを読めていません');
@@ -285,6 +292,6 @@ export async function startWithRecovery(): Promise<StartWithRecoveryOutcome> {
   const previousPid = current.info.pid;
   const previousPidAlive = pidAppearsAlive(previousPid);
   const quarantinedTo = await quarantineRuntimeFile();
-  const info = await start();
+  const { info } = await start();
   return { kind: 'recovered', info, quarantinedTo, previousPid, previousPidAlive };
 }
