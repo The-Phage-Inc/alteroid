@@ -1,4 +1,5 @@
 // SWR のキーは文字列ではなくオブジェクトにする: 連結の順番や区切りで衝突しうるうえ、`mutate` 側でも同じ形で指すため
+import { useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 
 import { ApiError, unwrap, useApi } from '../api';
@@ -505,12 +506,33 @@ export function useConversation(
 
 export function useApprovalById(id: string | null) {
   const api = useApi();
-  return useSWR(id === null ? null : KEY.approvalById(id), async ({ byId }) => {
-    const result = await api.api.GET('/approvals/{id}', { params: { path: { id: byId } } });
-    // 404 だけを `null` にし、それ以外の失敗は投げる: 「無い」と「確かめられなかった」を取り違えないため
-    if (result.response.status === 404) return null;
-    return unwrap(result);
-  });
+  // この mount の最初の取り直しが済んだ id: キャッシュに前に開いたときの「未回答」が残っていても、
+  // 呼び出し側が済むまで信用しないで済むようにする（`isValidating` だけだと最初の描画で false のことがある）
+  const [revalidatedId, setRevalidatedId] = useState<string | null>(null);
+  const sawValidating = useRef(false);
+  const swr = useSWR(
+    id === null ? null : KEY.approvalById(id),
+    async ({ byId }) => {
+      const result = await api.api.GET('/approvals/{id}', { params: { path: { id: byId } } });
+      // 404 だけを `null` にし、それ以外の失敗は投げる: 「無い」と「確かめられなかった」を取り違えないため
+      if (result.response.status === 404) return null;
+      return unwrap(result);
+    },
+    {
+      // 開くたびに必ず取り直す: 別の経路（チャット・CLI・別タブ）で答えられていても古い値のままにしない
+      revalidateOnMount: true,
+      onSuccess: () => setRevalidatedId(id),
+      onError: () => setRevalidatedId(id),
+    },
+  );
+  const { isValidating } = swr;
+  // 取り直しが他の呼び出しと重なって自分の onSuccess が呼ばれない場合に備え、「検証中を見たあと止まった」でも済みとする
+  useEffect(() => {
+    if (id === null) return;
+    if (isValidating) sawValidating.current = true;
+    else if (sawValidating.current) setRevalidatedId(id);
+  }, [id, isValidating]);
+  return { ...swr, revalidated: id !== null && revalidatedId === id };
 }
 
 export function useApprovalTrace(id: string | null) {
