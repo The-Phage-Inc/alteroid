@@ -346,8 +346,8 @@ function Runners() {
                 <Profile runner={runner} />
               </div>
               <PushHealth runner={runner} />
-              {runner.runnerId === undefined || runner.state === 'vacating' ? null : (
-                <VacateRunner runnerId={runner.runnerId} />
+              {runner.runnerId === undefined ? null : (
+                <VacateRunner runnerId={runner.runnerId} vacating={runner.state === 'vacating'} />
               )}
             </li>
           ))}
@@ -359,7 +359,8 @@ function Runners() {
 
 // 1回目の押下では叩かず確認を挟む: 空けると載っている委譲が他の器へ移り、走っているマネージャーを動かす操作のため
 // 叩いた後も「空き終わった」とは言わない: 応答は立てたことの確認だけのため
-function VacateRunner({ runnerId }: { runnerId: string }) {
+// 移している最中でも外さず、ボタンだけ引っ込める: 一覧の取り直しで外すと、押した結果（握手を飛ばした警告）が見えないまま消えるため
+function VacateRunner({ runnerId, vacating }: { runnerId: string; vacating: boolean }) {
   const vacate = useVacateRunner();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -369,13 +370,14 @@ function VacateRunner({ runnerId }: { runnerId: string }) {
   if (done !== null) {
     return (
       <p className="mt-2 text-[11px] break-words text-muted-foreground">
-        仕事を他へ移す指示を出した。まだ終わってはいない——この実行環境で動いている委譲は他の実行環境へ移る。進み具合はこの一覧の状態で見える。
         {done.skipped === null
-          ? ''
-          : ` ⚠️ 動いている委譲への引き継ぎの連絡は飛ばした（${done.skipped}）。もう一度指示すると連絡をやり直す（この一覧は移している最中の実行環境には押すボタンを出さないので、コマンドラインから指示し直す）。`}
+          ? '仕事を他へ移す指示を出した。まだ終わってはいない——この実行環境で動いている委譲は他の実行環境へ移る。進み具合はこの一覧の状態で見える。'
+          : // 握手を飛ばした回は成功の文を出さない: 委譲を移していないのに「移る」と読めてしまうため（CLI の `runners vacate` と同じ言い方）
+            `仕事を他へ移す指示は立てたが、握手は飛ばした（委譲はまだ移していない）。 ⚠️ 動いている委譲への引き継ぎの連絡は飛ばした（${done.skipped}）。もう一度指示すると連絡をやり直す（この一覧は移している最中の実行環境には押すボタンを出さないので、コマンドラインから指示し直す）。`}
       </p>
     );
   }
+  if (vacating) return null;
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5">
       {confirming ? (
