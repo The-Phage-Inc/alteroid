@@ -7,6 +7,7 @@ import {
   ATTACHMENT_EMPTY_MESSAGE,
   ATTACHMENT_FROM_CLASSES,
   AttachmentRejectedError,
+  attachmentTooLargeMessage,
   classifyAttachmentFrom,
   DEFAULT_ATTACHMENT_LIMITS,
   type AttachmentFromClass,
@@ -144,7 +145,7 @@ export class AttachmentDraft {
     if (info.size > max) {
       return {
         ok: false,
-        reason: `大きすぎる: ${name} は ${info.size} バイト（1 つ ${max} バイトまで）`,
+        reason: `${name}: ${attachmentTooLargeMessage(isAttachmentImageMediaType(mediaType) ? 'image' : 'file', info.size, max)}`,
       };
     }
     try {
