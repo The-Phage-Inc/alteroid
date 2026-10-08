@@ -172,6 +172,9 @@ export interface CloneHost {
 
   endConversation(conversationId: string): Promise<void>;
 
+  // 削除した会話（#4218）をメモリから落とす。省略可能にする: 実装していない器では、削除の結果が「進行中の購読と途中経過を落とせなかった」と言う（黙って落としたことにしない）
+  forgetConversation?(conversationId: string): void;
+
   answerApproval(
     approvalId: string,
     answer: string,

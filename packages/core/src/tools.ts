@@ -9764,6 +9764,11 @@ function renderJournalEntry(
           }
         : { head, body: `取れなかった: ${entry.result.reason}\n${scope}` };
     }
+    case 'conversation_deleted':
+      return {
+        head: '[conversation_deleted]',
+        body: `会話 ${entry.deletedConversationId} を削除した（${entry.hiddenCount} 件。${entry.deletedBy}）`,
+      };
   }
 }
 

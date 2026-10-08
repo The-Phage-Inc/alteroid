@@ -4,6 +4,7 @@ import {
   createRunnerRegistry,
   scanJournalPages,
   verifyCommitmentEditIfMatchContract,
+  verifyCommitmentRemoveForConversationContract,
   verifyCommitmentEditUnreadableContract,
   verifyCommitmentFoldContract,
   verifyCommitmentTieOrderContract,
@@ -15,6 +16,7 @@ import {
   verifyJournalStoreUnreadableGetContract,
   UnreadableJournalEntryError,
   verifyJournalStoreSearchContract,
+  verifyJournalStoreDeletedConversationContract,
   verifyJournalStoreWithContract,
   verifyPermissionGrantStoreContract,
   verifyPracticeStoreContract,
@@ -439,6 +441,12 @@ describe('PgJournalStore', () => {
     });
   });
 
+  describe('墓標の契約（issue #4218）', () => {
+    it('墓標の後は list/listPage/get/q/with から外れる／別の会話と墓標は外れない／limit より前に効く／墓標の後の行も外れる', async () => {
+      await verifyJournalStoreDeletedConversationContract(stores.journal);
+    });
+  });
+
   /**
    * `JournalStore` の `with` 絞りの契約（issue #418）を、**pg 実装
    * （PGlite = インプロセスの実 PostgreSQL）**に対して測る。同じ形の歯が
@@ -513,6 +521,10 @@ describe('PgJournalStore', () => {
 
     it('editBody の ifMatch の契約（#3786。3実装で同じことを測る）', async () => {
       await verifyCommitmentEditIfMatchContract(stores.commitments);
+    });
+
+    it('removeForConversation の契約（#4218。3実装で同じことを測る。human かつ source 一致の行だけを未了・片付いたとも物理的に消す）', async () => {
+      await verifyCommitmentRemoveForConversationContract(stores.commitments);
     });
 
     it('読めない行への editBody の契約（#4064。fs と pg で同じことを測る。インメモリは読めない行を持てない）', async () => {
