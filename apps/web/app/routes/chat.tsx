@@ -1736,10 +1736,12 @@ export function ChatPane({
     };
     const dropTransients = (previous: Line[]) =>
       previous.filter((line) => !(line.transient === true && line.of === stream.id));
+    // 書き先の key は呼んだ時点で取る: 更新関数の中で replyKey を読むと、同じ塊で届いた tool が先に endReply して前の行の末尾が落ち、日誌の本文と食い違った行が末尾に居座る
     const append = (chunk: string) => {
       if (!writable()) return;
+      const key = replyKey;
       setLines((previous) => {
-        const index = previous.findIndex((line) => line.key === replyKey);
+        const index = previous.findIndex((line) => line.key === key);
         if (index === -1) return previous;
         const next = [...previous];
         const current = next[index];
