@@ -24,6 +24,7 @@ import type {
   RunnerRescueRefDeleteResult,
   RunnerSetCredentialsCommand,
   RunnerAttachment,
+  RunnerStagedAttachmentMeta,
   RunnerStartCommand,
   UnpushedWorkResult,
 } from './runner-protocol.js';
@@ -48,6 +49,7 @@ export interface LocalRunnerOptions {
   /** ローカルでも渡す: コンテナ構成でだけ `.zprofile` が効く形にしない（M4 受け入れ基準1）。 */
   profile?: ProfileVessel;
   attachmentsRoot?: string;
+  attachmentStageLimit?: number;
   pluginsRoot?: string;
   outboxRoot?: string;
   outboxStagedRoot?: string;
@@ -83,6 +85,9 @@ class LocalRunner implements RunnerClient {
       ...(options.attachmentsRoot === undefined
         ? {}
         : { attachmentsRoot: options.attachmentsRoot }),
+      ...(options.attachmentStageLimit === undefined
+        ? {}
+        : { attachmentStageLimit: options.attachmentStageLimit }),
       ...(options.pluginsRoot === undefined ? {} : { pluginsRoot: options.pluginsRoot }),
       ...(options.outboxRoot === undefined ? {} : { outboxRoot: options.outboxRoot }),
       ...(options.outboxStagedRoot === undefined
@@ -106,6 +111,7 @@ class LocalRunner implements RunnerClient {
       type: 'hello',
       runnerId: this.runnerId,
       capabilities: [...RUNNER_CAPABILITIES],
+      attachmentStageLimit: this.#host.attachmentStageLimit,
     });
     while (this.#queue.length > 0) {
       const event = this.#queue.shift();
@@ -156,6 +162,14 @@ class LocalRunner implements RunnerClient {
 
   async transcript(managerId: string): Promise<string | null> {
     return this.#host.transcript(managerId);
+  }
+
+  async stageAttachment(
+    managerId: string,
+    meta: RunnerStagedAttachmentMeta,
+    body: AsyncIterable<Uint8Array>,
+  ): Promise<void> {
+    await this.#host.stageAttachment(managerId, meta, body);
   }
 
   async openOutboxFile(

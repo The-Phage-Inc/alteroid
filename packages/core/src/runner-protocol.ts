@@ -93,15 +93,22 @@ export type RunnerLease = z.infer<typeof runnerLeaseSchema>;
  * runner が取りに行く別ルートは作らない: 中身（`data`）を命令の本文に base64 で載せる。
  * runner は記憶ストアの鍵もファイルシステムの共有も持たず、同じ要求で運べば最初のターンとの競りも起きないため。
  * `id` / `name` はパスの部品になるので、スキーマは形だけを見て、置く側が検める。
+ * 大きいファイル（#4128 段3a）は `data` を載せず `staged: true` だけにする: 中身はデーモンが先に別口
+ * （`PUT /managers/:id/attachments/:attachmentId`）へ押して置かせるため。`staged` は `manager-attachments-stage` を名乗る runner にだけ送る。
  */
-export const runnerAttachmentSchema = z.object({
-  id: z.string().min(1),
-  name: z.string(),
-  mediaType: z.string(),
-  size: z.number().int().nonnegative(),
-  sha256: z.string().min(1),
-  data: z.string(),
-});
+export const runnerAttachmentSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string(),
+    mediaType: z.string(),
+    size: z.number().int().nonnegative(),
+    sha256: z.string().min(1),
+    data: z.string().optional(),
+    staged: z.literal(true).optional(),
+  })
+  .refine((item) => (item.data === undefined) !== (item.staged === undefined), {
+    message: '`data` と `staged` はちょうど一方',
+  });
 
 export type RunnerAttachment = z.infer<typeof runnerAttachmentSchema>;
 
@@ -479,6 +486,9 @@ export const RUNNER_CAPABILITY_AWAITING_BACKGROUND_SIGNAL = 'awaiting-background
 
 export const RUNNER_CAPABILITY_MANAGER_ATTACHMENTS = 'manager-attachments';
 
+/** これを名乗らない器へ `staged` の添付を送らない（`data` が必須の旧い runner は命令ごと 400 で断る。#4128 段3a）。 */
+export const RUNNER_CAPABILITY_MANAGER_ATTACHMENTS_STAGE = 'manager-attachments-stage';
+
 /** これを名乗らない器の報告に `files` が無いことを「成果物が無い」と読まない（旧い runner は出し箱を知らない）。 */
 export const RUNNER_CAPABILITY_MANAGER_OUTBOX = 'manager-outbox';
 
@@ -490,6 +500,7 @@ export const RUNNER_CAPABILITY_MANAGER_PEERS = 'manager-peers';
 export const RUNNER_CAPABILITIES: readonly string[] = [
   RUNNER_CAPABILITY_AWAITING_BACKGROUND_SIGNAL,
   RUNNER_CAPABILITY_MANAGER_ATTACHMENTS,
+  RUNNER_CAPABILITY_MANAGER_ATTACHMENTS_STAGE,
   RUNNER_CAPABILITY_MANAGER_OUTBOX,
   RUNNER_CAPABILITY_MANAGER_PEERS,
 ];
@@ -636,6 +647,8 @@ export const runnerEventSchema = z.discriminatedUnion('type', [
     workerModel: z.string().optional(),
     /** 器ごとの事実を名乗らせる（デーモンの設定と二重管理にしない）。無ければデーモン側の既定値で検める。 */
     attachmentBodyLimit: z.number().int().positive().optional(),
+    /** 無い（旧い版）なら別口を持たないので、デーモンは大きいファイルを送らずに断る（#4128 段3a）。 */
+    attachmentStageLimit: z.number().int().positive().optional(),
     /** 開いている peer が無い器は送らない。hello の後に開閉が変われば `manager_peers` で名乗り直す。 */
     managerPeers: z.array(runnerManagerPeerSchema).optional(),
     managerPeersClosed: z.array(runnerManagerPeerClosedSchema).optional(),
@@ -1219,6 +1232,14 @@ export function assertNeverRunnerLegStatus(status: never): never {
   throw new Error(`未知の RunnerLegState.status: ${String(status)}`);
 }
 
+export interface RunnerStagedAttachmentMeta {
+  readonly id: string;
+  readonly name: string;
+  readonly mediaType: string;
+  readonly size: number;
+  readonly sha256: string;
+}
+
 /** `size` は runner の自己申告（応答の `content-length`）で、信じきらない。 */
 export interface RunnerOutboxContent {
   /** 無ければ自己申告が無い（読み手は `body` を数えて上限で打ち切る）。 */
@@ -1333,6 +1354,16 @@ export interface RunnerClient {
   deleteOutboxFile?(
     managerId: string,
     fileId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<void>;
+  /**
+   * 置けなかったら投げる: 呼び手は理由つきで命令を送らずに断る（#4128 段3a）。押す向きだけで、runner から取りに行く経路は作らない。
+   * 省略した実装へは、呼び手が大きいファイルを送らずに断る。
+   */
+  stageAttachment?(
+    managerId: string,
+    meta: RunnerStagedAttachmentMeta,
+    body: AsyncIterable<Uint8Array>,
     options?: { signal?: AbortSignal },
   ): Promise<void>;
   /**
