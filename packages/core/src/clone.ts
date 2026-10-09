@@ -119,6 +119,7 @@ import {
 } from './dropped-record.js';
 import type {
   AnswerApprovalVia,
+  ClonePluginLoadObservation,
   CloneHost,
   InterruptOutcome,
   InterruptTarget,
@@ -156,6 +157,7 @@ import type { McpServerService } from './mcp-server-service.js';
 import type { McpServers } from './mcp-servers.js';
 import type { PluginDistributionService } from './plugin-distribution-service.js';
 import { PLUGIN_SCOPES_FOR_CLONE, extractPluginsForScopes } from './plugin-extract.js';
+import { describePluginLoadForJournal } from './plugin-load-journal.js';
 import { summarizeRemovedForJournal } from './plugin-removed-summary.js';
 import type { ProfileService } from './profile-service.js';
 import { createRecentMap } from './recent.js';
@@ -696,6 +698,8 @@ class Clone implements CloneHost {
   readonly #cwd: string | undefined;
   /** 前回日誌へ書いた plugin の一覧の指紋（`#plugins`）。空は ''。 */
   #lastPluginsDigest = '';
+  /** 前回日誌へ書いた、init の plugin の読み込み結果の指紋（`#apply` の `session_started`）。 */
+  #lastPluginLoadDigest: string | null = null;
   readonly #sessionStore: SessionStore | undefined;
   // `cwd` から計算し直さない: SDK の sanitize（200 文字超は切って djb2 のハッシュを足す）の再実装は静かにずれるため
   #projectKey: string | null = null;
@@ -729,6 +733,8 @@ class Clone implements CloneHost {
   #observedPermissionMode: string | null = null;
   // `null`（init 未観測）と `[]`（SDK が0本と報告）を畳まない: `self.ts` 側で区別する手段が無くなるため
   #mcpServersInfo: Array<{ name: string; status: string }> | null = null;
+  // `null` は「観測していない」（init に `plugins` が無いときも前の観測を残さず `null` へ戻す）。`at` は init を受けた時刻（#3816）
+  #pluginLoadInfo: ClonePluginLoadObservation | null = null;
   // ここで `getContextUsage()` を呼ばない: `detail: 'full'` は token-count API を呼ぶので、`turn_ended` が既に呼んだ戻り値を代入するだけにするため
   #lastContextUsage: ContextUsageObservation | null = null;
   // 無制限には覚えない: 長く走る1本のセッションでメモリが伸び続けるため。忘れたら `onForget` で日誌へ残す（忘れた id が `permission_denials` に再び載ると同じ拒否が二重に載る）
@@ -1176,6 +1182,10 @@ class Clone implements CloneHost {
       previousSessionId,
       ...(runningManagers === undefined ? {} : { runningManagers }),
     };
+  }
+
+  pluginLoad(): ClonePluginLoadObservation | undefined {
+    return this.#pluginLoadInfo ?? undefined;
   }
 
   /** デーモンの HTTP 層から一覧・生ログへ降りるための口。 */
@@ -6040,6 +6050,8 @@ class Clone implements CloneHost {
     // 観測していない」であって「0本と観測した」ではない（#324）。`[]` に戻すと
     // 次の init が届くまでの窓で「0本」と嘘をつく。
     this.#mcpServersInfo = null;
+    // 前のセッションの plugin の読み込み結果を、次のセッションの結果として見せない（`mcpServers` と同じ理由）
+    this.#pluginLoadInfo = null;
     this.#sdkSession.setSdkSessionId(null);
     this.#lastContextUsage = null;
   }
@@ -6062,6 +6074,11 @@ class Clone implements CloneHost {
     this.#apiKeySource = facts.apiKeySource;
     this.#observedPermissionMode = facts.permissionMode;
     this.#mcpServersInfo = facts.mcpServers;
+    // 読めなかった init では控えない（`null` に戻す）: 前の結果を、今回の結果として見せないため
+    this.#pluginLoadInfo =
+      facts.pluginLoad === null
+        ? null
+        : { at: new Date().toISOString(), pluginLoad: facts.pluginLoad };
   }
 
   /**
@@ -7582,6 +7599,19 @@ class Clone implements CloneHost {
           noteCloneSessionIdNotRecorded(error);
         });
         this.#captureInitFacts(event.runtime);
+        // 届いたかの確認（#3815）: init の plugins / plugin_errors を、前回と変わったときだけ日誌へ残す（`#plugins` と同じ形）。init に欄が無いときは書かない（観測していない）
+        if (event.runtime.pluginLoad !== null) {
+          const described = describePluginLoadForJournal(event.runtime.pluginLoad);
+          if (described.digest !== this.#lastPluginLoadDigest) {
+            this.#lastPluginLoadDigest = described.digest;
+            await this.#journal({
+              type: 'exchange',
+              with: 'self',
+              role: 'outbound',
+              text: `${EXCHANGE_KIND_DECISION_PREFIX}${described.text}`,
+            });
+          }
+        }
         // 人間の操作で開き直した後の最初の init なら、古い id → 新しい id を日誌に残す。
         const reopened = this.#distillMemory.takeReopenInit();
         if (reopened !== null) {
