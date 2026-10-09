@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import {
+  ATTACHMENT_REQUEST_TIMEOUT_MS,
   AttachmentRejectedError,
   attachmentBatchItemOf,
   attachmentMaxBytes,
@@ -39,6 +40,31 @@ import type { AttachmentRef } from './schema.js';
 export const OUTBOX_FETCH_FILE_TIMEOUT_MS = 30_000;
 /** 1回の報告ぶんの取り出し全体にかける時間の既定。超えた分は「受け取れなかった（時間切れ）」にして報告を先へ進める。 */
 export const OUTBOX_FETCH_TOTAL_TIMEOUT_MS = 90_000;
+/** 大きさに応じて延ばす期限の、見込む転送速度（バイト/秒。1 MiB/s）。 */
+const OUTBOX_FETCH_ASSUMED_BYTES_PER_SECOND = 1024 * 1024;
+
+/**
+ * 1つのファイルを取る（または別口へ押す）時間の期限（ms）。大きさに応じて延ばす（#4128 段3b）:
+ * `max(既定 30 秒, size / (1 MiB/s))`。30 MiB までは既定の 30 秒のまま（小さいファイルの期限を変えない）。
+ * 上限は {@link ATTACHMENT_REQUEST_TIMEOUT_MS}（1時間。runner 側の1リクエストの持ち時間）。2 GiB は 2048 秒（約34分）。
+ */
+export function outboxFetchDeadlineMs(size: number): number {
+  const scaled = Math.ceil((Math.max(0, size) / OUTBOX_FETCH_ASSUMED_BYTES_PER_SECOND) * 1000);
+  return Math.min(ATTACHMENT_REQUEST_TIMEOUT_MS, Math.max(OUTBOX_FETCH_FILE_TIMEOUT_MS, scaled));
+}
+
+/**
+ * 1回の報告ぶんの取り出し全体の期限（ms）。既定の 90 秒に、各ファイルの期限が既定の 30 秒を超えて延びた分を足す
+ * （小さいファイルだけの報告は 90 秒のまま。大きいファイルの分だけ延びる）。上限は1時間。
+ */
+export function outboxFetchTotalDeadlineMs(fileDeadlinesMs: readonly number[]): number {
+  const extension = fileDeadlinesMs.reduce(
+    (acc, ms) => acc + Math.max(0, ms - OUTBOX_FETCH_FILE_TIMEOUT_MS),
+    0,
+  );
+  return Math.min(ATTACHMENT_REQUEST_TIMEOUT_MS, OUTBOX_FETCH_TOTAL_TIMEOUT_MS + extension);
+}
+
 /** 退避先を消させる呼び出し1回の時間。 */
 export const OUTBOX_DELETE_TIMEOUT_MS = 5_000;
 
@@ -101,10 +127,13 @@ export async function fetchManagerOutbox(
     return { attachments, rejected };
   }
 
-  const fileTimeoutMs = input.fileTimeoutMs ?? OUTBOX_FETCH_FILE_TIMEOUT_MS;
-  const totalTimeoutMs = input.totalTimeoutMs ?? OUTBOX_FETCH_TOTAL_TIMEOUT_MS;
+  // 注入（試験用）があればそれを優先する。無ければ大きさに応じて延ばす
+  const fileTimeoutOf = (file: RunnerOutboxFile): number =>
+    input.fileTimeoutMs ?? outboxFetchDeadlineMs(file.size);
+  const totalTimeoutMs =
+    input.totalTimeoutMs ?? outboxFetchTotalDeadlineMs(input.files.map(fileTimeoutOf));
   const totalSignal = AbortSignal.timeout(totalTimeoutMs);
-  const placed: RunnerOutboxFile[] = [];
+  const toRemove: RunnerOutboxFile[] = [];
   const acceptedItems: AttachmentBatchItem[] = [];
 
   for (const file of input.files) {
@@ -135,6 +164,7 @@ export async function fetchManagerOutbox(
       });
       continue;
     }
+    const fileTimeoutMs = fileTimeoutOf(file);
     const signal = AbortSignal.any([totalSignal, AbortSignal.timeout(fileTimeoutMs)]);
     const outcome = await fetchOne({
       open,
@@ -153,18 +183,21 @@ export async function fetchManagerOutbox(
     });
     if (outcome.ok) {
       attachments.push(outcome.ref);
-      placed.push(file);
+      toRemove.push(file);
       acceptedItems.push(attachmentBatchItemOf(outcome.ref));
     } else {
       rejected.push({ name, reason: outcome.reason });
+      // 大きさで断ったもの（二度と取りに行かない）も消させる: 外部ストレージの無いデーモンが断る大きいファイルを、
+      // runner の退避先に24時間の掃除まで溜めないため（#4128 段3b）
+      if (outcome.neverFetch === true) toRemove.push(file);
     }
   }
 
-  // 置けたものだけ、退避先を消させる。失敗は握る（取りこぼしは runner の24時間の掃除が消す）。報告は止めない。
+  // 置けたもの（と、二度と取りに行かないもの）の退避先を消させる。失敗は握る（取りこぼしは runner の24時間の掃除が消す）。報告は止めない。
   const remove = runner.deleteOutboxFile?.bind(runner);
-  if (remove !== undefined && placed.length > 0) {
+  if (remove !== undefined && toRemove.length > 0) {
     await Promise.allSettled(
-      placed.map((file) =>
+      toRemove.map((file) =>
         remove(input.managerId, file.fileId, {
           signal: AbortSignal.timeout(OUTBOX_DELETE_TIMEOUT_MS),
         }),
@@ -174,7 +207,8 @@ export async function fetchManagerOutbox(
   return { attachments, rejected };
 }
 
-type FetchOneOutcome = { ok: true; ref: AttachmentRef } | { ok: false; reason: string };
+type FetchOneOutcome =
+  { ok: true; ref: AttachmentRef } | { ok: false; reason: string; neverFetch?: true };
 
 async function fetchOne(input: {
   open: NonNullable<RunnerClient['openOutboxFile']>;
@@ -194,6 +228,7 @@ async function fetchOne(input: {
     return {
       ok: false,
       reason: `1つの上限（${fileMax} バイト）を超える（申告 ${file.size} バイト）ので取りに行かなかった`,
+      neverFetch: true,
     };
   }
   // 画像（宣言）は先頭の検めと入れ直しに中身が要るので、これまでどおり集めて入れる。それ以外は置き場へ流す（#4128 段1）
