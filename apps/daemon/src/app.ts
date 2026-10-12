@@ -73,6 +73,8 @@ import {
   JournalAnchorNotFoundError,
   ProfileInputError,
   ProfileRollbackFailedError,
+  ProfileVersionMismatchError,
+  profileEntryVersionOf,
   redactProfileFailure,
   TokenPoolInputError,
   TokenPoolVersionMismatchError,
@@ -314,6 +316,7 @@ import {
   pluginRemoveResponseSchema,
   pluginsListResponseSchema,
   profileEntryUpdateRequestSchema,
+  profileConflictResponseSchema,
   profileErrorResponseSchema,
   profileResponseSchema,
   profileUpdateRequestSchema,
@@ -1248,6 +1251,7 @@ function describeProfileEntries(entries: readonly EnvProfileEntry[]) {
       ...entry,
       sha256: fingerprintOf(entry.script),
       bytes: Buffer.byteLength(entry.script),
+      version: profileEntryVersionOf(entry),
     })),
     ...composedFingerprints(entries),
     script: all,
@@ -1269,14 +1273,20 @@ async function mutateProfile(
   | { ok: true; body: ReturnType<typeof profileUpdateResponseSchema.parse> }
   | {
       ok: false;
+      status: 400;
       body: {
         error: string;
         detail: string;
       };
     }
+  | {
+      ok: false;
+      status: 409;
+      body: ReturnType<typeof profileConflictResponseSchema.parse>;
+    }
 > {
   if (deps.profile === undefined) {
-    return { ok: false, body: { error: 'プロファイルの器が無い', detail: '' } };
+    return { ok: false, status: 400, body: { error: 'プロファイルの器が無い', detail: '' } };
   }
   const label = spec.subject === undefined ? '' : `（${spec.subject}）`;
   await deps.stores.journal.append({
@@ -1307,6 +1317,7 @@ async function mutateProfile(
     if (error instanceof ProfileInputError) {
       return {
         ok: false,
+        status: 400,
         body: { error: 'プロファイルの入力が不正（保存していない）', detail: error.message },
       };
     }
@@ -1314,7 +1325,34 @@ async function mutateProfile(
     if (error instanceof NulNotAllowedError) {
       return {
         ok: false,
+        status: 400,
         body: { error: 'プロファイルの入力が不正（保存していない）', detail: error.message },
+      };
+    }
+    // 読んだ後に変わっていた: 何も変えていない。いまの行を本文抜きで添える（鍵を往復させない）
+    if (error instanceof ProfileVersionMismatchError) {
+      const current = error.current;
+      return {
+        ok: false,
+        status: 409,
+        body: profileConflictResponseSchema.parse({
+          error: 'プロファイルの行が読んだ後に変わっている（変えていない）',
+          detail:
+            current === null
+              ? '読んだ後に、その行は消されている（または読んだ後に作られた行ではない）'
+              : `読んだ後に、行 ${current.name} が変わっている・作られている`,
+          current:
+            current === null
+              ? null
+              : {
+                  name: current.name,
+                  scope: current.scope,
+                  updatedAt: current.updatedAt,
+                  sha256: fingerprintOf(current.script),
+                  bytes: Buffer.byteLength(current.script),
+                  version: profileEntryVersionOf(current),
+                },
+        }),
       };
     }
     throw error;
@@ -1335,6 +1373,7 @@ async function mutateProfile(
     const failure = redactProfileFailure(result.clone, process.env);
     return {
       ok: false,
+      status: 400,
       body: {
         error: 'プロファイルが読めなかったので保存していない',
         detail: [failure.error, failure.output].join('\n').trim(),
@@ -1383,6 +1422,7 @@ async function mutateProfile(
         updatedAt: entry.updatedAt,
         sha256: entry.sha256,
         bytes: entry.bytes,
+        version: entry.version,
       })),
       composed,
       ...(described.sha256 === undefined
@@ -6964,6 +7004,7 @@ export function createApp(deps: AppDeps) {
           route: 'PUT /profile',
           run: (profile) => profile.apply(script),
         });
+        // 版を比べない口なので 409 は来ない（`apply` は ifMatch を受けない）
         return outcome.ok ? c.json(outcome.body, 200) : c.json(outcome.body, 400);
       },
     )
@@ -6977,7 +7018,9 @@ export function createApp(deps: AppDeps) {
         description:
           '名前付きの行を置く（無ければ作る）。行は名前のコード単位順につなげて効かせる。' +
           '置く前に評価する（撒く先が runner だけの行は、デーモンでは評価できないので runner が評価する）。' +
-          '読めなければ保存も配布もせず、理由を返す（前のものが残る）。',
+          '読めなければ保存も配布もせず、理由を返す（前のものが残る）。' +
+          '`ifMatch`（`GET /profile` の各行の `version`）を渡すと、読んだ後にその行が変わっていたとき何も変えずに 409。' +
+          '`ifMatch: null` は「行が無いときだけ作る」。省けば今までどおり比べない。',
         responses: {
           200: {
             description: '行を置いた後の全行と、クローンと各 runner への反映結果。',
@@ -6992,6 +7035,12 @@ export function createApp(deps: AppDeps) {
           403: {
             description: '許可（`access grant`）の無いアカウント。',
             content: { 'application/json': { schema: resolver(errorResponseSchema) } },
+          },
+          409: {
+            description:
+              '`ifMatch` がいまの行と食い違う（読んだ後に変わった・作られた・消された。何も変えていない）。' +
+              '`current` にいまの行（本文は載せない。無ければ `null`）を添える。',
+            content: { 'application/json': { schema: resolver(profileConflictResponseSchema) } },
           },
         },
       }),
@@ -7010,14 +7059,16 @@ export function createApp(deps: AppDeps) {
             400,
           );
         }
-        const { script, scope } = c.req.valid('json');
+        const { script, scope, ifMatch } = c.req.valid('json');
         const outcome = await mutateProfile(deps, {
           actor: describeActor(c.get('principal')),
           route: 'PUT /profile/:name',
           subject: `行 ${name}`,
-          run: (profile) => profile.set(name, script, scope),
+          run: (profile) =>
+            profile.set(name, script, scope, ifMatch === undefined ? undefined : { ifMatch }),
         });
-        return outcome.ok ? c.json(outcome.body, 200) : c.json(outcome.body, 400);
+        if (outcome.ok) return c.json(outcome.body, 200);
+        return outcome.status === 409 ? c.json(outcome.body, 409) : c.json(outcome.body, 400);
       },
     )
 
@@ -7028,7 +7079,9 @@ export function createApp(deps: AppDeps) {
         summary: '実行環境プロファイルの1行を外す',
         description:
           '名前付きの行を外す。他の行は変えない。無い名前は 404（何も変えない）。' +
-          '外した行が、クローンか runner のどちらかに掛かる最後の1行だったなら、その側から環境が外れる。',
+          '外した行が、クローンか runner のどちらかに掛かる最後の1行だったなら、その側から環境が外れる。' +
+          'クエリの `ifMatch`（`GET /profile` の各行の `version`）を渡すと、読んだ後にその行が変わっていたとき外さずに 409。' +
+          '省けば今までどおり比べない。',
         responses: {
           200: {
             description: '行を外した後の全行と、クローンと各 runner への反映結果。',
@@ -7045,6 +7098,12 @@ export function createApp(deps: AppDeps) {
           404: {
             description: 'その名前の行は無い。',
             content: { 'application/json': { schema: resolver(errorResponseSchema) } },
+          },
+          409: {
+            description:
+              '`ifMatch` がいまの行と食い違う（読んだ後に変わった。外していない）。' +
+              '`current` にいまの行（本文は載せない）を添える。',
+            content: { 'application/json': { schema: resolver(profileConflictResponseSchema) } },
           },
         },
       }),
@@ -7066,13 +7125,16 @@ export function createApp(deps: AppDeps) {
         if (!(await deps.profile.read()).some((entry) => entry.name === name)) {
           return c.json({ error: `プロファイルに行 ${name} は無い` }, 404);
         }
+        const ifMatch = c.req.query('ifMatch');
         const outcome = await mutateProfile(deps, {
           actor: describeActor(c.get('principal')),
           route: 'DELETE /profile/:name',
           subject: `行 ${name}（外す）`,
-          run: (profile) => profile.remove(name),
+          run: (profile) =>
+            profile.remove(name, ifMatch === undefined || ifMatch === '' ? undefined : { ifMatch }),
         });
-        return outcome.ok ? c.json(outcome.body, 200) : c.json(outcome.body, 400);
+        if (outcome.ok) return c.json(outcome.body, 200);
+        return outcome.status === 409 ? c.json(outcome.body, 409) : c.json(outcome.body, 400);
       },
     )
 
