@@ -22,6 +22,7 @@ import type {
   StoredMcpServers,
   Exchange,
   GrantResult,
+  InboxEvent,
   JobStatus,
   JournalEntry,
   JournalEntryInput,
@@ -62,6 +63,7 @@ import {
   mcpServersVersionOf,
   RESERVED_SCHEDULE_KINDS,
   isReservedEventSource,
+  DAEMON_ATTACHMENT_USAGE_SOURCE,
   ARCHIVE_REMOVE_MANY_JOURNAL_ID_CHARS,
   ARCHIVE_REMOVE_MANY_LIMIT_DEFAULT,
   ARCHIVE_REMOVE_MANY_LIMIT_MAX,
@@ -1094,7 +1096,7 @@ function describeTokenPolicyChanges(changes: readonly TokenPolicyChange[]): stri
 // 能力を広げる口は、状態変更の後にこの関数を当てない: 日誌が落ちると記録の無い変更が生まれるので、日誌を先に書き、書けなければ状態を変えずに 500 にする。状態変更が投げたら打ち消しの行をこの関数で足す（記録が多すぎる側に倒す）。状態変更の後でないと分からない情報は2行目として best-effort で足す。
 // 戻り値は書けた行（書けなければ `undefined`）: `PUT /memory/:slug` だけが `markHumanTouched` へ渡すために見る（日誌に行が無いのに派生値だけ立てると対応が崩れる）。
 async function appendJournalOrDrop(
-  stores: Stores,
+  stores: Pick<Stores, 'journal'>,
   entry: JournalEntryInput,
   what: string,
   detail: string,
@@ -1105,6 +1107,54 @@ async function appendJournalOrDrop(
     noteDroppedRecord(what, detail, error);
     return undefined;
   }
+}
+
+/** 連携の鍵1本あたりの、期限内の添付の預かりがこれを越えたら知らせる（#4005。オーナーの判断で 1GiB から始める）。 */
+export const INTEGRATION_ATTACHMENT_NOTICE_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * 連携の鍵が上げた添付で、その鍵の預かり（期限内）が閾値を越えたら、日誌とクローンへ1回知らせる（#4005）。
+ * 断らない: 枠を置かないのがオーナーの決定で、これは決め直すための材料と契機である。
+ * 状態を持たず「この1件で越えたか」だけを見る（上げる前は閾値未満・上げた後は閾値以上）: 越えるのは一度きりで、デーモンの再起動をまたいでも二度鳴らないため。
+ * 掃除で下がってからもう一度越えれば、もう一度鳴る。
+ */
+export async function noteIntegrationAttachmentUsage(
+  stores: Pick<Stores, 'attachments' | 'journal'>,
+  post: (event: InboxEvent) => void,
+  keyId: string,
+  addedBytes: number,
+  threshold: number = INTEGRATION_ATTACHMENT_NOTICE_BYTES,
+): Promise<void> {
+  let total: number;
+  try {
+    total = (await stores.attachments.usage()).byIntegrationKey[keyId]?.totalBytes ?? 0;
+  } catch (error) {
+    noteDroppedRecord('連携の鍵の添付の使用量', `keyId=${keyId}`, error);
+    return;
+  }
+  const before = total - addedBytes;
+  if (!(before < threshold && total >= threshold)) return;
+  const text =
+    `連携の鍵 ${keyId} が上げた添付の預かり（期限内）が ${String(total)} バイトになり、` +
+    `閾値 ${String(threshold)} バイトを越えた。上げることは断っていない。` +
+    '鍵ごとの内訳は GET /attachments の usage.byIntegrationKey で見られる。止めるなら、その鍵を失効させる。';
+  await appendJournalOrDrop(
+    stores,
+    {
+      type: 'decision',
+      decision: text,
+      grounds: `keyId=${keyId} totalBytes=${String(total)} threshold=${String(threshold)}（#4005）`,
+    },
+    '連携の鍵の添付の閾値の知らせ',
+    `keyId=${keyId}`,
+  );
+  post({
+    type: 'external',
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    source: DAEMON_ATTACHMENT_USAGE_SOURCE,
+    payload: { text, keyId, totalBytes: total },
+  });
 }
 
 function journalWriteFailedBody(): { error: string; code: typeof JOURNAL_WRITE_FAILED_CODE } {
@@ -2244,6 +2294,15 @@ export function createApp(deps: AppDeps) {
             ...(keep === true ? { kept: true } : {}),
             uploadedBy: uploaderOf(c.get('principal')),
           });
+          if (principal.kind === 'integration') {
+            // 応答を待たせない: 知らせは上げた結果を変えず、使用量の集計の時間を鍵の呼び手へ負わせないため
+            void noteIntegrationAttachmentUsage(
+              stores,
+              (event) => clone.post(event),
+              principal.keyId,
+              meta.size,
+            );
+          }
           return c.json(meta, 200);
         } catch (error) {
           if (error instanceof AttachmentRejectedError) {
