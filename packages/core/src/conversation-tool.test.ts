@@ -7,7 +7,7 @@ import {
 } from './conversation.js';
 import type { JournalQuery } from './store.js';
 import type { Stores } from './store.js';
-import { createMemoryStores } from './testing.js';
+import { createMemoryStores, dropLastRowPerPage } from './testing.js';
 import { createCloneTools } from './tools.js';
 
 function tools(stores: Stores) {
@@ -30,9 +30,21 @@ function tools(stores: Stores) {
 function spyOnList(stores: Stores): JournalQuery[] {
   const calls: JournalQuery[] = [];
   const original = stores.journal.list.bind(stores.journal);
+  const originalPage = stores.journal.listPage.bind(stores.journal);
+  // 窓は `listPage` で読む（終端を `next` で決めるため）。インメモリの `listPage` は内部で `list` を余り1件付きで呼ぶので、頁の中の呼び出しは数えず、頁へ渡された問い合わせを1件として積む
+  let inPage = false;
   stores.journal.list = async (query?: JournalQuery) => {
-    calls.push(query ?? {});
+    if (!inPage) calls.push(query ?? {});
     return original(query);
+  };
+  stores.journal.listPage = async (query?: JournalQuery) => {
+    calls.push(query ?? {});
+    inPage = true;
+    try {
+      return await originalPage(query);
+    } finally {
+      inPage = false;
+    }
   };
   return calls;
 }
@@ -127,7 +139,7 @@ describe('conversation_read — 窓が小さくても manager の往復に食わ
 });
 
 describe('conversation_read — since / until の伝播', () => {
-  it('since / until が stores.journal.list へそのまま降りる', async () => {
+  it('since / until が stores.journal.list（窓は listPage）へそのまま降りる', async () => {
     const stores = createMemoryStores();
     const calls = spyOnList(stores);
     await humanTurn(stores, 'conv-1', '質問', '返答');
@@ -431,6 +443,23 @@ describe('conversation_read — 判定できないことを2値に潰さない',
     const reached = await call('conversation_read', { q: '存在しない語', scan: 500 });
     expect(reached).toContain('無い');
     expect(reached).not.toContain('判定できない');
+  });
+});
+
+describe('conversation_read — 読めない行を捨てて短くなった窓（#4770）', () => {
+  it('窓が scan を下回っても、ストアが続きを言っていれば先頭に届いたと言わない', async () => {
+    const base = createMemoryStores();
+    await humanTurn(base, 'conv-old', '古い発言', '古い返答');
+    await humanTurn(base, 'conv-new', '新しい発言', '新しい返答');
+    const call = tools(dropLastRowPerPage(base));
+
+    const byId = await call('conversation_read', { conversationId: 'conv-none', scan: 100 });
+    const list = await call('conversation_read', { scan: 100 });
+
+    for (const reply of [byId, list]) {
+      expect(reply).toContain('この窓より古いものは見ていない');
+      expect(reply).not.toContain('先頭に届いている');
+    }
   });
 });
 

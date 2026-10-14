@@ -27,7 +27,12 @@ import {
   verifyScheduleUnreadableContract,
   verifyStoreIsolationContract,
 } from '@alteroid/core';
-import type { Job, JournalEntry, ManagerSummary } from '@alteroid/core';
+import {
+  readConversationPage,
+  type Job,
+  type JournalEntry,
+  type ManagerSummary,
+} from '@alteroid/core';
 import { eq, sql } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -502,6 +507,48 @@ describe('PgJournalStore', () => {
 
       expect(ids(page.entries)).toEqual(['g1']);
       expect(page.next).toBeNull();
+    });
+
+    // 読めない行を捨てて窓が短くなっても、先頭に届いたとは言わない（#4770）。件数から終端を推すと、読めない行の向こうの古い会話を「無い」と言う
+    it('readConversationPage: 窓の中に読めない行があって短くなっても、reachedStart は偽で続きの cursor を返す', async () => {
+      const exchangeRow = (id: string, index: number, broken: boolean) => ({
+        id,
+        at: new Date(Date.UTC(2026, 7, 1, 0, 0, index)),
+        type: 'exchange',
+        entry: broken
+          ? { with: 'human', leaked: 'x' }
+          : {
+              type: 'exchange',
+              id,
+              at: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+              with: 'human',
+              role: 'inbound',
+              text: id,
+              conversationId: `conv-${id}`,
+            },
+      });
+      await db
+        .insert(journalTable)
+        .values([
+          exchangeRow('g0', 0, false),
+          exchangeRow('b1', 1, true),
+          exchangeRow('g2', 2, false),
+        ]);
+
+      const page = await readConversationPage(stores.journal, { limit: 10, scan: 2 });
+
+      expect(page.conversations.map((c) => c.conversationId)).toEqual(['conv-g2']);
+      expect(page.reachedStart).toBe(false);
+      // 続きは読めた最後の行から: 読めない行を継続点にすると、次の頁で「カーソルが指す発言が読めない」で落ちるため
+      expect(page.next).toEqual({ id: 'g2', at: '2026-08-01T00:00:02.000Z' });
+
+      const following = await readConversationPage(stores.journal, {
+        limit: 10,
+        scan: 2,
+        cursor: page.next!,
+      });
+      expect(following.conversations.map((c) => c.conversationId)).toEqual(['conv-g0']);
+      expect(following.reachedStart).toBe(true);
     });
 
     it('list() は従来どおり（読めた行だけを返す）', async () => {
