@@ -482,3 +482,53 @@ describe('usage-poller — 現役のトークンで測る', () => {
     expect(calls()).toBe(2);
   });
 });
+
+describe('起動直後の「鍵が無い」は、鍵が届いたら長い間隔を待たずに測り直す（#4737）', () => {
+  it('⭐ 鍵の無いまま「未ログイン」と測った後で鍵が届けば、30分を待たずに次の間隔で測り直す', async () => {
+    const key: { identity?: { tokenId: string; generation: number } } = {};
+    const { queryFn } = probe(() => (key.identity === undefined ? NOT_LOGGED_IN : LOGGED_IN));
+    const poller = startUsagePolling({
+      queryFn,
+      cwd: '/work',
+      intervalMs: 5,
+      unavailableIntervalMs: 600_000,
+      identity: () => key.identity,
+    });
+
+    await expect.poll(() => poller.state().state, { timeout: 2000 }).toBe('unavailable');
+    key.identity = { tokenId: 'tok-1', generation: 1 };
+    await expect.poll(() => poller.state().state, { timeout: 2000 }).toBe('ok');
+
+    poller.stop();
+  });
+
+  it('鍵が届かないままなら、長い間隔を待つ（鍵の無い構成で測り直しを増やさない）', async () => {
+    // 実時間で待たない（#2146）: 偽の時計で間隔を進め、測った回数で確かめる
+    vi.useFakeTimers();
+    try {
+      const { queryFn, calls } = probe(() => NOT_LOGGED_IN);
+      const poller = startUsagePolling({
+        queryFn,
+        cwd: '/work',
+        intervalMs: 5,
+        unavailableIntervalMs: 600_000,
+        identity: () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(poller.state().state).toBe('unavailable');
+      const after = calls();
+
+      // 通常の間隔を何度も過ぎても、鍵が届かないので測り直さない
+      await vi.advanceTimersByTimeAsync(100);
+      expect(calls()).toBe(after);
+
+      // 長い間隔が過ぎたら測る（諦めない）
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(calls()).toBe(after + 1);
+
+      poller.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
