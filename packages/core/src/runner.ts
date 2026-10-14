@@ -226,6 +226,8 @@ import {
 import { chunkMirrorEntries, MIRROR_EVENT_MAX_CHARS } from './mirror-chunks.js';
 import {
   deleteRescueRef,
+  type RescueListIncomplete,
+  RescueListNotice,
   RescueMemory,
   type RescueRefDeleteResult,
   resolveRescueIntervalMs,
@@ -1844,6 +1846,8 @@ class RunnerSession {
   readonly #pidsPressureNotices = new PidsPressureNotices();
   readonly #denialStreaks = new ClassifierDenialStreaks();
   readonly #rescueMemory = new RescueMemory();
+  /** 退避の列挙の打ち切りの知らせ（同じ状態が続く間は繰り返さない。#4681）。 */
+  readonly #rescueListNotice = new RescueListNotice();
   #rescueRunning: Promise<void> | null = null;
   /** 前の報告から後に走った「外へ出す」コマンドの名前（`outward-commands.ts`）。報告を出すときに空にする。 */
   readonly #outwardActions: string[] = [];
@@ -2132,6 +2136,7 @@ class RunnerSession {
           env: this.#childEnv(),
           memory: this.#rescueMemory,
           hintDirs: this.#gitDirHints,
+          onListIncomplete: (incomplete) => this.#noteRescueListIncomplete(incomplete),
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
         if (worktrees.length > 0) {
@@ -2250,6 +2255,13 @@ class RunnerSession {
     }
     await this.#noteWorktreesOutsideScratchConvention();
     this.#onClosed();
+  }
+
+  // 退避から漏れた作業ツリーがあることを note で知らせる（#4681）。打ち切られた分は退避されず、知らせないと人間もクローンも気づけないため
+  #noteRescueListIncomplete(incomplete: RescueListIncomplete | undefined): void {
+    const text = this.#rescueListNotice.next(incomplete);
+    if (text === undefined) return;
+    this.#emit({ type: 'note', managerId: this.#id, text });
   }
 
   /**

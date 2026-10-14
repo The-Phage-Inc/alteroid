@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { readdir, realpath, stat, unlink } from 'node:fs/promises';
+import { lstat, readdir, realpath, stat, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -304,6 +304,42 @@ export interface RunRescueOptions {
   readonly diffMaxBytes?: number;
   /** 担い手が git を打った場所。決まり（`/tmp/mgr-<委譲 id の頭>`）の外の作業ツリーも退避するため。 */
   readonly hintDirs?: readonly string[];
+  /**
+   * 作業ツリーの列挙が打ち切られた（件数の上限・起点が読めない）ときに呼ぶ（#4681）。打ち切られた分は退避されないので、呼び手が知らせる。
+   * 打ち切られなかった回も `undefined` で呼ぶ: 呼び手が「直った」を知り、同じ知らせを繰り返さないため。
+   */
+  readonly onListIncomplete?: (incomplete: RescueListIncomplete | undefined) => void;
+}
+
+/**
+ * 退避の列挙の打ち切りを知らせる文を返す。同じ状態が続く間は `undefined`（繰り返さない）。打ち切られなくなったら覚えを消す（#4681）。
+ */
+export class RescueListNotice {
+  #lastKey: string | undefined;
+
+  next(incomplete: RescueListIncomplete | undefined): string | undefined {
+    const key = incomplete === undefined ? undefined : JSON.stringify(incomplete);
+    if (key === this.#lastKey) return undefined;
+    this.#lastKey = key;
+    if (incomplete === undefined) return undefined;
+    const why =
+      incomplete.unreadable !== undefined
+        ? `起点が読めなかった（${incomplete.unreadable}）`
+        : `作業ツリーが多く、${String(incomplete.truncatedAtCount)} 本で探すのを打ち切った`;
+    return (
+      `退避 ref（未 push の変更を remote へ預ける仕組み）の作業ツリーの探索が途中で止まった: ${why}。` +
+      '見つからなかった作業ツリーの変更は退避されず、器が入れ替わると失われうる。' +
+      '要る変更は自分で push するか、作業ツリーを減らすこと。'
+    );
+  }
+}
+
+/** 退避の作業ツリーの列挙が打ち切られたこと（#4681）。 */
+export interface RescueListIncomplete {
+  /** 件数の上限で打ち切った（この本数で止めた）。 */
+  readonly truncatedAtCount?: number;
+  /** 起点が読めなかった（理由）。 */
+  readonly unreadable?: string;
 }
 
 function defaultHasCredential(env: Record<string, string | undefined>): boolean {
@@ -326,6 +362,19 @@ export async function runRescue(cwd: string, options: RunRescueOptions): Promise
     ...(options.tmpRootDir === undefined ? {} : { tmpRootDir: options.tmpRootDir }),
     ...(options.hintDirs === undefined ? {} : { hintDirs: options.hintDirs }),
   });
+  // 起点が無い（ENOENT）のは「漏れた」ではない: 作業場ごと無ければ、退避から漏れる変更も無いため。知らせるのは在るのに読めない回だけ
+  const unreadable =
+    listed.unreadable !== undefined && (await pathExists(cwd)) ? listed.unreadable : undefined;
+  options.onListIncomplete?.(
+    listed.truncatedAtCount === undefined && unreadable === undefined
+      ? undefined
+      : {
+          ...(listed.truncatedAtCount === undefined
+            ? {}
+            : { truncatedAtCount: listed.truncatedAtCount }),
+          ...(unreadable === undefined ? {} : { unreadable }),
+        },
+  );
   const reports: RescueWorktree[] = [];
   const resend = options.memory.takeResend();
   for (const tree of listed.worktrees) {
@@ -847,5 +896,14 @@ async function removeStaleScratch(
     }
   } catch {
     // 掃除は best-effort。
+  }
+}
+
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await lstat(target);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
   }
 }

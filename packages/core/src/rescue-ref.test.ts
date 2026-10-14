@@ -11,6 +11,7 @@ import {
   DEFAULT_RESCUE_INTERVAL_MS,
   RESCUE_INTERVAL_MS_ENV_KEY,
   RESCUE_REF_PREFIX,
+  RescueListNotice,
   RescueMemory,
   removeStaleIndexFiles,
   rescueRefName,
@@ -586,5 +587,72 @@ describe('退避 ref（#1266）', () => {
     expect(resolveRescueIntervalMs({ [RESCUE_INTERVAL_MS_ENV_KEY]: '99999999999' })).toBe(
       2147483647,
     );
+  });
+});
+
+describe('退避の作業ツリーの列挙の打ち切りを呼び手へ返す（#4681）', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await makeTempDir('rescue-list-');
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const run = (cwd: string, onListIncomplete: (value: unknown) => void) =>
+    runRescue(cwd, {
+      managerId: 'mgr-4681aaaa-0000-0000-0000-000000000000',
+      spawn: realSpawn,
+      env: { ...GIT_ENV },
+      memory: new RescueMemory(),
+      tmpRootDir: path.join(root, 'no-tmp'),
+      onListIncomplete,
+    });
+
+  it('⭐ 作業ツリーが上限（20本）を超えたら、打ち切った本数を返す', async () => {
+    const cwd = path.join(root, 'work');
+    for (let i = 0; i < 21; i += 1) {
+      const repo = path.join(cwd, `r${String(i).padStart(2, '0')}`);
+      await mkdir(repo, { recursive: true });
+      g(repo, 'init', '-q', '-b', 'main');
+    }
+    const seen: unknown[] = [];
+    await run(cwd, (value) => seen.push(value));
+    expect(seen).toEqual([{ truncatedAtCount: 20 }]);
+  });
+
+  it('起点が在るのに読めなければ、その理由を返す', async () => {
+    // ファイルを起点にして、ディレクトリとして読めなくする（権限で塞ぐ形は root で走る器では効かない）
+    const file = path.join(root, 'not-a-dir');
+    await writeFile(file, 'x');
+    const seen: unknown[] = [];
+    await run(file, (value) => seen.push(value));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ unreadable: expect.any(String) as unknown });
+  });
+
+  it('起点が存在しなければ知らせない（作業場ごと無いので、退避から漏れる変更も無い）', async () => {
+    const seen: unknown[] = [];
+    await run(path.join(root, 'missing'), (value) => seen.push(value));
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('打ち切られなければ undefined を返す（呼び手が「直った」を知るため）', async () => {
+    const cwd = path.join(root, 'one');
+    await mkdir(cwd, { recursive: true });
+    g(cwd, 'init', '-q', '-b', 'main');
+    const seen: unknown[] = [];
+    await run(cwd, (value) => seen.push(value));
+    expect(seen).toEqual([undefined]);
+  });
+});
+
+describe('RescueListNotice — 退避の列挙の打ち切りの知らせを繰り返さない（#4681）', () => {
+  it('⭐ 同じ状態が続く間は1度だけ知らせ、直ったら覚えを消し、また打ち切られたら知らせ直す', () => {
+    const notice = new RescueListNotice();
+    expect(notice.next({ truncatedAtCount: 20 })).toContain('20 本で探すのを打ち切った');
+    expect(notice.next({ truncatedAtCount: 20 })).toBeUndefined();
+    expect(notice.next(undefined)).toBeUndefined();
+    expect(notice.next({ truncatedAtCount: 20 })).toContain('20 本で探すのを打ち切った');
+    expect(notice.next({ unreadable: 'EACCES' })).toContain('起点が読めなかった（EACCES）');
   });
 });
