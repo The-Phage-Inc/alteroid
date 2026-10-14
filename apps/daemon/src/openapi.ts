@@ -1408,6 +1408,7 @@ export const progressResponseSchema = z.object({
       responded: progressCount,
       delegated: progressCount,
       notApplicable: progressCount,
+      unjudgeable: progressCount,
     }),
     completeness: z.object({
       unreadable: progressCount,
