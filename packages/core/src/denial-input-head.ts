@@ -24,13 +24,23 @@ function isSecretEnvName(name: string): boolean {
 // 短い値を渡さない: redactEnvSecrets は長さの下限が無く、`LANG=C` のような値まで置換して出力が `[REDACTED]` だらけになるため
 const SECRET_ENV_VALUE_MIN_LENGTH = 8;
 
-function redactSecretEnvValues(text: string, env: NodeJS.ProcessEnv | undefined): string {
-  if (env === undefined) return text;
+// `alwaysSecretValues` は名前の判定を通さずに伏せる: 資格の正本は名前と値しか降りず「秘密か」の印が無いため、`DB_PASS` のような名前の値が取りこぼされる。8字未満を除く扱いは env と同じ
+function redactSecretEnvValues(
+  text: string,
+  env: NodeJS.ProcessEnv | undefined,
+  alwaysSecretValues: Iterable<string> = [],
+): string {
   const candidates: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(env)) {
+  for (const [name, value] of Object.entries(env ?? {})) {
     if (!isSecretEnvName(name)) continue;
     if (typeof value !== 'string' || value.length < SECRET_ENV_VALUE_MIN_LENGTH) continue;
     candidates[name] = value;
+  }
+  let index = 0;
+  for (const value of alwaysSecretValues) {
+    if (value.length < SECRET_ENV_VALUE_MIN_LENGTH) continue;
+    candidates[`__ALWAYS_SECRET_${index}`] = value;
+    index += 1;
   }
   return redactEnvSecrets(text, candidates);
 }
@@ -197,8 +207,12 @@ function redactKnownSecretPatterns(text: string): string {
   return result;
 }
 
-export function redactSecretsInText(text: string, env: NodeJS.ProcessEnv | undefined): string {
-  return redactKnownSecretPatterns(redactSecretEnvValues(text, env));
+export function redactSecretsInText(
+  text: string,
+  env: NodeJS.ProcessEnv | undefined,
+  alwaysSecretValues?: Iterable<string>,
+): string {
+  return redactKnownSecretPatterns(redactSecretEnvValues(text, env, alwaysSecretValues));
 }
 
 // 40桁の SHA と英数字混在の長い塊を伏せない: コミットの sha・UUID・枝名が化けると報告や日誌が観測として使えなくなるため
@@ -210,8 +224,16 @@ const QUERY_PARAMS_TAIL = /\bparams:[\s\S]*$/i;
 
 // `buildDenialInputHead` では `params:` を落とさない: 道具の入力に `params:` は普通に現れ、その先頭を残す契約を変えないため
 // `params:` の落としを先に行う: 落とす部分を伏せ字の取りこぼしに頼らないため
-export function redactErrorText(text: string, env: NodeJS.ProcessEnv | undefined): string {
-  return redactSecretsInText(text.replace(QUERY_PARAMS_TAIL, `params: ${REDACTED}`), env);
+export function redactErrorText(
+  text: string,
+  env: NodeJS.ProcessEnv | undefined,
+  alwaysSecretValues?: Iterable<string>,
+): string {
+  return redactSecretsInText(
+    text.replace(QUERY_PARAMS_TAIL, `params: ${REDACTED}`),
+    env,
+    alwaysSecretValues,
+  );
 }
 
 // 一致鍵に使わない（`matchInputOf` を使う）: `command` 以外の欄を捨てるため、使うと撃ち直しにまで1回限りの許可が及ぶ
@@ -262,10 +284,11 @@ function sortKeysDeep(value: unknown): unknown {
 export function buildDenialInputHead(
   toolInput: unknown,
   env: NodeJS.ProcessEnv | undefined,
+  alwaysSecretValues?: Iterable<string>,
 ): string | undefined {
   const raw = rawLineOf(toolInput);
   if (raw === undefined) return undefined;
-  const redacted = redactSecretsInText(raw, env);
+  const redacted = redactSecretsInText(raw, env, alwaysSecretValues);
   return redacted.length > DENIAL_INPUT_HEAD_LIMIT
     ? `${redacted.slice(0, codePointBoundary(redacted, DENIAL_INPUT_HEAD_LIMIT))}${TRUNCATION_MARK}`
     : redacted;
