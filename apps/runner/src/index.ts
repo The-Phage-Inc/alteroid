@@ -109,6 +109,12 @@ export const PICKUP_WAIT_LIMIT_MS = FORCED_EXIT_MS - 5_000;
 // 預けた生ログがここまでに取られなければ、本文を載せて送り直す（SIGTERM から。#4896）。上限（`PICKUP_WAIT_LIMIT_MS`）の 20 秒手前: 大きい本文を SSE で流し切る時間を残すため
 export const ARCHIVE_INLINE_AFTER_MS = PICKUP_WAIT_LIMIT_MS - 20_000;
 
+// 畳みの時間の積み上げ（#4925。Railway の猶予 `SHUTDOWN_GRACE_MS` 60秒 → `FORCED_EXIT_MS` 55秒 → `PICKUP_WAIT_LIMIT_MS` 50秒）:
+//   0秒 SIGTERM → 30秒 `ARCHIVE_INLINE_AFTER_MS`（`shutdown()` の途中でも、並行のタイマーが退避を送り直す）
+//   → 50秒 `PICKUP_WAIT_LIMIT_MS`（`shutdown()` の完了と取られるのを待つ上限。口を閉じて exit へ進めるのは、`shutdown()` が終わってから）
+//   → 最大 53秒 出し箱の流し切り（`DRAIN_WAIT_MS` 3秒）→ 55秒 forced exit → 60秒 SIGKILL
+// `shutdown()` の待ちを 30秒で切らない: 未 push の確認・退避 ref の push の途中で exit すると、その作業が失われるため。
+
 export const DRAIN_POLL_INTERVAL_MS = 50;
 
 // タイムアウトしても投げない: 待ち切れなかった分は、この後 `formatOutboxShutdownReport` が残りとして報告するため。
@@ -148,43 +154,81 @@ export async function shutdownHandingOver(deps: {
   write?: (line: string) => void;
 }): Promise<void> {
   const startedAt = deps.startedAt ?? Date.now();
-  await deps.host.shutdown().catch(() => undefined);
-
-  await drainAndReportOutbox(deps.outbox, {
-    ...(deps.drainWaitMs === undefined ? {} : { waitMs: deps.drainWaitMs }),
-    ...(deps.write === undefined ? {} : { write: deps.write }),
-  });
-
   const limitMs = deps.pickupWaitLimitMs ?? PICKUP_WAIT_LIMIT_MS;
-  // 1段目: 取られるのを待つ。ここまでに取られなかった預けた生ログは、本文を載せて送り直す（#4896）。
-  // 上限ぎりぎりまで待ってから送ると、SSE に載せて流し切る時間が残らないため、上限より手前で一度切る
   const inlineAtMs = Math.min(deps.inlineArchivesAfterMs ?? ARCHIVE_INLINE_AFTER_MS, limitMs);
-  let left = await waitForPickups({
-    pending: () => deps.host.pendingPickups(),
-    subscribed: () => deps.outbox.subscribed,
-    deadlineAt: startedAt + inlineAtMs,
-  });
-  if (left > 0 && deps.outbox.subscribed && deps.host.inlineUnpickedArchives !== undefined) {
+  const afterMs = (atMs: number): number => Math.max(0, startedAt + atMs - Date.now());
+
+  // 送り直しの判定を `shutdown()` と並べて走らせる（#4925）: `shutdown()` が長引いても、SIGTERM から `inlineAtMs` で、
+  // まだ取られていない退避を送り直す。二度は送らない: `inlineUnpickedArchives` が送った分を預かりから外す
+  const inlineTimer = setTimeout(() => {
+    if (
+      !deps.outbox.subscribed ||
+      deps.host.inlineUnpickedArchives === undefined ||
+      deps.host.pendingPickups() === 0
+    ) {
+      return;
+    }
     const sent = deps.host.inlineUnpickedArchives();
     if (sent > 0) {
       (deps.write ?? writeStderrSync)(
-        `alteroid-runner: デーモンが取りに来なかった生ログの退避 ${String(sent)} 件を、本文を載せて送り直した\n`,
+        `alteroid-runner: 畳みの途中で、デーモンが取りに来なかった生ログの退避 ${String(sent)} 件を、本文を載せて送り直した\n`,
       );
-      await waitForOutboxDrain(deps.outbox, deps.drainWaitMs ?? DRAIN_WAIT_MS);
     }
-  }
-  // 2段目: 残り（出し箱の退避先など）を上限まで待つ
-  left = await waitForPickups({
-    pending: () => deps.host.pendingPickups(),
-    subscribed: () => deps.outbox.subscribed,
-    deadlineAt: startedAt + limitMs,
+  }, afterMs(inlineAtMs));
+
+  // `shutdown()` の完了を待つのは、従来どおり待ちの上限（`limitMs`）まで: 終わる前に口を閉じて exit すると、
+  // 畳みの途中の push・未 push の確認が切られる。上限を超えて終わらないときだけ、待ちの段へ進む
+  let capTimer: NodeJS.Timeout | undefined;
+  const cap = new Promise<void>((resolve) => {
+    capTimer = setTimeout(resolve, afterMs(limitMs));
   });
-  if (left > 0) {
-    (deps.write ?? writeStderrSync)(
-      `alteroid-runner: 畳みで預けた物のうち ${String(left)} 件を、デーモンが取りに来ないまま止まる（生ログの退避・出し箱の退避先）\n`,
-    );
+  try {
+    await Promise.race([deps.host.shutdown().catch(() => undefined), cap]);
+  } finally {
+    clearTimeout(capTimer);
+  }
+
+  try {
+    await handOverPickups();
+  } finally {
+    clearTimeout(inlineTimer);
   }
   deps.closeListener();
+
+  async function handOverPickups(): Promise<void> {
+    await drainAndReportOutbox(deps.outbox, {
+      ...(deps.drainWaitMs === undefined ? {} : { waitMs: deps.drainWaitMs }),
+      ...(deps.write === undefined ? {} : { write: deps.write }),
+    });
+
+    // 1段目: 取られるのを待つ。ここまでに取られなかった預けた生ログは、本文を載せて送り直す（#4896）。
+    // 上限ぎりぎりまで待ってから送ると、SSE に載せて流し切る時間が残らないため、上限より手前で一度切る
+    let left = await waitForPickups({
+      pending: () => deps.host.pendingPickups(),
+      subscribed: () => deps.outbox.subscribed,
+      deadlineAt: startedAt + inlineAtMs,
+    });
+    if (left > 0 && deps.outbox.subscribed && deps.host.inlineUnpickedArchives !== undefined) {
+      const sent = deps.host.inlineUnpickedArchives();
+      if (sent > 0) {
+        (deps.write ?? writeStderrSync)(
+          `alteroid-runner: デーモンが取りに来なかった生ログの退避 ${String(sent)} 件を、本文を載せて送り直した\n`,
+        );
+        await waitForOutboxDrain(deps.outbox, deps.drainWaitMs ?? DRAIN_WAIT_MS);
+      }
+    }
+    // 2段目: 残り（出し箱の退避先など）を上限まで待つ
+    left = await waitForPickups({
+      pending: () => deps.host.pendingPickups(),
+      subscribed: () => deps.outbox.subscribed,
+      deadlineAt: startedAt + limitMs,
+    });
+    if (left > 0) {
+      (deps.write ?? writeStderrSync)(
+        `alteroid-runner: 畳みで預けた物のうち ${String(left)} 件を、デーモンが取りに来ないまま止まる（生ログの退避・出し箱の退避先）\n`,
+      );
+    }
+  }
 }
 
 function envValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
