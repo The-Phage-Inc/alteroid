@@ -726,6 +726,7 @@ class Host implements RunnerHost {
   readonly #scratchAbort = new AbortController();
   #scratchRunning: Promise<void> | null = null;
   #attachmentPruning: Promise<void> | null = null;
+  #outboxPruning: Promise<void> | null = null;
   readonly #knownManagerIds = new Set<string>();
   // `knownTerminated` を固定の集合として持たない: resume で同じ `managerId` が戻っても古い pid が「終端済み」のままになるため
   readonly #liveDelegationPids = new Set<number>();
@@ -863,16 +864,23 @@ class Host implements RunnerHost {
           // 出し箱と退避先の取りこぼしも、添付と同じ周期・同じ基準（生きた委譲に当たらず24時間触れていない）で消す
           // `#attachmentPruning` の鎖に乗せない: 添付の掃除が長引いても出し箱の掃除を止めないため（失敗は握る）
           // 出し箱の root は子の権限で消す（担い手が書ける木を runner の権限で再帰削除しない）
-          pruneStaleOutboxRoots(
-            {
-              outboxRoot: this.#outboxRoot,
-              stagedRoot: this.#outboxStagedRoot,
-              rescueStagedRoot: this.#rescueStagedRoot,
-            },
-            [...this.#sessions.keys()],
-            Date.now(),
-            this.#outboxRemoval(),
-          );
+          // 非同期（#4906）: 同一プロセスの runner では、走査と削除の同期 I/O がデーモンのメインのループを止める。重ならないよう1本ずつ走らせる
+          if (this.#outboxPruning === null) {
+            this.#outboxPruning = pruneStaleOutboxRoots(
+              {
+                outboxRoot: this.#outboxRoot,
+                stagedRoot: this.#outboxStagedRoot,
+                rescueStagedRoot: this.#rescueStagedRoot,
+              },
+              () => [...this.#sessions.keys()],
+              Date.now(),
+              this.#outboxRemoval(),
+            )
+              .catch(() => undefined)
+              .finally(() => {
+                this.#outboxPruning = null;
+              });
+          }
           if (this.#scratchRunning !== null || this.#scratchAbort.signal.aborted) return;
           const run = sweeper
             .sweep(this.#scratchAbort.signal, this.runnerId)
@@ -3232,6 +3240,7 @@ class RunnerSession {
     }
   }
 
+  // 同期のままにする（#4906）: 見るのは担当ごとの小さな出し箱の直下1つだけで、ループを止める重さではない。非同期にすると、報告が出る時機が実際の I/O の待ちに左右されるため
   #outboxHasEntries(): boolean {
     if (this.#outboxDir === undefined) return false;
     try {
