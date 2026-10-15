@@ -279,6 +279,7 @@ import {
 import {
   classifyUsageNotice,
   describeUsageNotice,
+  isRateLimitReason,
   mergeRateLimitFacts,
   rateLimitMemoryKey,
   usageTransitionOf,
@@ -3854,6 +3855,8 @@ class Clone implements CloneHost {
     cause: string | { readonly error: unknown },
     sdkFailure?: SdkFailure,
   ): Promise<void> {
+    // 例外で来た失敗の枠判定はここ1か所に置く: 呼び出し側（`#pump`・`#runTurn`・`#read`）ごとに書くと、経路が増えたとき例外だけの 429 が枠にならず合図を食う形が戻るため（#4879）。`usage_limited` は終端の `error` より先に届く必要があるので、下の emit より前に済ませる
+    if (typeof cause !== 'string') await this.#noteThrownUsageFailure(cause.error, conversationId);
     // 分類は生の文字列で先に行い、外へ出す文だけを `reasonOf` にする: `prompt is too long` 等が2行目以降に在る形もあり入口で1行目へ畳むと判定が壊れる一方、`emit`・日誌・`failure` に載る文は drizzle の `params:` のように値を運びうるため
     const rawMessage = typeof cause === 'string' ? cause : String(cause.error);
     const message = typeof cause === 'string' ? cause : reasonOf(cause.error);
@@ -4493,6 +4496,21 @@ class Clone implements CloneHost {
 
     // `source === 'text'` に限って数える: `rate_limit_event` 由来はターンの頭ごとに届く「1つぶんの状態」で後続の `result` が成功することがあり、数えると成功するターンの途中でも畳みにかかるため
     if (source === 'text') await this.#noteUnproductiveUsageBlockFold();
+  }
+
+  // 枠の分類は生の文（`String(error)`）に掛け、通知に載せる文だけ `reasonOf` を通す: 日誌・`usage_limited` に載る文が値を運びうるため
+  // `result` 経由で既に立てている間は何もしない: 同じ枠を二重に日誌・回し手へ渡さないため
+  async #noteThrownUsageFailure(error: unknown, conversationId: string | null): Promise<void> {
+    if (this.#usageBlocked !== null) return;
+    const raw = String(error);
+    const classified = classifyUsageNotice(raw);
+    const notice: UsageLimitNotice | undefined =
+      classified?.kind === 'reached'
+        ? classified
+        : isRateLimitReason(raw)
+          ? { kind: 'reached', text: reasonOf(error) }
+          : undefined;
+    await this.#noteUsageNotice(notice, conversationId, 'text');
   }
 
   async #handle(event: InboxEvent): Promise<void> {
@@ -6094,8 +6112,13 @@ class Clone implements CloneHost {
   #childEnv(): NodeJS.ProcessEnv {
     // 鍵は呼ばれるたびに読み直す: `#childEnvBase` は構築時のスナップショットで、後から差し替えた鍵が届かなくなるため。
     // 重ね順は runner.ts と揃える（env → 正本 → 鍵 → プロファイル）: 層ごとに違うと片方にだけ回る鍵が生まれるため。
-    // 身元の捕捉はここ以外でしない: 世代の照合が素通しになる。
+    // 身元の捕捉は本セッションを組むここ以外でしない: 世代の照合が素通しになる。
     this.#sdkSession.captureSessionTokenIdentity(this.#tokenIdentity?.());
+    return this.#childEnvWithoutIdentityCapture();
+  }
+
+  /** 蒸留のセッションは `#childEnv()` ではなくこちらを使う: 走行中の本セッションの鍵の身元を、回した後の鍵で上書きしてしまうため（#4880）。 */
+  #childEnvWithoutIdentityCapture(): NodeJS.ProcessEnv {
     const env = this.#layeredChildEnv();
     // 伏せるのは最後（正本やプロファイルが同じ名前を重ねても生き残らせない）。`this.#env` 自体は動かさない: daemon は OAuth の交換にこの鍵を使い続ける。
     for (const key of this.#withheldEnvKeys) delete env[key];
@@ -6276,7 +6299,8 @@ class Clone implements CloneHost {
         memory,
         ...(this.#self === undefined ? {} : { self: this.#self }),
       }),
-      env: this.#childEnv(),
+      // 身元を捕まえない組み立て（#4880）: 本セッションが走っている間に鍵が回っても、本セッションの身元を新しい鍵で上書きしないため。
+      env: this.#childEnvWithoutIdentityCapture(),
       ...(this.#cwd === undefined ? {} : { cwd: this.#cwd }),
       onPostToolUse: (input) => this.#onDistillToolUse(input),
       // 足す: 蒸留は `memory_write` を叩く経路で、失敗を記録しないと「記憶が書かれなかった」が静かに落ちる。
