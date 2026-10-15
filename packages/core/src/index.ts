@@ -1030,6 +1030,7 @@ export {
   type RunnerProfileResult,
   type RunnerRegistry,
   type RunnerRegistryOptions,
+  type RunnerRequestStages,
   type RunnerRevisionStatus,
   type RunnerResumeResult,
   type RunnerSessionOpenResult,
@@ -1606,6 +1607,16 @@ export {
   type LoopStall,
   type LoopStallWatchOptions,
 } from './loop-stall.js';
+export {
+  describeThreadpoolWait,
+  measureThreadpoolWait,
+  type ThreadpoolWait,
+} from './threadpool-wait.js';
+export {
+  RUNNER_CLIENT_KEEP_ALIVE_MS,
+  RUNNER_KEEP_ALIVE_TIMEOUT_MS,
+  applyRunnerKeepAlive,
+} from './runner-keep-alive.js';
 export {
   defaultRunnerRescueStagedRoot,
   RescueStashMemory,
