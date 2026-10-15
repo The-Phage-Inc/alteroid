@@ -5,18 +5,10 @@ import {
   ROTATABLE_CREDENTIAL_KEYS,
 } from './credentials.js';
 import { reasonOf } from './dropped-record.js';
+import { APP_ENV_VAR_DEFAULTS } from './app-env-var-defaults.js';
 import type { Stores } from './store.js';
 
-// 「未設定＝空」が正しい既定の変数は播種しない: 空文字は袋の中で「外す」と同じ意味になるため
-export const APP_ENV_VAR_DEFAULTS: readonly { name: string; value: string }[] = [
-  { name: 'TZ', value: 'Asia/Tokyo' },
-  { name: 'ALTEROID_DAILY_REPORT_AT', value: '22:00' },
-  { name: 'ALTEROID_INITIATIVE_EVERY', value: '55' },
-  { name: 'ALTEROID_ACCESS_TOKEN_TTL_DAYS', value: '30' },
-  { name: 'ALTEROID_WITHHELD_REPORT_FLUSH_MS', value: '1800000' },
-  { name: 'ALTEROID_MEMORY_TIDY_AT', value: '03:00' },
-  { name: 'ALTEROID_REPORT_LOOKBACK_DAYS', value: '3' },
-];
+export { APP_ENV_VAR_DEFAULTS, DAEMON_RESTART_REQUIRED_ENV_NAMES } from './app-env-var-defaults.js';
 
 export async function seedDefaultEnvVars(
   stores: Stores,
