@@ -298,3 +298,101 @@ describe('Host: 畳み（shutdown）で預けた物の数（#4699）', () => {
     expect(host.pendingPickups()).toBe(0);
   });
 });
+
+// 畳み始める前に emit した出し箱・未追跡の預かりの退避先のファイルも待たせる（#4912）
+describe('Host: 畳み始める前に退避先へ置いた物も待ちに入る（#4912）', () => {
+  const OUTBOX_ID = 'a'.repeat(32);
+  const RESCUE_ID = 'b'.repeat(32);
+
+  // 畳み始める前に、ターンの報告で出し箱のファイルを1つ emit した器。退避先には、このプロセスが送っていない前の残りも置く
+  async function hostWithEmittedReport() {
+    const outboxRoot = await makeTempDir('runner-emitted-');
+    const outboxStagedRoot = await makeTempDir('runner-emitted-staged-');
+    const rescueStagedRoot = await makeTempDir('runner-emitted-rescue-staged-');
+    await mkdir(join(outboxStagedRoot, 'mgr-old'));
+    await mkdir(join(rescueStagedRoot, 'mgr-old'));
+    await writeFile(join(outboxStagedRoot, 'mgr-old', OUTBOX_ID), '前の担当の残り');
+    await writeFile(join(rescueStagedRoot, 'mgr-old', RESCUE_ID), '前のプロセスの預かり');
+    const events: RunnerEvent[] = [];
+    const fake = fakeSdk(async () => {
+      await writeFile(join(outboxRoot, 'mgr-early', 'result.txt'), '成果物');
+    });
+    const host = createRunnerHost({
+      runnerId: 'runner-emitted',
+      workspacePath: '/workspace',
+      emit: (event) => events.push(event),
+      queryFn: fake.fn,
+      env: { PATH: '/usr/bin' },
+      outboxRoot,
+      outboxStagedRoot,
+      rescueStagedRoot,
+      scratchSweep: false,
+      cwdExistsFn: () => true,
+      readCgroupEventCountersFn: async () => ({}),
+      finishUnpushedWorkFn: async () => ({ cwd: '/workspace', worktrees: [] }),
+    });
+    hosts.push(host);
+    await host.start({ managerId: 'mgr-early', request: '依頼', cwd: '/workspace' });
+    await vi.waitFor(() => expect(events.some((e) => e.type === 'report')).toBe(true));
+    const report = events.find((e) => e.type === 'report');
+    if (report?.type !== 'report') throw new Error('report が無い');
+    const fileId = report.files?.[0]?.fileId ?? '';
+    expect(fileId).not.toBe('');
+    return { host, fileId };
+  }
+
+  it('⭐ 畳み始める前に emit した出し箱のファイルは待ちに入り、DELETE で外れる。退避先に残っていても送っていない物は入らない', async () => {
+    const { host, fileId } = await hostWithEmittedReport();
+    expect(host.pendingPickups()).toBe(0);
+
+    await host.shutdown();
+    // 前の残り（出し箱の mgr-old・預かりの mgr-old）は数えない
+    expect(host.pendingPickups()).toBe(1);
+
+    await host.deleteOutboxFile('mgr-early', fileId);
+    expect(host.pendingPickups()).toBe(0);
+  });
+
+  it('⭐ 畳み始める前に取られた出し箱のファイルは、待ちに入らない', async () => {
+    const { host, fileId } = await hostWithEmittedReport();
+    await host.deleteOutboxFile('mgr-early', fileId);
+
+    await host.shutdown();
+
+    expect(host.pendingPickups()).toBe(0);
+  });
+
+  it('⭐ GET を読み切ったら、DELETE が来なくても待ちから外す', async () => {
+    const { host, fileId } = await hostWithEmittedReport();
+    await host.shutdown();
+
+    const outbox = await host.openOutboxFile('mgr-early', fileId);
+    // 読み始めただけでは外さない
+    expect(host.pendingPickups()).toBe(1);
+    for await (const chunk of outbox!.stream) void chunk;
+    expect(host.pendingPickups()).toBe(0);
+  });
+
+  it('何も送っていない器は、退避先に残りがあっても待ちが0のまま', async () => {
+    const outboxStagedRoot = await makeTempDir('runner-none-staged-');
+    await mkdir(join(outboxStagedRoot, 'mgr-old'));
+    await writeFile(join(outboxStagedRoot, 'mgr-old', OUTBOX_ID), '前の残り');
+    const host = createRunnerHost({
+      runnerId: 'runner-none',
+      workspacePath: '/workspace',
+      emit: () => undefined,
+      queryFn: fakeSdk(async () => undefined).fn,
+      env: { PATH: '/usr/bin' },
+      outboxRoot: await makeTempDir('runner-none-root-'),
+      outboxStagedRoot,
+      rescueStagedRoot: await makeTempDir('runner-none-rescue-staged-'),
+      scratchSweep: false,
+      cwdExistsFn: () => true,
+      readCgroupEventCountersFn: async () => ({}),
+      finishUnpushedWorkFn: async () => ({ cwd: '/workspace', worktrees: [] }),
+    });
+    hosts.push(host);
+    await host.shutdown();
+    expect(host.pendingPickups()).toBe(0);
+  });
+});
