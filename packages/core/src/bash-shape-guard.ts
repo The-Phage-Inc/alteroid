@@ -1,7 +1,7 @@
 import { computeQuoteScan } from './bash-wait-guard.js';
 
 // Bash の「形の歯」（#4947 で作業者に、#4949 でマネージャーにも）。依頼文で禁じても破られる形を、機械の門で断って代わりの道を返す。
-// 引用符の中・注釈・`<`・`<<<`・`<(...)`・パイプ `|` は断らない（誤検知の防ぎ）。
+// 引用符の中・注釈・`<`・`<<<`・`<(...)`・パイプ `|` は断らない（誤検知の防ぎ）。ただし、状態を変えるコマンド（`git merge` など）を管の最後でない段に置く形は断る（#4990）。
 // 引用符の中でも実行される所だけ中を読む: `bash -c` / `sh -c` の引数（1段）と、二重引用符の中の `$(...)`・バッククォート
 // git は、コマンドの位置の `git` の全体の選択肢を読み飛ばした先の下位命令で判定する（`echo git reset` は通す）
 // 既知の穴（断らない）: `eval`・変数に入れた命令（`$CMD`）・2段以上の入れ子の `bash -c`
@@ -20,44 +20,58 @@ export type BashShapeForm =
   | 'git-force-push'
   | 'git-rebase'
   | 'no-verify'
-  | 'gh-merge-auto';
+  | 'gh-merge-auto'
+  | 'pipe-masks-exit';
 
 export type BashShapeVerdict =
   { blocked: false } | { blocked: true; form: BashShapeForm; reason: string };
 
-const REASONS: Record<BashShapeForm, string> = {
+// 理由の文は、最初の1文で「何を止めたか」と「代わりにどう書けば通るか」を言う（#4989）: 「使えない」とだけ言うと禁止の宣言として読まれ、担当が手を止めて依頼者の指示を待つため。
+// 管（`| tail`）で絞ることは勧めない（#4990）: 終了コードが管の後ろのものになり、前のコマンドの失敗が成功に見えるため
+// `pipe-masks-exit` は止めるコマンドの名前が文に入るので、ここには置かず `pipeMasksExitReason` で作る
+const REASONS: Record<Exclude<BashShapeForm, 'pipe-masks-exit'>, string> = {
   heredoc:
-    'ヒアドキュメント（`<<EOF`）はこの Bash では使えない。ファイルを作るなら Write、直すなら Edit を使うこと。ファイルへ流し込むためなら、内容を Write でファイルに書いてから、そのパスを引数に渡して実行する。',
+    'ヒアドキュメント（`<<EOF`）は通らないので、ファイルを作るなら Write、直すなら Edit で書き、流し込む先のコマンドにはそのファイルの絶対パスを引数で渡すこと。',
   'subst-heredoc':
-    '二重引用符の中のコマンド置換（`"$(cat <<\'EOF\' …)"`）やバッククォートの中のヒアドキュメントは、実行されるのでこの Bash では使えない。コミットメッセージや PR の本文は、Write でメッセージのファイルを作り、`git commit -F <絶対パス>`・`gh pr create --body-file <絶対パス>` のようにファイルを渡すこと。',
+    '二重引用符の中のコマンド置換（`"$(cat <<\'EOF\' …)"`）やバッククォートの中のヒアドキュメントは実行されるので通らない。コミットメッセージや PR の本文は Write でファイルに書き、`git commit -F <絶対パス>`・`gh pr create --body-file <絶対パス>` のようにファイルで渡すこと。',
   redirect:
-    '出力のリダイレクト（`>`・`>>`・`>|`・`&>`・`>/dev/null`・`2>/dev/null`）はこの Bash では使えない。ファイルへ書くなら Write を使うこと。出力を捨てるためなら、捨てずに `| tail -n 20` か `| head` で絞る。要る行だけなら `| grep` を使う。',
+    '出力のリダイレクト（`>`・`>>`・`>|`・`&>`・`>/dev/null`・`2>/dev/null`）は通らないので、ファイルへ書くなら Write を使い、出力を捨てたいだけならリダイレクトを外してそのまま打ち、出力を読むこと（長い出力は道具が切って、全文をファイルに残す）。',
   'fd-dup':
-    '記述子の付け替え（`2>&1`・`>&2`）はこの Bash では使えない。Bash の道具は標準エラーも一緒に返すので要らない。出力を絞るなら、付け替えずに `| tail -n 20` を使うこと。',
+    '記述子の付け替え（`2>&1`・`>&2`）は通らないので、付け替えを外してそのまま打つこと（Bash の道具は標準エラーも一緒に返す）。',
   'pipe-stderr':
-    '`|&`（標準エラーも一緒にパイプへ流す記述子の付け替え）はこの Bash では使えない。`|` だけでよい。Bash の道具は標準エラーも一緒に返すので、絞るなら `| tail -n 20` を使うこと。',
+    '`|&`（標準エラーも一緒に管へ流す形）は通らないので、`|&` を外してそのまま打つこと（Bash の道具は標準エラーも一緒に返す）。',
   'sed-in-place':
-    '`sed -i`（`--in-place`・`-Ei`・`-i.bak` を含む）はこの Bash では使えない。ファイルの置き換えは Edit を使うこと。例えば `foo` を `bar` に直すなら、Edit で old_string に `foo`、new_string に `bar` を渡す（同じ語が複数あるなら replace_all を立てるか、前後の行を含めて一意にする）。',
+    '`sed -i`（`--in-place`・`-Ei`・`-i.bak` を含む）は通らないので、ファイルの置き換えは Edit で、old_string に元の文字列、new_string に新しい文字列を渡して行うこと（同じ語が複数あるなら replace_all を立てるか、前後の行を含めて一意にする）。',
   'node-eval':
-    '`node -e`・`--eval`・`-p`・`--print` はこの Bash では使えない。読むだけなら Read か grep を使うこと。処理が要るなら、スクリプトを Write で作業ディレクトリの中に書き、絶対パスで `node /絶対パス/script.mjs` と実行する。',
+    '`node -e`・`--eval`・`-p`・`--print` は通らないので、読むだけなら Read か grep を使い、処理が要るならスクリプトを Write で作業ディレクトリの中に書いて `node /絶対パス/script.mjs` で実行すること。',
   'python-c':
-    '`python -c`・`python3 -c` はこの Bash では使えない。読むだけなら Read か grep を使うこと。処理が要るなら、スクリプトを Write で作業ディレクトリの中に書き、絶対パスで `python3 /絶対パス/script.py` と実行する。',
+    '`python -c`・`python3 -c` は通らないので、読むだけなら Read か grep を使い、処理が要るならスクリプトを Write で作業ディレクトリの中に書いて `python3 /絶対パス/script.py` で実行すること。',
   'perl-eval':
-    '`perl -e`・`-E`・`-i` はこの Bash では使えない。読むだけなら Read か grep を使うこと。ファイルの置き換えは Edit を使う。処理が要るなら、スクリプトを Write で作業ディレクトリの中に書き、絶対パスで `perl /絶対パス/script.pl` と実行する。',
+    '`perl -e`・`-E`・`-i` は通らないので、読むだけなら Read か grep、ファイルの置き換えは Edit を使い、処理が要るならスクリプトを Write で作業ディレクトリの中に書いて `perl /絶対パス/script.pl` で実行すること。',
   'git-reset':
-    '`git reset`（`--hard`・`--soft`・`--mixed` を含む全ての形）はこの Bash では使えない。ステージを外すなら `git restore --staged <path>` を使うこと。作業ツリーの変更を捨てる・枝を動かすなら、捨てる前に依頼者へ確かめる。コミットを取り消して戻すなら `git revert <commit>` を使う。',
+    '`git reset`（`--hard`・`--soft`・`--mixed` を含む全ての形）は通らないので、ステージを外すなら `git restore --staged <path>`、コミットを取り消して戻すなら `git revert <commit>` を使うこと（作業ツリーの変更を捨てる・枝を動かすのが目的のときだけは、捨てる前に依頼者へ確かめる）。',
   'git-force-push':
-    '`git push` の `--force`・`--force-with-lease`・`--force-if-includes`・`-f`（`-uf` のような組み合わせを含む）と、`+` で始まる refspec（`git push origin +main`）はこの Bash では使えない。新しいコミットを積んで普通に push すること。履歴を書き換える必要があるなら、新しい枝を切って PR にする。',
+    '`git push` の強制（`--force`・`--force-with-lease`・`--force-if-includes`・`-f`・`-uf` のような組み合わせ・`+` で始まる refspec）は通らないので、新しいコミットを積んで普通に `git push` し、履歴を書き換える必要があるなら新しい枝を切って PR にすること。',
   'git-rebase':
-    '`git rebase`（`git pull --rebase`・`git pull -r` を含む）はこの Bash では使えない。最新の main を取り込むなら `git merge origin/main` を使うこと。途中で止まった rebase から抜けるなら、`git rebase --abort` は通る。',
+    '`git rebase`（`git pull --rebase`・`git pull -r` を含む）は通らないので、最新の main を取り込むなら `git merge origin/main` を使うこと（途中で止まった rebase から抜ける `git rebase --abort` は通る）。',
   'no-verify':
-    '`--no-verify`（git のどの下位命令でも）と `git commit -n` はこの Bash では使えない。フックが落ちたなら、落ちた理由を直してから打ち直すこと。',
+    '`--no-verify`（git のどの下位命令でも）と `git commit -n` は通らないので、フックが落ちた理由を直してから、付けずに打ち直すこと。',
   'gh-merge-auto':
-    '`gh pr merge --auto` はこの Bash では使えない。CI を前面で `timeout 530 gh run watch <id> --exit-status` で待ち、緑なら `gh pr merge <番号> --squash --match-head-commit <sha>` のように `--match-head-commit` を付けてマージすること。',
+    '`gh pr merge --auto` は通らないので、CI を前景で `timeout 530 gh run watch <id> --exit-status` で待ち、緑なら `gh pr merge <番号> --squash --match-head-commit <sha>` でマージすること。',
 };
 
-function blocked(form: BashShapeForm): BashShapeVerdict {
-  return { blocked: true, form, reason: REASONS[form] };
+/** どの形の理由にも最後に添える1文（#4989）。止めたのが1回の呼び出しだけで、書き直して続けてよいことを言う。 */
+export const BASH_SHAPE_CONTINUE_NOTE =
+  '止めたのはこの1回の呼び出しだけなので、上のとおり書き直して、依頼者の返事を待たずにそのまま続けること。迷ったら、1回の Bash では1つのコマンドだけを、変数を使わず絶対パスで打ち、出力はそのまま読む。';
+
+type FixedReasonForm = Exclude<BashShapeForm, 'pipe-masks-exit'>;
+
+function blocked(form: FixedReasonForm): BashShapeVerdict {
+  return { blocked: true, form, reason: `${REASONS[form]}${BASH_SHAPE_CONTINUE_NOTE}` };
+}
+
+function pipeMasksExitReason(name: string): string {
+  return `\`${name}\` の出力を管（\`| tail\` など）に渡すと、終了コードが管の最後のコマンドのものになり、\`${name}\` が失敗しても成功に見えるので通らない。管を外して \`${name} …\` だけを打ち、出力はそのまま読むこと（長い出力は道具が切って、全文をファイルに残す）。${BASH_SHAPE_CONTINUE_NOTE}`;
 }
 
 const SEGMENT_BOUNDARY = new Set([';', '&', '|', '\n', '(', ')', '\u0060']);
@@ -462,7 +476,7 @@ const NODE_VALUED = new Set([
 ]);
 const PYTHON_VALUED = new Set(['-W', '-X', '--check-hash-based-pycs']);
 
-function inspectInterpreter(name: string, args: readonly string[]): BashShapeForm | undefined {
+function inspectInterpreter(name: string, args: readonly string[]): FixedReasonForm | undefined {
   if (name === 'sed') {
     return args.some(
       (a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place' || a.startsWith('--in-place='),
@@ -539,7 +553,7 @@ function isForcePush(rest: readonly string[]): boolean {
   );
 }
 
-function inspectGit(args: readonly string[]): BashShapeForm | undefined {
+function inspectGit(args: readonly string[]): FixedReasonForm | undefined {
   const g = gitSubcommandOf(args);
   if (g === undefined) return undefined;
   const dd = g.rest.indexOf('--');
@@ -567,7 +581,8 @@ function inspectGit(args: readonly string[]): BashShapeForm | undefined {
   }
 }
 
-function inspectGh(args: readonly string[]): BashShapeForm | undefined {
+// `gh` の先頭の位置引数（`pr merge` など）。`-R <repo>` は読み飛ばす
+function ghPositionals(args: readonly string[]): string[] {
   const positional: string[] = [];
   for (let i = 0; i < args.length && positional.length < 2; i += 1) {
     const a = args[i] ?? '';
@@ -577,9 +592,234 @@ function inspectGh(args: readonly string[]): BashShapeForm | undefined {
       positional.push(a);
     }
   }
+  return positional;
+}
+
+function inspectGh(args: readonly string[]): FixedReasonForm | undefined {
+  const positional = ghPositionals(args);
   return positional[0] === 'pr' && positional[1] === 'merge' && args.includes('--auto')
     ? 'gh-merge-auto'
     : undefined;
+}
+
+// 管の最後でない段に置かれたとき、終了コードが隠れて困るコマンド（#4990）。mutating は状態を変えるので止め、checker は成否を見るためのもので知らせる
+type PipeStage = { kind: 'mutating'; name: string } | { kind: 'checker'; name: string };
+
+const GIT_MUTATING = new Set([
+  'merge',
+  'pull',
+  'commit',
+  'cherry-pick',
+  'revert',
+  'am',
+  'apply',
+  'push',
+  'checkout',
+  'switch',
+  'restore',
+]);
+
+const STASH_MUTATING = new Set(['push', 'pop', 'apply', 'drop', 'save']);
+
+// `pnpm`・`npm`・`yarn`・`bun` の全体の選択肢のうち、値を取るもの（`--filter=x` のように `=` で続けた形は1語なので、ここに無くても読み飛ばせる）
+const PACKAGE_MANAGER_VALUED = new Set([
+  '-C',
+  '--dir',
+  '--filter',
+  '-F',
+  '--prefix',
+  '--workspace',
+  '--cwd',
+  '--reporter',
+]);
+
+const SCRIPT_CHECKER_RE = /^(test|build|typecheck|lint|format|check)/;
+
+// 値を取る選択肢を読み飛ばして、位置引数だけを集める
+function positionalsOf(args: readonly string[], valued: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? '';
+    if (a === '--') continue;
+    if (a.startsWith('-')) {
+      if (valued.has(a)) i += 1;
+    } else {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+// 引数の並び（選択肢を含む）のうち、最初の位置引数の位置。無ければ -1
+function firstOperandIndex(args: readonly string[], valued: ReadonlySet<string>): number {
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? '';
+    if (a === '--') continue;
+    if (!a.startsWith('-')) return i;
+    if (valued.has(a)) i += 1;
+  }
+  return -1;
+}
+
+// 道具そのもの（`pnpm exec`・`npx` の先にも来る）。git・gh・パッケージマネージャーは含まない
+function classifyTool(name: string, args: readonly string[]): PipeStage | undefined {
+  switch (name) {
+    case 'prettier':
+      return args.includes('--write') || args.includes('-w')
+        ? { kind: 'mutating', name: 'prettier --write' }
+        : { kind: 'checker', name };
+    case 'eslint':
+      return args.includes('--fix')
+        ? { kind: 'mutating', name: 'eslint --fix' }
+        : { kind: 'checker', name };
+    case 'vitest':
+    case 'jest':
+    case 'tsc':
+    case 'pytest':
+    case 'make':
+      return { kind: 'checker', name };
+    case 'cargo': {
+      const sub = positionalsOf(args, new Set())[0];
+      return sub !== undefined && ['test', 'build', 'check', 'clippy'].includes(sub)
+        ? { kind: 'checker', name: `cargo ${sub}` }
+        : undefined;
+    }
+    case 'go': {
+      const sub = positionalsOf(args, new Set())[0];
+      return sub !== undefined && ['test', 'build', 'vet'].includes(sub)
+        ? { kind: 'checker', name: `go ${sub}` }
+        : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function classifyPackageManager(name: string, args: readonly string[]): PipeStage | undefined {
+  const at = firstOperandIndex(args, PACKAGE_MANAGER_VALUED);
+  if (at < 0) return undefined;
+  const first = args[at] ?? '';
+  const after = args.slice(at + 1);
+  if (first === 'exec' || first === 'dlx') {
+    const inner = firstOperandIndex(after, new Set());
+    return inner < 0 ? undefined : classifyTool(after[inner] ?? '', after.slice(inner + 1));
+  }
+  const script =
+    first === 'run' || first === 'run-script'
+      ? positionalsOf(after, PACKAGE_MANAGER_VALUED)[0]
+      : first;
+  return script !== undefined && SCRIPT_CHECKER_RE.test(script)
+    ? { kind: 'checker', name: `${name} ${script}` }
+    : undefined;
+}
+
+function classifyStage(word: CommandWord): PipeStage | undefined {
+  const { name, args } = word;
+  switch (name) {
+    case 'git': {
+      const g = gitSubcommandOf(args);
+      if (g === undefined) return undefined;
+      if (GIT_MUTATING.has(g.sub)) return { kind: 'mutating', name: `git ${g.sub}` };
+      if (g.sub === 'stash') {
+        const next = g.rest[0];
+        return next === undefined || next.startsWith('-') || STASH_MUTATING.has(next)
+          ? { kind: 'mutating', name: 'git stash' }
+          : undefined;
+      }
+      return undefined;
+    }
+    case 'gh': {
+      const p = ghPositionals(args);
+      if (p[0] === 'pr' && p[1] === 'merge') return { kind: 'mutating', name: 'gh pr merge' };
+      if (p[0] === 'run' && p[1] === 'watch') return { kind: 'checker', name: 'gh run watch' };
+      if (p[0] === 'pr' && p[1] === 'checks') return { kind: 'checker', name: 'gh pr checks' };
+      return undefined;
+    }
+    case 'pnpm':
+    case 'npm':
+    case 'yarn':
+    case 'bun':
+      return classifyPackageManager(name, args);
+    case 'npx':
+    case 'pnpx': {
+      const at = firstOperandIndex(args, new Set(['-p', '--package', '-c', '--call']));
+      return at < 0 ? undefined : classifyTool(args[at] ?? '', args.slice(at + 1));
+    }
+    default:
+      return classifyTool(name, args);
+  }
+}
+
+// 文（`;`・`&&`・`||`・`&`・改行・括弧で区切る）ごとに、単独の `|` で区切った段の並びを返す。`||` は文の区切り
+function splitPipelines(command: string, outside: readonly boolean[]): string[][][] {
+  const statements: string[][][] = [];
+  let stages: string[][] = [];
+  let tokens: string[] = [];
+  let tokenStart = -1;
+  const endToken = (end: number): void => {
+    if (tokenStart >= 0) tokens.push(command.slice(tokenStart, end));
+    tokenStart = -1;
+  };
+  const endStage = (end: number): void => {
+    endToken(end);
+    stages.push(tokens);
+    tokens = [];
+  };
+  const endStatement = (end: number): void => {
+    endStage(end);
+    statements.push(stages);
+    stages = [];
+  };
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command.charAt(i);
+    if (!outside[i]) {
+      if (tokenStart < 0) tokenStart = i;
+    } else if (ch === '|' && command.charAt(i + 1) === '|') {
+      endStatement(i);
+      i += 1;
+    } else if (ch === '|') {
+      endStage(i);
+      if (command.charAt(i + 1) === '&') i += 1;
+    } else if (SEGMENT_BOUNDARY.has(ch)) {
+      endStatement(i);
+    } else if (ch === ' ' || ch === '\t') {
+      endToken(i);
+    } else if (tokenStart < 0) {
+      tokenStart = i;
+    }
+  }
+  endStatement(command.length);
+  return statements;
+}
+
+export type PipeExitMasking =
+  { kind: 'mutating'; name: string } | { kind: 'checker'; name: string; last: string };
+
+/**
+ * 管の最後でない段に、終了コードを隠すと困るコマンドが在るかを読む（#4990）。段が2つ以上の文だけを見る。
+ * 最初に当たった mutating を、無ければ最初に当たった checker を返す。引用符・注釈の中は見ない。
+ */
+export function inspectPipeExitMasking(command: string): PipeExitMasking | undefined {
+  // 管の各段の終了コードを自分で拾う形（`PIPESTATUS`・`pipefail`）は見ない: 隠れていないので、止めても知らせても邪魔になるだけのため
+  if (/\bPIPESTATUS\b|\bpipefail\b/.test(command)) return undefined;
+  const subs = findQuotedSubstitutions(command);
+  const visible = subs.length > 0 ? maskSubstitutions(command, subs) : command;
+  const scan = computeQuoteScan(visible);
+  const scrubbed = scrubComments(visible, scan.comment);
+  const tokenMask = scan.outside.map((o, i) => o || scan.comment[i] === true);
+  let checker: PipeExitMasking | undefined;
+  for (const stages of splitPipelines(scrubbed, tokenMask)) {
+    if (stages.length < 2) continue;
+    const last = commandWordOf(stages[stages.length - 1] ?? [])?.name ?? '';
+    for (const tokens of stages.slice(0, -1)) {
+      const word = commandWordOf(tokens);
+      const stage = word === undefined ? undefined : classifyStage(word);
+      if (stage === undefined) continue;
+      if (stage.kind === 'mutating') return stage;
+      checker ??= { kind: 'checker', name: stage.name, last };
+    }
+  }
+  return checker;
 }
 
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'ash']);
@@ -593,6 +833,20 @@ function shellScriptOperand(rawArgs: readonly string[]): string | undefined {
     if (a === '-o' || a === '+o' || a === '-O' || a === '+O') i += 1;
   }
   return undefined;
+}
+
+/**
+ * 検査のコマンドを管に渡した Bash が成功で返った回に添える知らせ（#4990）。止めない。読めなかったときは何も添えない: 知らせのために道具の結果を壊さないため。
+ */
+export function pipeExitNotice(toolName: string | undefined, command: unknown): string | null {
+  if (toolName !== 'Bash' || typeof command !== 'string') return null;
+  try {
+    const masking = inspectPipeExitMasking(command);
+    if (masking?.kind !== 'checker') return null;
+    return `直前の Bash が成功で返ったのは管の最後の \`${masking.last}\` の終了コードで、\`${masking.name}\` が通ったことは表さない。成否は出力の要約の行で確かめ、見えなければ管を外して打ち直すこと（#4990）。`;
+  } catch {
+    return null;
+  }
 }
 
 export function inspectBashShape(command: string, depth = 0): BashShapeVerdict {
@@ -634,6 +888,12 @@ export function inspectBashShape(command: string, depth = 0): BashShapeVerdict {
     const inner = inspectBashShape(sub.body, depth + 1);
     if (!inner.blocked) continue;
     return inner.form === 'heredoc' ? blocked('subst-heredoc') : inner;
+  }
+
+  // 管の判定は最後に置く: 上の形のほうが直す道がはっきりしているため。`bash -c` の中・置換の中は、上の再帰が自分の最後で読む
+  const masking = inspectPipeExitMasking(command);
+  if (masking?.kind === 'mutating') {
+    return { blocked: true, form: 'pipe-masks-exit', reason: pipeMasksExitReason(masking.name) };
   }
   return { blocked: false };
 }
