@@ -68,6 +68,7 @@ import {
 } from './denial-shape.js';
 import {
   buildActivityDigest,
+  type DigestShape,
   type ManagerAwaitingBackgroundMap,
   type ManagerLiveness,
 } from './digest.js';
@@ -5098,12 +5099,13 @@ class Clone implements CloneHost {
         const cause = event.cause === 'manual' ? 'manual' : 'schedule';
         const journalCause = event.cause ?? 'schedule';
         const plan = claimed.status === 'ok' ? claimed.plan : null;
-        const timerDigest = await this.#recentDigest();
-        // 同じ会話の2回目以降は前回からの差分にする（#4937）。日誌の1行は差分にする前の全文の長さのまま（`turnInputEntry` は今までどおり）
+        // #4938 の案2: 要約の全体ではなく、担当の節・継続中の依頼の節と、他の節の件数の行だけを付ける。
+        // `renderDigest` に通さない: 短いので差分にしなくてよく、通すと節の控えがこの形で上書きされ、自発の tick の差分の基準が崩れるため
+        const timerDigest = await this.#recentDigestCounts();
+        // 依頼の本文と固定の指示は、同じ会話の2回目以降は短い参照にする（#4937）
         const firedAt = new Date();
         // 組む直前にも判定し直す（#4941）: `#pump` の判定の後の `await` の間に、作り直しの窓が開きうる
         this.#resetDigestDeltaIfNewConversation();
-        const sentDigest = this.#digestDelta.renderDigest(timerDigest, firedAt);
         const instructionRef = '（固定の指示は会話の上と同じ）';
         const timerInstruction =
           plan === null
@@ -5137,7 +5139,7 @@ class Clone implements CloneHost {
           ...(plan?.lastRunAt === undefined ? {} : { lastRunAt: plan.lastRunAt }),
           // 走りかけていた可能性があることを隠さない: 二重に手を出さないため
           ...(plan?.pendingRun === undefined ? {} : { unfinishedAt: plan.pendingRun.at }),
-          digest: sentDigest.text,
+          digest: timerDigest,
           fixedInstruction: timerInstruction,
           ...(seenRequestAt === null
             ? {}
@@ -5145,8 +5147,8 @@ class Clone implements CloneHost {
                 requestRef: `依頼の本文は前回（${clockLabel(seenRequestAt)}）の発火と同じ。会話の上にある`,
               }),
         });
-        // 長さの上限で要約の末尾が切られたら、控えを進めない: 会話に載っていない節を「上にある」と言わないため
-        if (!timerPrompt.endsWith(sentDigest.text)) this.#digestDelta.discardStaged();
+        // 長さの上限で末尾が切られたら、控えを進めない: 会話に載っていない文を「上にある」と言わないため
+        if (!timerPrompt.endsWith(timerDigest)) this.#digestDelta.discardStaged();
         const outcome = await this.#runInternal(timerPrompt);
 
         // 完了の記録は claim とは別に、ここで行う: ここまで来ないうちに器が落ちたら印が残って配り直される
@@ -5516,7 +5518,7 @@ class Clone implements CloneHost {
   }
 
   // 日報は「記憶の床」の1行を付けない: tick という区切りに数を出す仕組みで、日報はその区切りではないため
-  async #recentDigestBare(): Promise<string> {
+  async #recentDigestBare(shape: DigestShape = 'full'): Promise<string> {
     try {
       const axes = await this.#managerDigestAxes();
       return await buildActivityDigest(
@@ -5524,10 +5526,16 @@ class Clone implements CloneHost {
         { since: new Date(Date.now() - RECENT_DIGEST_WINDOW_MS) },
         axes.liveness,
         axes.awaitingBackground,
+        { shape },
       );
     } catch (error) {
       return `（直近の状況をまとめられなかった: ${reasonOf(error)}）`;
     }
+  }
+
+  // #4938 の案2: 定期の依頼の tick は、要約の全体ではなく担当の節・継続中の依頼の節と、他の節の件数の行を付ける
+  async #recentDigestCounts(): Promise<string> {
+    return `${await this.#memoryFloorDigestLine()}\n\n${await this.#recentDigestBare('counts')}`;
   }
 
   // 書き込みを止める門にしない・畳むことを強制しない: 数を1行足すだけで、判断は常にクローンが下すため。
