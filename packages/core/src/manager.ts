@@ -6353,7 +6353,108 @@ class Pool implements ManagerPool {
         noteDroppedRecord('枠で止まった借りの清算', `managerId=${managerId}`, error);
       }
     }
+    for (const managerId of await this.#sweepRetiredUsageWakes()) nudged.push(managerId);
     for (const managerId of await this.#sweepWorkerLimitWakes()) nudged.push(managerId);
+    return nudged;
+  }
+
+  /**
+   * 動いているデーモンの上で枠に当たって failed / lost になり、`#retire` で像から外れた担当を、周回の掃きでも起こす（#5166）。
+   * 上の走査は `#records` を起点にするので、像に無く挑み直しの状態も持たない担当は誰にも拾われない。
+   * 鍵の出来事（`rotated` / `recovered` / `reopened`）が出ない戻り方では、契機は他に無い。
+   * 起こすのは次の両方が成り立つときだけ（片方でも欠ければ印を残す）:
+   * (a) 現役の鍵が `ready`（`#wakeIfHeldTokenStale` と同じ口。通らないなら起こしても同じ枠に当たる）。
+   * (b) 担当が止まった後に鍵が通る状態へ戻ったと言える。次の3つの材料のどれかが成り立つとき。材料が無ければ起こさない（「分からない」を起こす側へ倒さない）。
+   *     1. 世代: 現役の世代が、担当の抱えていた世代（`#tokenIdentities`）と違う。
+   *     2. 冷却明け: 現役の鍵の `cooldownUntil` が `usageStoppedAt` より後で、もう過ぎている。
+   *     3. 成功の観測: 現役の鍵の行に `lastRejectedAt` も `cooldownUntil` も無く、`updatedAt` が `usageStoppedAt` より後。
+   *        鍵が尽きて同じ世代へ戻る形では、成功を観測した回し手が `markTokenUsable` で 2 を消すので、2 だけでは拾えない。
+   *        `lastRejectedAt` を消すのは `markTokenUsable` だけだが、`updatedAt` は人の編集（ラベル・順位・無効の切り替え・値の差し替え。
+   *        `buildTokens` の `changed`）でも進む。拒否の記録が無い行で、止まった後に人が編集した回は誤って起こしうる
+   *        （起こして枠に当たれば、既存の挑み直しの間隔と印に戻る。ready は成り立っているので被害は 1 ターン）。
+   * 人が止めた担当・後継の居る担当は `#nudgeForUsageRotation` の許可リストが `gone` と返す（ここでは緩めない）。
+   * 同じ担当を二重に起こさないのは、掃きを直列のままにして `#resuming` の busy と `#nudge` の判定に任せるため。ここに専用の排他は足さない。
+   */
+  async #sweepRetiredUsageWakes(): Promise<string[]> {
+    const nudged: string[] = [];
+    const candidates = [...this.#usageStopped].filter(
+      (managerId) => !this.#records.has(managerId) && !this.#usageWakeRetry.has(managerId),
+    );
+    if (candidates.length === 0) return nudged;
+    const identity = this.#tokenIdentity?.();
+    if (identity === undefined || this.#tokenAvailability === undefined) return nudged;
+    const availability = await this.#tokenAvailability(identity.tokenId).catch(() => undefined);
+    if (availability !== 'ready') return nudged;
+    // 現役の鍵の行は(b)の2つ目・3つ目の材料で、世代が違えば要らないので、要る担当が現れるまで読まない。1周で1度だけ読む。
+    let activeRow: Pick<AgentToken, 'cooldownUntil' | 'lastRejectedAt' | 'updatedAt'> | undefined;
+    let activeRowRead = false;
+    const readActiveRow = async (): Promise<typeof activeRow> => {
+      if (!activeRowRead) {
+        activeRowRead = true;
+        try {
+          activeRow = (await this.#stores.tokens.list()).find(
+            (token) => token.id === identity.tokenId,
+          );
+        } catch (error) {
+          noteDroppedRecord('枠で止まった担当の鍵の行の読み取り', identity.tokenId, error);
+          activeRow = undefined;
+        }
+      }
+      return activeRow;
+    };
+    for (const managerId of candidates) {
+      if (this.#stopped) break;
+      try {
+        // 判定の間に別の契機が起こして印を下ろした・像に載せた担当は触らない。
+        if (
+          !this.#usageStopped.has(managerId) ||
+          this.#records.has(managerId) ||
+          this.#usageWakeRetry.has(managerId)
+        ) {
+          continue;
+        }
+        // 像へは載せない（`#load` しない）: 起こさない担当まで毎周 `#records` に居座らせないため。起こすなら `#nudgeForUsageRotation` が載せる。
+        const job = await this.#findJob(managerId);
+        if (job === undefined) continue;
+        const heldGeneration = this.#tokenIdentities.get(managerId)?.generation;
+        let returned = heldGeneration !== undefined && heldGeneration !== identity.generation;
+        if (!returned && job.usageStoppedAt !== undefined) {
+          const stoppedAt = Date.parse(job.usageStoppedAt);
+          const row = await readActiveRow();
+          if (!Number.isNaN(stoppedAt) && row !== undefined) {
+            const until = row.cooldownUntil;
+            const updatedAt = row.updatedAt === undefined ? NaN : Date.parse(row.updatedAt);
+            returned =
+              // 冷却明け: 止まった後に明けていて、もう過ぎている
+              (until !== undefined && until > stoppedAt && until <= this.#now()) ||
+              // 成功の観測: 拒否も冷却も残っておらず、行が止まった後に更新されている（`markTokenUsable` だけが `lastRejectedAt` を消して `updatedAt` をその時刻にする）
+              (until === undefined &&
+                row.lastRejectedAt === undefined &&
+                !Number.isNaN(updatedAt) &&
+                updatedAt > stoppedAt);
+          }
+        }
+        if (!returned) continue;
+        // 判定の間に別の契機が起こして印を下ろしていたら、二重に起こさない。
+        if (!this.#usageStopped.has(managerId)) continue;
+        await this.#journal({
+          type: 'decision',
+          decision: `[${managerId}] 枠で落ちて像から外れた担当を、掃きで起こし直す（現役の鍵は世代 ${String(identity.generation)}、ready。止まった後に通る状態へ戻った）`,
+          grounds:
+            `managerId=${managerId} tokenId=${identity.tokenId} 鍵の状態=ready ` +
+            '（#5166。鍵の出来事が出ない戻り方では、像に無い担当を起こす契機が他に無い）',
+        });
+        const outcome = await this.#nudgeForUsageRotation(managerId);
+        // `skipped`（届かなかった）は印を残し、挑み直しの状態へ乗せる。以後は上の走査が間隔を置いて拾う。
+        this.#noteUsageWakeOutcome(managerId, outcome);
+        if (outcome === 'nudged' || outcome === 'gone') {
+          await this.#clearUsageStoppedMark(managerId);
+        }
+        if (outcome === 'nudged') nudged.push(managerId);
+      } catch (error) {
+        noteDroppedRecord('像から外れた枠の停止の起こし直し', `managerId=${managerId}`, error);
+      }
+    }
     return nudged;
   }
 
@@ -13313,7 +13414,8 @@ function usageRotationNudge(): string {
     'この会話はそのまま続いている（最初からやり直さないこと）。' +
     '枠で落ちたターンだけをやり直し、中断していた作業の続きを進めよ。' +
     '作業者（サブエージェント）が枠で止まっていたなら、鍵が戻っても自動では戻らない。' +
-    'SendMessage でその作業者に続きを頼み直すこと（新しく立て直さない）。'
+    'SendMessage でその作業者に続きを頼み直すこと（新しく立て直さない）。' +
+    'まず作業ツリーと枝の状態を測り、未 push のコミットがあれば先に push してから、止まった所から続けること。'
   );
 }
 
