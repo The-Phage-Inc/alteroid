@@ -13,6 +13,7 @@ import {
   stripNul,
   UnreadableCommitmentError,
   unreadableCommitmentSchema,
+  withoutClosedRecord,
 } from '@alteroid/core';
 import type {
   Commitment,
@@ -21,6 +22,7 @@ import type {
   CommitmentList,
   EditCommitmentBodyOptions,
   CommitmentOpenResult,
+  CommitmentReopenResult,
   CommitmentStore,
   UnreadableCommitment,
 } from '@alteroid/core';
@@ -284,6 +286,40 @@ export class FsCommitmentStore implements CommitmentStore {
           trimmedClosedIds: file.trimmedClosedIds,
         }),
         result: closedIds,
+      };
+    });
+  }
+
+  async reopen(id: string): Promise<CommitmentReopenResult> {
+    if (hasNul(id)) return { kind: 'not-found' };
+    // 判定と書き込みを同じ排他区間で行う: 分けると、並行の片付けや二重の開き直しと競合して、`before` が実際に外した記録とずれるため
+    return this.#update<CommitmentReopenResult>((file) => {
+      const found = file.entries.find((entry) => entry.id === id);
+      if (found === undefined) {
+        // 読めない行は閉じていても投げる（`get` と同じ。書き直さない）
+        const broken = file.unreadable.find((row) => row.id === id);
+        if (broken !== undefined) {
+          throw new UnreadableCommitmentError(
+            `引き受けた仕事 ${id} が読めない形で入っている（片付いたのではない）: ${broken.reason}`,
+          );
+        }
+        return { next: file, result: { kind: 'not-found' } };
+      }
+      if (found.closedAt === undefined) return { next: file, result: { kind: 'not-closed' } };
+      // 重複の判定も同じ排他区間で行う: `open` の畳み込みが守る不変条件を、開き直しの経路で破らないため
+      const reopened = withoutClosedRecord(found);
+      const duplicate = findOpenManagerDuplicate(file.entries, reopened);
+      if (duplicate !== undefined) {
+        return { next: file, result: { kind: 'duplicate-open', openId: duplicate.id } };
+      }
+      return {
+        next: {
+          entries: file.entries.map((entry) => (entry.id === id ? reopened : entry)),
+          unreadable: file.unreadable,
+          trimmedClosedCount: file.trimmedClosedCount,
+          trimmedClosedIds: file.trimmedClosedIds,
+        },
+        result: { kind: 'reopened', before: found },
       };
     });
   }

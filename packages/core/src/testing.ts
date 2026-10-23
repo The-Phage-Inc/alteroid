@@ -131,6 +131,7 @@ import {
   CommitmentConflictError,
   commitmentVersionMatches,
   compareProfileEntryNames,
+  withoutClosedRecord,
   ensureTrailingNewline,
   findOpenManagerDuplicate,
   JournalAnchorNotFoundError,
@@ -843,6 +844,17 @@ export function createMemoryStores(): Stores {
         closedIds.push(id);
       }
       return closedIds;
+    },
+    // 判定と書き込みのあいだに `await` を挟まない（`open` と同じ）。`autoCloseWhenBack` も外す理由は `CommitmentStore.reopen` の doc。
+    async reopen(id) {
+      const existing = commitments.get(id);
+      if (!existing) return { kind: 'not-found' };
+      if (existing.closedAt === undefined) return { kind: 'not-closed' };
+      const reopened = withoutClosedRecord(existing);
+      const duplicate = findOpenManagerDuplicate([...commitments.values()], reopened);
+      if (duplicate !== undefined) return { kind: 'duplicate-open', openId: duplicate.id };
+      commitments.set(id, reopened);
+      return { kind: 'reopened', before: isolate(existing) };
     },
     // `origin` の判定はしない: 呼び出し側（`PATCH /commitments/:id`）が確かめてから呼ぶ（`CommitmentStore.editBody` の doc）。
     async editBody(id, body, at, by: CommitmentEditedBy, options) {
