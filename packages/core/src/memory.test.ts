@@ -12,6 +12,7 @@ import {
   MEMORY_TIDY_TARGETS_BUDGET,
   describeMemoryTidyTargets,
   MEMORY_PROMPT_OUTLINE_BUDGET,
+  MEMORY_PROMPT_OUTLINE_HEADING_WIDTH,
   MEMORY_PROMPT_OMITTED_TAIL_BUDGET,
   MEMORY_TOC_CHAR_BUDGET,
   MEMORY_TOC_ENTRY_LIMIT,
@@ -60,6 +61,7 @@ import {
   type MemoryTocIssue,
 } from './memory.js';
 import type { JournalEntry, MemoryDescriptionFreshness, MemoryProtectionStatus } from './schema.js';
+import { fillListingBudget } from './excerpt.js';
 import { listPageByOverfetch } from './journal-page.js';
 import { JournalAnchorNotFoundError } from './store.js';
 import type { JournalQuery, JournalStore } from './store.js';
@@ -2223,7 +2225,7 @@ const INVARIANT2_CORPUS: MemoryPart[] = [
 ];
 
 const INVARIANT2_GOLDEN =
-  '<!-- memory: no-frontmatter.md（premise・本文は載っていない。全 32 文字 / 2 節） -->\n要旨: （まだ書かれていない。memory_frontmatter_set の description で書くこと——ここが空だと、本文を開くまでこの文書が何なのか分からない）\n節（memory_section_read に節id を渡せば本文が開く。数字は文字数・子込み）:\n[5f35fd4b-d02c5e61] # no-frontmatter — 32 文字\n  [a200735a-6700831a] ## 節A1 — 11 文字\n\n<!-- memory: explicit-premise.md（premise・本文は載っていない。全 85 文字 / 3 節） -->\n要旨: 要旨B\n節（memory_section_read に節id を渡せば本文が開く。数字は文字数・子込み）:\n[d261b61a-c981527a] # explicit-premise — 46 文字\n  [0ca6eb3f-52241122] ## 節B1 — 12 文字\n  [e2d59aaf-2a39d6bb] ## 節B2 — 11 文字\n\n<!-- memory: frontmatter が壊れている（既知の形にならなかった。premise として扱っている） -->\n<!-- memory: broken.md（premise・本文は載っていない。全 34 文字 / 1 節） -->\n要旨: （まだ書かれていない。memory_frontmatter_set の description で書くこと——ここが空だと、本文を開くまでこの文書が何なのか分からない）\n節（memory_section_read に節id を渡せば本文が開く。数字は文字数・子込み）:\n[489e4048-1b0e31ad] # broken — 12 文字\n\n<!-- memory: unknown-type.md（premise・本文は載っていない。全 76 文字 / 2 節） -->\n要旨: 要旨E\n節（memory_section_read に節id を渡せば本文が開く。数字は文字数・子込み）:\n[9f0ec3f9-96417823] # unknown-type — 30 文字\n  [d6a625f1-9195a16d] ## 節E1 — 11 文字\n\n<!-- memory: index -->\n## 記憶の目次（fact。本文は memory_read で開く。階層はインデントで表す）\n- fact-doc: fact-doc — 要旨を書いた時刻が記録されていない: 要旨C';
+  '<!-- memory: no-frontmatter.md（premise・本文は載っていない。全 32 文字 / 2 節） -->\n要旨: （まだ書かれていない。memory_frontmatter_set の description で書くこと——ここが空だと、本文を開くまでこの文書が何なのか分からない）\n節（memory_section_read に節id を渡せば本文が開く。文字数（子込み）は memory_outline で見られる）:\n[5f35fd4b-d02c5e61] # no-frontmatter\n  [a200735a-6700831a] ## 節A1\n\n<!-- memory: explicit-premise.md（premise・本文は載っていない。全 85 文字 / 3 節） -->\n要旨: 要旨B\n節（memory_section_read に節id を渡せば本文が開く。文字数（子込み）は memory_outline で見られる）:\n[d261b61a-c981527a] # explicit-premise\n  [0ca6eb3f-52241122] ## 節B1\n  [e2d59aaf-2a39d6bb] ## 節B2\n\n<!-- memory: frontmatter が壊れている（既知の形にならなかった。premise として扱っている） -->\n<!-- memory: broken.md（premise・本文は載っていない。全 34 文字 / 1 節） -->\n要旨: （まだ書かれていない。memory_frontmatter_set の description で書くこと——ここが空だと、本文を開くまでこの文書が何なのか分からない）\n節（memory_section_read に節id を渡せば本文が開く。文字数（子込み）は memory_outline で見られる）:\n[489e4048-1b0e31ad] # broken\n\n<!-- memory: unknown-type.md（premise・本文は載っていない。全 76 文字 / 2 節） -->\n要旨: 要旨E\n節（memory_section_read に節id を渡せば本文が開く。文字数（子込み）は memory_outline で見られる）:\n[9f0ec3f9-96417823] # unknown-type\n  [d6a625f1-9195a16d] ## 節E1\n\n<!-- memory: index -->\n## 記憶の目次（fact。本文は memory_read で開く。階層はインデントで表す）\n- fact-doc: fact-doc — 要旨を書いた時刻が記録されていない: 要旨C';
 
 describe('indexed — 第3の区分（要旨だけ。節の目次は焼かれない）', () => {
   it('⭐⭐ MEMORY_PROMPT_INDEXED_DESCRIPTION_BUDGET は premise の要旨予算＋目次予算より必ず小さい', () => {
@@ -4668,7 +4670,7 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
   const outlineOf = (content: string): string =>
     renderMemoryOutline(scanMemorySections(content).sections);
 
-  it('⭐ カードには本文が載らず、要旨・節の見出し・節id・文字数・開き方が載る', () => {
+  it('⭐ カードには本文が載らず、要旨・節の見出し・節id・開き方が載り、行に文字数は載らない', () => {
     const rendered = renderMemoryDocuments([
       {
         slug: 'about-me',
@@ -4681,7 +4683,9 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
     expect(rendered).toContain('要旨: 私の要旨');
     expect(rendered).toContain('## 判断の基準');
     expect(rendered).toContain('memory_section_read');
-    expect(rendered).toMatch(/\[[0-9a-f]{8}-[0-9a-f]{8}\] ## 判断の基準 — /);
+    expect(rendered).toMatch(/\[[0-9a-f]{8}-[0-9a-f]{8}\] ## 判断の基準$/m);
+    expect(rendered).not.toMatch(/ — [\d,]+ 文字/);
+    expect(rendered).toContain('文字数（子込み）は memory_outline で見られる');
     expect(rendered.length).toBeLessThan(400);
   });
 
@@ -4732,7 +4736,7 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
   it('⭐⭐ 焼き込みの断り書きは短く（落ちた末尾の一覧を除いて 500 字以下）、節数・直近の節・開き方・移す基準が在る', () => {
     const content =
       `---\ntype: premise\ndescription: 大きい\n---\n` +
-      Array.from({ length: 33 }, (_, i) => `## ${i + 1}. ${'あ'.repeat(190)}\n本文`).join('\n');
+      Array.from({ length: 90 }, (_, i) => `## ${i + 1}. ${'あ'.repeat(190)}\n本文`).join('\n');
     const rendered = renderMemoryDocuments([{ slug: 'heosterra-dev', content }]);
     const { sections } = scanMemorySections(content);
     const fit = measurePremiseOutlineFit({ slug: 'heosterra-dev', content });
@@ -4745,7 +4749,10 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
     expect(fit!.total).toBe(sections.length);
     // 直近の節: 落ちた末尾の最後の節が節id つきで載る
     const last = sections[sections.length - 1]!;
-    expect(rendered).toContain(`[${last.id}] ${last.heading}`);
+    // 焼き込みの行の見出しは幅で切ってある
+    expect(rendered).toContain(
+      `[${last.id}] ${last.heading.slice(0, MEMORY_PROMPT_OUTLINE_HEADING_WIDTH - 1)}…`,
+    );
     // 開き方と移す基準
     expect(rendered).toContain('side=tail');
     expect(rendered).toContain('q=<文字列>');
@@ -4761,14 +4768,14 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
   it('⭐⭐ 移した説明（仕組み・算術・⭐・side=tail の向き）は memory_outline の応答にあり、焼き込みには無い', () => {
     const content =
       `---\ntype: premise\ndescription: 大きい\n---\n` +
-      Array.from({ length: 33 }, (_, i) => `## ${i + 1}. ${'あ'.repeat(190)}\n本文`).join('\n');
+      Array.from({ length: 90 }, (_, i) => `## ${i + 1}. ${'あ'.repeat(190)}\n本文`).join('\n');
     const rendered = renderMemoryDocuments([{ slug: 'heosterra-dev', content }]);
     const outline = outlineOf(content);
     const moved = [
       '1行の平均は',
       '固定費',
       '見出しを平均',
-      '節の目次は全 33 節ぶん',
+      '節の目次は全 90 節ぶん',
       '毎ターンの床はほとんど動かない',
       'side=tail は末尾を**読む**ための向きであって',
       '末尾を**移す**ための指示ではない',
@@ -4818,6 +4825,30 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
     expect(omittedIn(at + 1)).toBe(true);
   });
 
+  // 幅を超える見出し（焼き込みでは切る）でも線が一致する: 注記の判定を道具の形（全文・文字数あり）で数えると、焼き込みが載せきる文書にも注記が出る
+  it('⭐ 80 字を超える見出しの文書でも、注記の出る線は焼き込みが省略を名乗る線と一致する', () => {
+    const build = (n: number) =>
+      `---\ntype: premise\ndescription: d\n---\n` +
+      Array.from({ length: n }, (_, i) => `## ${i}. ${'あ'.repeat(150)}\n本文`).join('\n');
+    const fit = measurePremiseOutlineFit({ slug: 'cliff', content: build(400) });
+    expect(fit).not.toBeNull();
+    const at = fit!.shown;
+    // 道具の形で数えれば、at 節は予算を超える（この試験が線のずれを捉えられる前提）
+    const toolStyleChars = scanMemorySections(build(at)).sections.reduce(
+      (sum, section) => sum + section.heading.length,
+      0,
+    );
+    expect(toolStyleChars).toBeGreaterThan(MEMORY_PROMPT_OUTLINE_BUDGET);
+    const noteIn = (n: number) =>
+      outlineOf(build(n)).includes('目次すら毎ターンの焼き込みに収まっていない');
+    const omittedIn = (n: number) =>
+      renderMemoryDocuments([{ slug: 'cliff', content: build(n) }]).includes('節は目次から省略');
+    expect(noteIn(at)).toBe(false);
+    expect(omittedIn(at)).toBe(false);
+    expect(noteIn(at + 1)).toBe(true);
+    expect(omittedIn(at + 1)).toBe(true);
+  });
+
   it('⭐⭐ 目次が予算で切れた文書は、落ちた末尾の直近の節を節id つきで名指しする', () => {
     const filler = Array.from(
       { length: 200 },
@@ -4833,7 +4864,7 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
     const namedAt = rendered.indexOf('## 58. 今日足したばかりの規則');
     expect(namedAt).toBeGreaterThan(omissionAt);
 
-    expect(rendered).toMatch(/\[[0-9a-f]{8}-[0-9a-f]{8}\] ## 58\. 今日足したばかりの規則 — /);
+    expect(rendered).toMatch(/\[[0-9a-f]{8}-[0-9a-f]{8}\] ## 58\. 今日足したばかりの規則$/m);
     expect(rendered).toContain('節id はそのまま memory_section_read に渡せる');
   });
 
@@ -4866,7 +4897,7 @@ describe('premise の焼き込み（カード）と、載せ直しの絞り込�
     const content = `---\ntype: premise\ndescription: 大きい\n---\n${huge}`;
     const outline = outlineOf(content);
 
-    expect(outline).toMatch(/1行の平均は \d+ 文字（うち節id と文字数の固定費が \d+ 文字）。/);
+    expect(outline).toMatch(/1行の平均は \d+ 文字（うち節id と記号の固定費が \d+ 文字）。/);
     expect(outline).toMatch(/見出しを平均 \d+ 文字（いま \d+ 文字）まで縮める必要がある。/);
     expect(renderMemoryDocuments([{ slug: 'big', content }])).not.toContain('1行の平均は');
   });
@@ -5393,5 +5424,240 @@ describe('describeMemoryTidyTargets — 焼き込みに収まっていない文�
 
     expect(reply).toContain('件は省略');
     expect(reply.length).toBeLessThan(MEMORY_TIDY_TARGETS_BUDGET * 2);
+  });
+});
+
+describe('焼き込みの目次の行は文字数を載せない（道具の応答の行は載せる）', () => {
+  const CHARS_SUFFIX = / — [\d,]+ 文字/;
+
+  const premiseOf = (slug: string, headings: readonly string[]): MemoryPart => ({
+    slug,
+    content:
+      '---\ntype: premise\ndescription: 要旨\n---\n' +
+      headings.map((heading) => `## ${heading}\n本文である。`).join('\n'),
+  });
+
+  // 変更前の行の形を手で組む: 実装の関数を呼ぶと、形が変わっても比較の片側が一緒に動いて差が消えるため
+  const oldStyleLines = (content: string): string[] =>
+    scanMemorySections(content).sections.map(
+      (section) =>
+        `${'  '.repeat(section.depth - 1)}[${section.id}] ${section.heading} — ${section.chars.toLocaleString('en-US')} 文字`,
+    );
+
+  it('⭐ 焼き込みのカードの目次の行に「— N 文字」が出ず、節id と見出しは出る', () => {
+    const doc = premiseOf('doc', ['規則A', '規則B']);
+    const rendered = renderMemoryDocuments([doc]);
+
+    expect(rendered).not.toMatch(CHARS_SUFFIX);
+    for (const section of scanMemorySections(doc.content).sections) {
+      expect(rendered).toContain(`[${section.id}] ${section.heading}`);
+    }
+  });
+
+  it('⭐ memory_outline など道具の応答の行には文字数が今のまま出る', () => {
+    const doc = premiseOf('doc', ['規則A', '規則B']);
+    const sections = scanMemorySections(doc.content).sections;
+    const tool = renderMemoryOutline(sections);
+
+    for (const section of sections) {
+      expect(tool).toContain(
+        `[${section.id}] ${section.heading} — ${section.chars.toLocaleString('en-US')} 文字`,
+      );
+    }
+    expect(renderMemoryOutline(sections, { q: '規則' })).toMatch(CHARS_SUFFIX);
+    expect(renderMemoryOutline(sections, { offset: 0 })).toMatch(CHARS_SUFFIX);
+  });
+
+  it('⭐ 文字数を外したぶん、予算に収まる節が増える（崖の位置が動く）', () => {
+    const doc = premiseOf(
+      'many',
+      Array.from({ length: 400 }, (_, i) => `これは中くらいの長さの見出しである ${i}`),
+    );
+    const before = fillListingBudget(oldStyleLines(doc.content), MEMORY_PROMPT_OUTLINE_BUDGET);
+    const fit = measurePremiseOutlineFit(doc);
+
+    expect(before.rest).toBeGreaterThan(0);
+    expect(fit).not.toBeNull();
+    expect(fit!.shown).toBeGreaterThan(before.shown);
+  });
+
+  it('⭐ 文字数の有無によらず、押し出し判定は節を取り違えない（押し出された節が名指しされる）', () => {
+    const base = Array.from({ length: 220 }, (_, i) => `節${i}`);
+    const before = premiseOf('doc', base);
+    const after = premiseOf('doc', [...base, ...Array.from({ length: 80 }, (_, i) => `追記${i}`)]);
+
+    const rendered = renderMemoryDocuments([after], {
+      seenContent: new Map([[after.slug, before.content]]),
+    });
+
+    expect(rendered).toContain('予算で押し出された節');
+    expect(rendered).not.toContain('いまは無い節');
+    expect(rendered).not.toMatch(CHARS_SUFFIX);
+  });
+});
+
+describe('焼き込みの目次の見出しは、長いものだけ先頭から一定の幅で切る', () => {
+  const WIDTH = MEMORY_PROMPT_OUTLINE_HEADING_WIDTH;
+
+  // 先頭に連番を置く: 切った後（先頭 WIDTH-1 字）でも節どうしが区別できるため
+  const longHeading = (i: number, length: number): string =>
+    `${i}.`.padEnd(length, 'あ').slice(0, length);
+
+  const premiseOf = (slug: string, headings: readonly string[]): MemoryPart => ({
+    slug,
+    content:
+      '---\ntype: premise\ndescription: 要旨\n---\n' +
+      headings.map((heading) => `## ${heading}\n本文である。`).join('\n'),
+  });
+
+  const cardLines = (rendered: string): string[] =>
+    rendered.split('\n').filter((line) => /^\s*\[[0-9a-f]{8}-[0-9a-f]{8}\] /.test(line));
+
+  it('⭐ 幅ちょうどまでは切らず、1字でも超えたら（幅 − 1）字 + 「…」に切る', () => {
+    const exact = `## ${'あ'.repeat(WIDTH - 3)}`;
+    const over = `## ${'い'.repeat(WIDTH - 2)}`;
+    expect(exact.length).toBe(WIDTH);
+    expect(over.length).toBe(WIDTH + 1);
+    const doc: MemoryPart = {
+      slug: 'doc',
+      content: `---\ntype: premise\ndescription: 要旨\n---\n${exact}\n本文\n${over}\n本文\n`,
+    };
+    const [first, second] = scanMemorySections(doc.content).sections;
+    const rendered = renderMemoryDocuments([doc]);
+
+    expect(rendered).toContain(`[${first!.id}] ${exact}\n`);
+    expect(rendered).not.toContain(`${exact}…`);
+    expect(rendered).toContain(`[${second!.id}] ${over.slice(0, WIDTH - 1)}…`);
+    expect(rendered).not.toContain(over);
+  });
+
+  it('⭐ 切った行にも節id が残り、節id で本文を開く口は変わらない', () => {
+    const doc = premiseOf('doc', [longHeading(1, 200), longHeading(2, 150)]);
+    const sections = scanMemorySections(doc.content).sections;
+    const lines = cardLines(renderMemoryDocuments([doc]));
+
+    expect(lines).toHaveLength(2);
+    sections.forEach((section, index) => {
+      expect(lines[index]).toMatch(new RegExp(`^\\s*\\[${section.id}\\] .{1,${WIDTH - 1}}…$`));
+      expect(lookupMemorySection(sections, section.id).kind).toBe('found');
+    });
+  });
+
+  it('切った見出しの全文は memory_outline に出る', () => {
+    const doc = premiseOf('doc', [longHeading(1, 200)]);
+    const sections = scanMemorySections(doc.content).sections;
+
+    expect(renderMemoryOutline(sections)).toContain(`${sections[0]!.heading} — `);
+  });
+
+  it('⭐ 切った行が1本でもあるときだけ、カードが切ったことと全文の在処を言う', () => {
+    const NOTE = '見出しが長いものは … で切ってある。全文は memory_outline';
+    expect(renderMemoryDocuments([premiseOf('short', ['短い見出し'])])).not.toContain(NOTE);
+    expect(renderMemoryDocuments([premiseOf('long', ['短い', longHeading(1, 100)])])).toContain(
+      NOTE,
+    );
+  });
+
+  it('⭐ 見出しを切ると、予算に収まる節が増える', () => {
+    const headings = Array.from({ length: 200 }, (_, i) => longHeading(i, 150));
+    const doc = premiseOf('long', headings);
+    const untruncated = fillListingBudget(
+      scanMemorySections(doc.content).sections.map(
+        (section) => `${'  '.repeat(section.depth - 1)}[${section.id}] ${section.heading}`,
+      ),
+      MEMORY_PROMPT_OUTLINE_BUDGET,
+    );
+    const fit = measurePremiseOutlineFit(doc);
+
+    expect(untruncated.rest).toBeGreaterThan(0);
+    expect(fit).not.toBeNull();
+    expect(fit!.shown).toBeGreaterThan(untruncated.shown);
+  });
+
+  it('⭐⭐ 押し出し判定は、切った見出しでも節を取り違えない（押し出された節が名指しされる）', () => {
+    const base = Array.from({ length: 200 }, (_, i) => longHeading(i, 120));
+    const before = premiseOf('doc', base);
+    const after = premiseOf('doc', [
+      ...base,
+      ...Array.from({ length: 120 }, (_, i) => longHeading(1000 + i, 120)),
+    ]);
+    const idsIn = (text: string): Set<string> =>
+      new Set([...text.matchAll(/\[([0-9a-f]{8}-[0-9a-f]{8})\]/g)].map((match) => match[1]!));
+    const vanished = [...idsIn(renderMemoryDocuments([before]))].filter(
+      (id) => !idsIn(renderMemoryDocuments([after])).has(id),
+    );
+    expect(vanished.length).toBeGreaterThan(0);
+
+    const rendered = renderMemoryDocuments([after], {
+      seenContent: new Map([[after.slug, before.content]]),
+    });
+
+    expect(rendered).toContain(`予算で押し出された節: ${vanished.length} 節`);
+    expect(rendered).not.toContain('いまは無い節');
+    expect(rendered).not.toContain('判定できない節');
+    expect(vanished.some((id) => idsIn(rendered).has(id))).toBe(true);
+  });
+
+  it('切った見出しが同じ先頭を共有する節は「判定できない」と名乗る（取り違えて断定しない）', () => {
+    const shared = 'あ'.repeat(WIDTH + 20);
+    const tail = (n: number) => `${shared}${n}`;
+    const filler = Array.from({ length: 60 }, (_, i) => `節${i}`);
+    const before = premiseOf('doc', [...filler, tail(1)]);
+    const after = premiseOf('doc', [...filler, tail(2), tail(3)]);
+
+    const rendered = renderMemoryDocuments([after], {
+      seenContent: new Map([[after.slug, before.content]]),
+    });
+
+    expect(rendered).not.toContain('押し出された節');
+    expect(rendered).toContain('判定できない節: 1 節');
+  });
+});
+
+describe('合成した本番相当の記憶（4 文書）で、各変更が焼き込みの字数を減らす', () => {
+  // 33・54・25・56 節。見出し長は 60〜200 字で平均 130 字前後、要旨は 1,000〜3,000 字
+  const SECTION_COUNTS = [33, 54, 25, 56];
+  const DESCRIPTION_LENGTHS = [1_000, 2_200, 1_600, 3_000];
+
+  const corpus = (): MemoryPart[] =>
+    SECTION_COUNTS.map((count, docIndex) => {
+      const headings = Array.from({ length: count }, (_, i) => {
+        const length = 60 + ((i * 37 + docIndex * 11) % 141);
+        return `${docIndex}-${i}. `.padEnd(length, '規則の引用').slice(0, length);
+      });
+      return {
+        slug: `corpus-${docIndex}`,
+        content:
+          `---\ntype: premise\ndescription: ${'要'.repeat(DESCRIPTION_LENGTHS[docIndex]!)}\n---\n` +
+          headings.map((heading) => `## ${heading}\n${'本文'.repeat(30)}`).join('\n'),
+      };
+    });
+
+  const shownLineChars = (lines: readonly string[]): number =>
+    lines.reduce((sum, line) => sum + line.length, 0);
+
+  it('⭐ 文字数を外した効果と、見出しを切った効果が、それぞれ 0 ではない', () => {
+    const docs = corpus();
+    const rendered = renderMemoryDocuments(docs);
+    const renderedLines = rendered
+      .split('\n')
+      .filter((line) => /^\s*\[[0-9a-f]{8}-[0-9a-f]{8}\] /.test(line));
+
+    let withCharsAndFull = 0;
+    let withoutCharsFull = 0;
+    for (const doc of docs) {
+      for (const section of scanMemorySections(doc.content).sections) {
+        const base = `${'  '.repeat(section.depth - 1)}[${section.id}] `;
+        const suffix = ` — ${section.chars.toLocaleString('en-US')} 文字`;
+        withCharsAndFull += (base + section.heading + suffix).length;
+        withoutCharsFull += (base + section.heading).length;
+      }
+    }
+    const withoutCharsTruncated = shownLineChars(renderedLines);
+
+    expect(renderedLines.length).toBeGreaterThan(0);
+    expect(withCharsAndFull - withoutCharsFull).toBeGreaterThan(0);
+    expect(withoutCharsFull - withoutCharsTruncated).toBeGreaterThan(0);
+    expect(rendered).not.toMatch(/ — [\d,]+ 文字/);
   });
 });
