@@ -469,7 +469,7 @@ const EXTERNAL_EVENT_NOTE =
 // 「使った分」の推定値の注記は、台帳の全文（`USAGE_ESTIMATE_NOTICE`）ではなく短い1行にする: 毎回同じ固定文で、全文は `usage_read` の説明と応答にある。
 // 短い行は差分の対象（`DIGEST_FIXED_PHRASES`）にしない: 参照に置き換えても、参照のほうが長くなるため。「請求明細ではない」は落とさない（確定した金額に読まれるため）
 const USAGE_ESTIMATE_DIGEST_LINE = '- 推定値（請求明細ではない。詳しくは `usage_read`）';
-const SOURCE_TALLY_HEADING =
+export const SOURCE_TALLY_HEADING =
   '**発行元（source）別の件数（正確な総数。上限 `DIGEST_SOURCE_TALLY_LIMIT`=' +
   `${DIGEST_SOURCE_TALLY_LIMIT} 発行元まで追跡する）**`;
 const BODY_SHAPE_NOTE_TAIL =
