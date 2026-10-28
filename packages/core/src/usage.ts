@@ -189,7 +189,20 @@ function detectReset(
       return true;
     }
   }
-  return false;
+  // 欠落したモデルが支配的なときも数え直しとする（Issue #5405）: 数え直し直後の最初の累積に主なモデルが載らず別のモデルだけが載ると、載ったモデルが前回以上で上の判定に掛からず、基準に残った前回の主なモデルに追いつくまでの消費が積まれない
+  // 「合計の減少」にしない: haiku のような小さなモデルが欠けただけの累積（#5402 の本番事象。opus がほぼ増えない再送に近い読み）も合計が haiku の cost ぶん減り、約 108 億の二重計上が再発するため
+  // 今回に無い基準のモデルの前回 cost の合計（欠落ぶん）が、今回の全モデルの cost 合計より大きいときだけ。厳密な `>` なので等しい読みは数え直しにしない。欠落が無ければ働かない
+  // 今回に cost の読めなかった欄が在るときは見ない: 読めない cost は 0 で書かれ、今回の合計が見かけ上小さくなるため
+  if (hasUnreadableCost(next)) return false;
+  let missing = 0;
+  for (const [model, before] of Object.entries(prev)) {
+    if (next[model] === undefined) missing += before.costUsd;
+  }
+  return missing > sumCostUsd(next);
+}
+
+function hasUnreadableCost(models: Record<string, UsageTotals>): boolean {
+  return Object.values(models).some((m) => (m.unreadable?.costUsd ?? 0) > 0);
 }
 
 function subtract(after: UsageTotals, before: UsageTotals): UsageTotals {
