@@ -8184,7 +8184,7 @@ export function createCloneTools(context: ToolContext) {
           'そのあとに残りの終端（done / failed / stopped）を出す。' +
           '各群の中は startedAt の新しい順である。',
         // status の説明は欄（status の describe）へ集めてある: 2か所に分かれていると、読み手が欄だけ見て呼ぶときに片方を取りこぼすため
-        'q で依頼文の全文と managerId を部分一致で探せる（依頼文の札や語で担当を探すとき。大文字小文字・全角半角は区別しない）。status と併用できる。' +
+        'q で依頼文の全文・managerId・直近の報告の本文・未 push の観測にある枝の名前を部分一致で探せる（依頼文の札や語、持っている PR の番号、作業中の枝で担当を探すとき。大文字小文字・全角半角は区別しない）。status と併用できる。' +
           '各行の退避 ref は件数と最新の1件だけで、全部は manager_report を rescueAll: true で呼ぶと、退避 ref を作業ツリーごとに全部出す。',
         '絞った先が予算で切れたら、断り書きが次に打つ cursor を案内する。それを cursor へ渡すと続きから読める。',
         '認証トークンの世代の行（`describeTokenGeneration` の doc）が出ているマネージャーでは、' +
@@ -8222,7 +8222,7 @@ export function createCloneTools(context: ToolContext) {
           .string()
           .optional()
           .describe(
-            '依頼文の全文と managerId に部分一致で絞る（例: 依頼文の札 "WORLDBUILD-7"）。' +
+            '依頼文の全文・managerId・直近の報告の本文・未 push の観測にある枝の名前に部分一致で絞る（例: 依頼文の札 "WORLDBUILD-7"、PR の番号 "6387"、枝 "feat/mob-add-kinds"）。' +
               '大文字小文字は区別せず、全角と半角は NFKC で揃えて比べる（【】と [] のような別の字は揃わない）。' +
               'status と併用できる（両方に当たるものだけが出る）。' +
               '省略・空文字・空白だけは絞らない（応答にその旨が出る）。' +
@@ -8299,10 +8299,10 @@ export function createCloneTools(context: ToolContext) {
           ? attention.filter((manager) => status.includes(manager.status))
           : attention;
         const view = queryFiltering
-          ? statusView.filter(
-              (manager) =>
-                normalizeManagerQuery(manager.request).includes(queryNeedle) ||
-                normalizeManagerQuery(manager.managerId).includes(queryNeedle),
+          ? statusView.filter((manager) =>
+              managerQueryHaystacks(manager).some((text) =>
+                normalizeManagerQuery(text).includes(queryNeedle),
+              ),
             )
           : statusView;
         // cursor は `status` と `q` で絞った後・予算で切る前で解決する: 順序を変えると絞りに当たらない行が窓を食い尽くすため
@@ -10694,6 +10694,22 @@ function managerJudgementRank(entry: ManagerSummary): 0 | 1 | 2 {
   return outcome === null ? JUDGEMENT_RANK_NOT_APPLICABLE : outcome.rank;
 }
 
+// `q` が当たる文: 依頼文・managerId・直近の報告の本文・未 push の観測にある枝の名前。
+// 枝は `branch` が null（detached HEAD など）の行を飛ばす。`unavailable` の観測は枝を持たない
+function managerQueryHaystacks(manager: ManagerSummary): string[] {
+  const observation = manager.lastUnpushedWorkObservation;
+  return [
+    manager.request,
+    manager.managerId,
+    ...(manager.lastReport === undefined ? [] : [manager.lastReport]),
+    ...(observation?.kind === 'observed'
+      ? observation.worktrees.flatMap((worktree) =>
+          worktree.branch === null ? [] : [worktree.branch],
+        )
+      : []),
+  ];
+}
+
 // NFKC の後に小文字へ: 順序を逆にすると、小文字化で字形が変わる全角英字が半角へ揃う前に素通りするため
 function normalizeManagerQuery(value: string): string {
   return value.normalize('NFKC').toLowerCase().trim();
@@ -10856,8 +10872,9 @@ const FILTER_STATUS_EMPTY_FULL =
 const FILTER_STATUS_EMPTY_REF =
   '（[] は絞らない扱い。**journal_read・commitment_list の [] は0件で、この道具だけ逆**）。';
 const FILTER_Q_MATCH_FULL =
-  '（依頼文の全文と managerId への部分一致。大文字小文字と全角半角は区別しない）';
-const FILTER_Q_MATCH_REF = '（依頼文の全文と managerId への部分一致）';
+  '（依頼文の全文・managerId・直近の報告の本文・未 push の観測にある枝の名前への部分一致。大文字小文字と全角半角は区別しない）';
+const FILTER_Q_MATCH_REF =
+  '（依頼文の全文・managerId・直近の報告の本文・未 push の観測にある枝の名前への部分一致）';
 const FILTER_Q_EMPTY_FULL = '（渡さなかったのと同じ結果である。status: [] と同じ倒し方）。';
 const FILTER_Q_EMPTY_REF = '（絞らない扱い）。';
 
