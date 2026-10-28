@@ -14,6 +14,8 @@ import {
   DIGEST_FIXED_PHRASES,
   DIGEST_LIST_SECTION_NAMES,
   SOURCE_TALLY_HEADING,
+  STANDING_LAST_RUN_LABEL,
+  STANDING_SECTION_HEADING_HEAD,
   foldDigestCountsLine,
 } from './digest.js';
 
@@ -164,6 +166,28 @@ function isListSection(heading: string): boolean {
   return DIGEST_LIST_SECTION_NAMES.some((candidate) => name.startsWith(candidate));
 }
 
+const STANDING_ROW_ID_PREFIX = 'standing-row:';
+
+function standingKindPrefixOf(kind: string): string {
+  return `${STANDING_ROW_ID_PREFIX}${paragraphKey(kind)}:`;
+}
+
+/** 控えの鍵（`standing-row:<kind の指紋>:<行の指紋>`）なら kind までの前置き。違えば `null`。 */
+function standingKindPrefix(id: string): string | null {
+  if (!id.startsWith(STANDING_ROW_ID_PREFIX)) return null;
+  const colon = id.indexOf(':', STANDING_ROW_ID_PREFIX.length);
+  return colon < 0 ? null : id.slice(0, colon + 1);
+}
+
+/** 継続中の依頼の1件（`- <kind>（…）…\n  前回動いた時刻: …`）の kind。その形でなければ `null`（読めない行の注記など）。 */
+function standingRowKind(item: string): string | null {
+  const [head, state] = item.split('\n');
+  if (head === undefined || state === undefined) return null;
+  if (!state.startsWith(`  ${STANDING_LAST_RUN_LABEL}`)) return null;
+  const open = head.indexOf('（');
+  return open > 2 ? head.slice(2, open) : null;
+}
+
 export class DigestSessionDelta {
   #committed: {
     sections: SectionRecord | null;
@@ -276,7 +300,16 @@ export class DigestSessionDelta {
       this.#fullForced = false;
       this.#compactionReset = false;
     }
-    for (const id of staged.fixed) this.#committed.fixed.add(id);
+    for (const id of staged.fixed) {
+      // 継続中の依頼の行は kind ごとに最新の1版だけ控える: A→B→A と変わったとき、2回前の A を「前回と同じ」と言わないため
+      const standingPrefix = standingKindPrefix(id);
+      if (standingPrefix !== null) {
+        for (const key of [...this.#committed.fixed]) {
+          if (key.startsWith(standingPrefix)) this.#committed.fixed.delete(key);
+        }
+      }
+      this.#committed.fixed.add(id);
+    }
     for (const [kind, request] of staged.requests) this.#committed.requests.set(kind, request);
     for (const key of staged.paragraphs) this.#committed.paragraphs.add(key);
     for (const [managerId, shown] of staged.reports) this.#committed.reports.set(managerId, shown);
@@ -346,6 +379,51 @@ export class DigestSessionDelta {
     if (this.#committed.fixed.has(id)) return ref;
     this.#stage().fixed.add(id);
     return full;
+  }
+
+  /**
+   * 定期の tick（件数の形）の要約の「継続中の依頼」の行を、同じ会話で既に全文で出した行と1字も違わなければ、1行の参照にまとめる。
+   * 比べるのは行の全文の完全一致だけ（行に入る変わる値は `前回動いた時刻` だけで、変わった行は自然に全文のままになる）。
+   * ⚠ を含む行・行の形でないもの（読めない行の注記）・「…ほか N 件」は常に全文。控えは `fixed` と同じ（確定は `commit` の後・reset と `forgetFixed` で捨てる）ので、
+   * 全文へ戻す条件（会話が変わった・要約が走りうる・失敗したターンの後・起動直後・使用量が観測できない回・20ターンごと）は固定の文言と同じ線になる。
+   */
+  foldStandingRows(digest: string): string {
+    const lines = digest.split('\n');
+    const start = lines.findIndex((line) => line.startsWith(STANDING_SECTION_HEADING_HEAD));
+    if (start < 0) return digest;
+    let end = start + 1;
+    while (end < lines.length && lines[end] !== '' && !SECTION_HEADING.test(lines[end] ?? '')) {
+      end += 1;
+    }
+    const out: string[] = [];
+    const foldedKinds: string[] = [];
+    let foldedAt = -1;
+    for (const entry of groupBody(lines.slice(start + 1, end))) {
+      if (!('item' in entry)) {
+        out.push(entry.other);
+        continue;
+      }
+      const kind = standingRowKind(entry.item);
+      if (kind === null || entry.item.includes('⚠')) {
+        out.push(entry.item);
+        continue;
+      }
+      const id = `${standingKindPrefixOf(kind)}${paragraphKey(entry.item)}`;
+      if (this.#committed.fixed.has(id)) {
+        if (foldedAt < 0) {
+          foldedAt = out.length;
+          out.push('');
+        }
+        foldedKinds.push(kind);
+        continue;
+      }
+      this.#stage().fixed.add(id);
+      out.push(entry.item);
+    }
+    if (foldedAt < 0) return digest;
+    out[foldedAt] =
+      `（継続中の依頼 ${foldedKinds.length} 件は、この会話で最後に全文で出した版と1字も変わっていない: ${foldedKinds.join('・')}。全文は会話の上にある。引き直しは \`schedule_list\`）`;
+    return [...lines.slice(0, start + 1), ...out, ...lines.slice(end)].join('\n');
   }
 
   /**
@@ -438,6 +516,22 @@ export class DigestSessionDelta {
       }
       fullSections.set(section.heading, bodyText);
       const before = previous?.sections.get(section.heading);
+      if (section.heading.startsWith(STANDING_SECTION_HEADING_HEAD)) {
+        // 全文で出した行は、会話でいちばん新しい版になる: 定期の tick の控え（`foldStandingRows`）に残った古い版を、後で「前回と同じ」と畳ませない。出た版で置き換える（同じ版なら控えは変わらず、畳みは続く）。
+        // 前回から変わらず畳んだ行（節ごと畳む回を含む）は、控えが別の版を指していれば捨てる（B→A→B→A のように戻る流れで、控えが会話の上の全文とずれないため）
+        const beforeItems = new Set(
+          before === undefined
+            ? []
+            : groupBody(before.split('\n')).flatMap((entry) =>
+                'item' in entry ? [entry.item] : [],
+              ),
+        );
+        for (const entry of groupBody(content)) {
+          if (!('item' in entry)) continue;
+          if (beforeItems.has(entry.item)) this.#alignStandingRow(entry.item);
+          else this.#noteStandingRowShown(entry.item);
+        }
+      }
       if (
         foldSame &&
         previous !== null &&
@@ -469,6 +563,44 @@ export class DigestSessionDelta {
     }
     this.#stage().sections = { at: now, sections: fullSections };
     return { text: out.join('\n'), fullChars: digest.length };
+  }
+
+  /**
+   * 継続中の依頼の行 `item` を全文で出した（自発の tick）。その kind の控えを、この版で置き換える（確定は `commit` の後。同じ kind の古い鍵は `commit` が捨てる）。
+   * 行の形でなければ何もしない。
+   */
+  #noteStandingRowShown(item: string): void {
+    const kind = standingRowKind(item);
+    if (kind === null) return;
+    this.#stage().fixed.add(`${standingKindPrefixOf(kind)}${paragraphKey(item)}`);
+  }
+
+  /** 前回から変わらず畳んだ行 `item`: 控えがその kind の別の版を指していれば捨てる（同じ版なら残す）。 */
+  #alignStandingRow(item: string): void {
+    const kind = standingRowKind(item);
+    if (kind === null) return;
+    const prefix = standingKindPrefixOf(kind);
+    const own = `${prefix}${paragraphKey(item)}`;
+    for (const key of [...this.#committed.fixed]) {
+      if (key.startsWith(prefix) && key !== own) this.#committed.fixed.delete(key);
+    }
+  }
+
+  /**
+   * 継続中の依頼 `kind` を道具（`schedule_create`・`schedule_remove`・`schedule_list`）で書き換えた・消した・見た。
+   * 道具の応答は返した時点で会話に載り、行の版が会話の上の全文からずれるので、その kind の控えを捨てる（次の定期の tick は全文）。
+   * `fixedInTurn` と同じく確定を待たず直接消す: 確定（`commit`）は入力を押し込めた直後の1回きりで、道具の呼び出しはその後に起きるため。押し込む前の控え（staged）も捨てる。
+   */
+  forgetStandingRow(kind: string): void {
+    const prefix = standingKindPrefixOf(kind);
+    for (const key of [...this.#committed.fixed]) {
+      if (key.startsWith(prefix)) this.#committed.fixed.delete(key);
+    }
+    const staged = this.#staged;
+    if (staged === null) return;
+    for (const key of [...staged.fixed]) {
+      if (key.startsWith(prefix)) staged.fixed.delete(key);
+    }
   }
 
   #foldFixed(lines: readonly string[]): string[] {
