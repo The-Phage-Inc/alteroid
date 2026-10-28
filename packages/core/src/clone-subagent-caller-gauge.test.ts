@@ -278,6 +278,25 @@ describe('サブエージェント呼びの計器: 上限', () => {
     await s.clone.stop();
   });
 
+  it(`handler 側の「サブと判定」は最初の ${String(SUBAGENT_GAUGE_LIMIT)} 回だけ書かれ、超えたら間引きの1行が1回だけ出る`, async () => {
+    const s = boot();
+    await turn(s);
+    const pre = s.pre();
+    const total = SUBAGENT_GAUGE_LIMIT + 5;
+    for (let i = 0; i < total; i += 1) {
+      await pre(preOf(RUNNER_LIST, `tu-sub-${String(i)}`, 'agent-1'), undefined, {} as never);
+    }
+    for (let i = 0; i < total; i += 1) {
+      await runnerList(s, metaOf(`tu-sub-${String(i)}`));
+    }
+    const lines = (await gaugeTexts(s, CALLER_VERDICT_GAUGE_PHRASE)).filter((line) =>
+      line.includes('toolUseId: 有・サブと判定'),
+    );
+    expect(lines.length).toBe(SUBAGENT_GAUGE_LIMIT + 1);
+    expect(lines.filter((line) => line.includes('以降は間引く')).length).toBe(1);
+    await s.clone.stop();
+  });
+
   it('handler 側も同じ上限で間引く', async () => {
     const s = boot();
     await turn(s);
