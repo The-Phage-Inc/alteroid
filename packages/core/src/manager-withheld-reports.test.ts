@@ -1294,3 +1294,88 @@ describe('畳んだ報告の在庫は台帳にも写り、デーモンの再起�
     await restarted.pool.stop();
   });
 });
+
+describe('畳むまでの await の間に abort() が終わっても、止めた委譲の在庫を積み直さない（#5504）', () => {
+  const FOLD_DECISION = '背景処理の完了待ちで畳んだターンの報告なので';
+
+  // 畳みの decision の日誌だけ、開けるまで止める（`#fetchReportFiles` と並ぶ「畳む前の await」の代表）
+  // `reached`: 書き込みが門に着いた（＝畳みの await の中に居る）。`written`: 門を開けて書き終えた。
+  function gateFoldDecision(stores: Stores): {
+    open: () => void;
+    reached: Promise<void>;
+    written: Promise<void>;
+  } {
+    let open!: () => void;
+    let markReached!: () => void;
+    let markWritten!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    const written = new Promise<void>((resolve) => {
+      markWritten = resolve;
+    });
+    const original = stores.journal.append.bind(stores.journal);
+    stores.journal.append = async (entry) => {
+      if (!JSON.stringify(entry).includes(FOLD_DECISION)) return original(entry);
+      markReached();
+      await gate;
+      const appended = await original(entry);
+      markWritten();
+      return appended;
+    };
+    return { open, reached, written };
+  }
+
+  // 0ms の1周: 書き終えた後の畳みの続きは microtask だけなので、macrotask を1つ挟めば走り切っている。
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  it('畳む間に abort した委譲の報告は、期限の後に flushWithheldReports しても受信箱へ出ない', async () => {
+    const { pool, stores, inbox, fake, advance } = await runningManualSetup();
+    const { open, reached, written } = gateFoldDecision(stores);
+
+    fake.report('mgr-withhold', '背景処理を待つ回', 'done', { awaitingBackground: AWAITING });
+    await reached;
+
+    const result = await pool.abort('mgr-withhold', '人間が止めた');
+    expect(result.outcome).toBe('stopped');
+
+    open();
+    await written;
+    await settle();
+
+    const before = inbox.length;
+    advance(WITHHELD_REPORT_FLUSH_MS + 60_000);
+    await pool.flushWithheldReports();
+    await settle();
+    expect(inbox.slice(before).map((event) => (event as { text?: string }).text)).toEqual([]);
+
+    await pool.stop();
+  });
+
+  it('対照: abort していない委譲の畳んだ報告は、同じ待ち方でも期限の後にまとめて配られる', async () => {
+    const { pool, stores, inbox, fake, advance } = await runningManualSetup();
+    const { open, reached, written } = gateFoldDecision(stores);
+
+    fake.report('mgr-withhold', '背景処理を待つ回', 'done', { awaitingBackground: AWAITING });
+    await reached;
+
+    open();
+    await written;
+    await settle();
+
+    const before = inbox.length;
+    advance(WITHHELD_REPORT_FLUSH_MS + 60_000);
+    await pool.flushWithheldReports();
+    const delivered = await vi.waitFor(() => {
+      const found = inbox.slice(before).find((event) => event.type === 'manager_message');
+      if (!found) throw new Error('まだ届いていない');
+      return found as { text: string };
+    });
+    expect(delivered.text).toContain('配っていない');
+
+    await pool.stop();
+  });
+});
