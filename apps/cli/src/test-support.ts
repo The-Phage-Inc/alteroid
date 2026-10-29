@@ -1,4 +1,43 @@
 import { vi } from 'vitest';
+import { createAttachmentDraft } from './attachments.js';
+import type { Listed, SlashContext } from './chat.js';
+import type { createClient } from './client.js';
+import type { Target } from './target.js';
+
+type Client = ReturnType<typeof createClient>;
+
+const UNREACHABLE_TARGET: Target = {
+  baseUrl: 'http://127.0.0.1:1',
+  headers: {},
+  remote: false,
+  note: null,
+};
+
+// confirm の既定を承認にしない: 確認を書き忘れた試験が、戻せない操作の HTTP を黙って叩くため
+export function slashArgs(
+  client: Client,
+  listed: Listed,
+  overrides: Partial<SlashContext> = {},
+): [Client, Listed, SlashContext] {
+  const target = overrides.target ?? UNREACHABLE_TARGET;
+  return [
+    client,
+    listed,
+    {
+      conversationId: null,
+      target,
+      confirm: async () => false,
+      onFailed: () => {},
+      hooks: {},
+      auxClient: client,
+      absentOkClient: client,
+      removedOkClient: client,
+      draft: createAttachmentDraft(target),
+      signal: new AbortController().signal,
+      ...overrides,
+    },
+  ];
+}
 
 // `vi.restoreAllMocks()` を呼ばない: 同じテストが張った他の spy（`fetch` など）まで戻してしまうため
 export function captureStdout(): () => string {
