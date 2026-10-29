@@ -486,6 +486,8 @@ export { InvalidArchiveSessionIdError, assertArchivableSessionId } from './archi
 export {
   TASK_RANK_STEP,
   addTaskRow,
+  editTaskRow,
+  taskBodyVersion,
   isTaskClosed,
   listTaskRows,
   moveTaskRow,
@@ -497,6 +499,9 @@ export {
 } from './task.js';
 export type {
   SetTaskStatusOptions,
+  EditTaskOptions,
+  TaskEditPatch,
+  TaskEditResult,
   TaskAddResult,
   TaskMoveResult,
   TaskSetKeepResult,
@@ -508,6 +513,7 @@ export type {
   TaskTransition,
 } from './task.js';
 export { verifyTaskStoreContract } from './task-store-contract.js';
+export { TASK_TITLE_MAX, describeTaskPlacement } from './task-tools.js';
 // 台帳 → Task の移行（#5469 P7。純関数・dryRun・指紋つきの実行。起動時・道具には繋がない）
 export {
   commitmentMigrationFingerprint,
