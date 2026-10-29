@@ -5,6 +5,7 @@ import { useCloseTask, useMoveTask, useReopenTask } from '@alteroid/swr';
 import { redactBody } from '@alteroid/logic';
 import type { Task, TaskPlacementInput } from '@alteroid/logic';
 
+import { ReopenForm } from '~/components/reopen-form';
 import { useReportDirty } from '~/lib/leave-guard';
 
 // 状態の言い換えに生の値を併記する: 画面の語と CLI・クローンが使う語（queued など）を結べなくならないように。
@@ -293,78 +294,14 @@ export function TaskCloseForm({ task }: { task: Task }) {
   );
 }
 
-// 閉じた主体（器が自動で閉じた行も含む）で出し分けない: 否定できる相手を画面の側で狭めると、サーバの規則が変わった日に画面だけがずれる。
+// 一覧と詳細で同じ離脱ガードの id を使う: 呼び元ごとに書くと、片方だけ id がずれて書きかけの検出が食い違うため
 export function TaskReopenForm({ task }: { task: Task }) {
   const reopenTask = useReopenTask();
-  const reasonId = useId();
-  const [opened, setOpened] = useState(false);
-  const [reason, setReason] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<unknown>(undefined);
-  const label = taskLabel(task);
-  useReportDirty(`task-reopen-reason:${task.id}`, reason.trim() !== '');
-
-  async function submit() {
-    if (busy || reason.trim() === '') return;
-    setBusy(true);
-    setFailure(undefined);
-    try {
-      await reopenTask(task.id, reason.trim());
-    } catch (caught) {
-      setFailure(caught);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (!opened) {
-    return (
-      <div className="mt-1.5 text-[11px]">
-        <Button size="sm" aria-label={`「${label}」を開き直す`} onClick={() => setOpened(true)}>
-          開き直す
-        </Button>
-      </div>
-    );
-  }
   return (
-    <>
-      <label htmlFor={reasonId} className="mt-2 block text-xs font-medium text-muted-foreground">
-        開き直す理由
-      </label>
-      <div className="mt-1 flex items-center gap-2">
-        <Input
-          id={reasonId}
-          value={reason}
-          aria-label={`「${label}」を開き直す理由`}
-          placeholder="例: まだ終わっていなかった"
-          onChange={(event) => setReason(event.target.value)}
-          onSubmitShortcut={() => void submit()}
-        />
-        <Button
-          variant="primary"
-          size="sm"
-          className="shrink-0"
-          loading={busy}
-          disabled={reason.trim() === ''}
-          aria-label={`「${label}」の開き直しを確定`}
-          onClick={() => void submit()}
-        >
-          開き直す
-        </Button>
-        <Button
-          size="sm"
-          className="shrink-0"
-          disabled={busy}
-          onClick={() => {
-            setOpened(false);
-            setReason('');
-            setFailure(undefined);
-          }}
-        >
-          やめる
-        </Button>
-      </div>
-      <ErrorNote error={failure} className="mt-2" />
-    </>
+    <ReopenForm
+      dirtyId={`task-reopen-reason:${task.id}`}
+      label={taskLabel(task)}
+      onReopen={(reason) => reopenTask(task.id, reason)}
+    />
   );
 }
