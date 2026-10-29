@@ -18,7 +18,7 @@ let originalFetch: typeof fetch;
 let listGets = 0;
 
 function Probe() {
-  useApprovals(false);
+  useApprovals();
   const one = useAnswerApproval();
   const all = useAnswerApprovals();
   useEffect(() => {
