@@ -1398,8 +1398,9 @@ describe('未了の見え方', () => {
       since: new Date(Date.now() - 60 * 60 * 1000),
     });
 
-    expect(digest).toContain('未了の仕事 1 /');
-    expect(digest).toContain('10 日前に頼まれてまだやっていないこと');
+    // #5469 P6b: 行ごとの本文は出さず、旧台帳の件数の1行だけが残る（窓で切らない保証は件数で保つ）
+    expect(digest).toContain('旧台帳に開いている 1 件は未了で、Task に同じ id が無い。');
+    expect(digest).not.toContain('10 日前に頼まれてまだやっていないこと');
   });
 
   it('片付けたものは digest から外れる', async () => {
@@ -1416,12 +1417,13 @@ describe('未了の見え方', () => {
       since: new Date(Date.now() - 60 * 60 * 1000),
     });
 
-    expect(digest).toContain('未了の仕事 0 /');
-    expect(digest).toContain('片付けた仕事 1 /');
-    expect(digest).toContain('片付いたとした理由: 済んだ');
+    // 開いている行が無ければ旧台帳の1行は出ない。片付けた仕事の節（理由の一覧）は #5469 P6b で無くなった
+    expect(digest).not.toContain('旧台帳');
+    expect(digest).not.toContain('もう済んだ依頼');
+    expect(digest).not.toContain('片付いたとした理由');
   });
 
-  it('片付けた仕事は期間で切る（日報が過去に終えた分を毎日並べ直さない）', async () => {
+  it('片付けた仕事は期間によらず digest に並べない（日報が過去に終えた分を毎日並べ直さない）', async () => {
     const stores = createMemoryStores();
     const old = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     await stores.commitments.open({
@@ -1436,7 +1438,7 @@ describe('未了の見え方', () => {
       since: new Date(Date.now() - 60 * 60 * 1000),
     });
 
-    expect(digest).toContain('片付けた仕事 0 /');
+    expect(digest).not.toContain('旧台帳');
     expect(digest).not.toContain('10 日前に片付けた依頼');
   });
 
