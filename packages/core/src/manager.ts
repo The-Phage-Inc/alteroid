@@ -192,6 +192,7 @@ import { WithheldReportsStore } from './withheld-reports-store.js';
 import { notePhase } from './loop-stall.js';
 import {
   FOLD_NOTICE_COMMANDS_MAX,
+  abortTextsOf,
   composeFoldNotice,
   composePeerCloseNotice,
   composePeerCloseNotices,
@@ -4410,29 +4411,12 @@ class Pool implements ManagerPool {
     reason?: string,
     by: ManagerStopActor = 'human',
   ): Promise<ManagerAbortResult> {
-    await this.#ensureConnected();
+    const target = await this.#resolveAbortTarget(managerId);
+    if ('outcome' in target) return target;
+    const { record, runner } = target;
 
     const who =
       by === 'clone' ? 'クローン' : by === 'auto-fold' ? 'デーモン（pids逼迫の自動畳み）' : '人間';
-
-    const record = this.#records.get(managerId) ?? (await this.#load(managerId));
-    if (!record) {
-      // 読めない形で在る行は「居ない」と言わない。
-      const unreadable = await this.#unreadableRowDetail(managerId);
-      if (unreadable !== undefined) {
-        return {
-          outcome: 'unreadable',
-          detail: `${unreadable}止めていない。行は書き換えていない。`,
-        };
-      }
-      return { outcome: 'absent', detail: `${managerId} というマネージャーは居ない。` };
-    }
-
-    const runner = await this.#runnerOf(record);
-    if (!runner) {
-      // `'absent'` を返さない: マネージャーは存在し、宛先がいま開いていないだけで、`app.ts` が 404 にすると一時的な状態が「そんなものは無い」という終端になる。言い方は `send()` と同じものを使う: 同じ観測に2つの言い方を持たせると片方だけが直る。
-      return { outcome: 'unknown', detail: this.#runnerNotOpenDetail(record) };
-    }
 
     // 止めた意思を確かめる前に先に立てる: await の間に別の契機（`send()` や別 runner の `#reattach`）が同じ `ManagerRecord` で resume を進めると、走り続ける委譲を「止まった」と言う事故になる。台帳は `outcome === 'stopped'` を確かめてからしか書かない: これは意思の共有であって確定の記録ではない。
     const lastReportAtAtStart = record.job.lastReportAt;
@@ -4455,16 +4439,7 @@ class Pool implements ManagerPool {
         record.job.lastReportAt !== lastReportAtAtStart ||
         this.#inputMarks.get(managerId) !== inputMarkAtStart)
     ) {
-      const detail =
-        `${who}が停止を試みたが、止める直前に ${managerId} へ新しい動きが入っていた` +
-        `（status=${record.job.status}）ので取りやめた。止めていない。`;
-      await this.#journal({
-        type: 'decision',
-        decision: `[auto-fold] ${managerId} の自動の畳みを取りやめた（直前に依頼が入った）: ${detail}`,
-        grounds:
-          'デーモンの自動畳み（Issue #1394）: 止める直前の読み直しで、手が空いた状態ではなくなっていた',
-      });
-      return { outcome: 'not_stopped', detail };
+      return await this.#cancelAutoFold(managerId, record, who);
     }
     // 読み直しと同じ同期の区間で立てる（間に `await` を挟まない）: 以後の `send()` は従来どおりこの印で断られる。
     if (by === 'auto-fold') record.stopConfirmedAt = this.#nowIso();
@@ -4478,17 +4453,7 @@ class Pool implements ManagerPool {
 
     // 二重の網: 印を立てる前の await の間に `#reattach` が resume を終えていれば印では塞げないので、戻った直後に宛先の食い違いを見る。新しい持ち主に任せず止めた意思を優先し、確かめられなければ「台帳を書かない」側へ合流させる。
     if (outcome === 'stopped' && record.job.runnerId !== runnerIdBeforeConfirm) {
-      const movedRunner = await this.#runnerOf(record);
-      if (movedRunner === null) {
-        outcome = 'unknown';
-        stopError = undefined;
-        sessionGone = undefined;
-      } else {
-        const moved = await this.#confirmStoppedAndReleaseLease(record, movedRunner, managerId);
-        outcome = moved.outcome;
-        stopError = moved.stopError;
-        sessionGone = moved.sessionGone;
-      }
+      ({ outcome, stopError, sessionGone } = await this.#reconfirmAfterMove(record, managerId));
     }
 
     if (outcome !== 'stopped') {
@@ -4496,32 +4461,21 @@ class Pool implements ManagerPool {
       delete record.stopConfirmedAt;
     }
 
-    // `#retire()` で在庫が消えるので、読むのは必ずその前（`WithheldReportsStore#stoppedNote`）。
     let withheldNote = '';
     if (outcome === 'stopped') {
-      record.waiting = [];
-      record.attached = false;
-      record.job.status = 'stopped';
-      this.#workerLimitStopped.delete(managerId);
-      delete record.job.workerLimitStopped;
-      await this.#persist(record);
-      withheldNote = this.#withheld.stoppedNote(managerId);
-      this.#retire(managerId);
+      withheldNote = await this.#settleStoppedRecord(record, managerId);
     }
     // `'not_stopped'` / `'unknown'` のときは台帳を書かない: 生きているかもしれないマネージャーの `waiting` を畳まず、確かめていない状態を確定させない。「止めた」と言えるのは止まったと確かめたときだけ。
 
-    const stopErrorNote =
-      stopError === undefined ? '' : `（runner.stop() が例外を投げた: ${reasonOf(stopError)}）`;
-    const attemptedBase =
-      reason === undefined ? `${who}が停止を試みた。` : `${who}が停止を試みた: ${reason}`;
-    const stoppedBase =
-      reason === undefined ? `${who}が停止させた。` : `${who}が停止させた: ${reason}`;
-    const detail =
-      outcome === 'stopped'
-        ? `${stoppedBase}${stopErrorNote}${withheldNote}`
-        : outcome === 'not_stopped'
-          ? `${attemptedBase}runner には ${managerId} のセッションがまだ残っている。止まっていない。${stopErrorNote}`
-          : `${attemptedBase}runner に確認が取れず、止まったかは未確認。${stopErrorNote}`;
+    const { detail, messageText, markup } = abortTextsOf({
+      outcome,
+      stopError,
+      who,
+      reason,
+      by,
+      managerId,
+      withheldNote,
+    });
     await this.#journal({
       type: 'exchange',
       with: 'manager',
@@ -4529,18 +4483,6 @@ class Pool implements ManagerPool {
       // `（停止）` はそのまま残す: テストが固定している。`[outcome=...]` は文の解釈なしに grep で数えられるようにする。
       text: `${EXCHANGE_KIND_REPLY_PREFIX}[${managerId}] （停止）[outcome=${outcome}] ${detail}`,
     });
-    // outcome ごとに言い分ける: 止まっていないのに「停止させました」と言うと、クローンは止まったつもりで次の判断へ進む。
-    const messageText =
-      outcome === 'stopped'
-        ? `${managerId} を${who}が停止させました。${reason === undefined ? '' : `理由: ${reason}`}${withheldNote}`
-        : outcome === 'not_stopped'
-          ? `${managerId} を${who}が止めようとしましたが、まだ止まっていません` +
-            `（runner にセッションが残っています）。`
-          : `${managerId} を${who}が止めようとしましたが、止まったかどうか確認が取れませんでした。`;
-    // `markup: 'none'` は人間が打った `reason` が実際に `messageText` へ入る回（`outcome === 'stopped'` の人間発）だけに立てる: 文字が1文字も入っていないメッセージに印を立てるのは、その text についての嘘になる。他の `#post` 呼び出し箇所には足さない。
-    // クローン発に `markup: 'markdown'` を立てない: 「まだ決めていない」を `undefined` で残さないと、将来既定が反転したとき、確かめていない推定が方針変更の外へ生き残る。
-    const markup: TextMarkup | undefined =
-      outcome === 'stopped' && by === 'human' && reason !== undefined ? 'none' : undefined;
     // クローン発の停止は受信箱へ配らない: `manager_stop` の戻り値で同じターンに同期的に受け取る内容の真部分集合で新しい事実が無く、`manager_message` は束ねられないので、停止1本ごとにクローンのターン（システムプロンプトの読み直し）を1回焼く。日誌には条件を問わず残る。
     // 人間発は配る: クローンには戻り値が無く、他に知る手段が無い。
     if (by !== 'clone') {
@@ -4548,6 +4490,82 @@ class Pool implements ManagerPool {
     }
 
     return { outcome, detail, ...(sessionGone === undefined ? {} : { sessionGone }) };
+  }
+
+  /** 段A（入口）: 接続を確かめ、台帳の像と宛先の runner を引く。引けなければ断りの結果を返す。 */
+  async #resolveAbortTarget(
+    managerId: string,
+  ): Promise<{ record: ManagerRecord; runner: RunnerClient } | ManagerAbortResult> {
+    await this.#ensureConnected();
+
+    const record = this.#records.get(managerId) ?? (await this.#load(managerId));
+    if (!record) {
+      // 読めない形で在る行は「居ない」と言わない。
+      const unreadable = await this.#unreadableRowDetail(managerId);
+      if (unreadable !== undefined) {
+        return {
+          outcome: 'unreadable',
+          detail: `${unreadable}止めていない。行は書き換えていない。`,
+        };
+      }
+      return { outcome: 'absent', detail: `${managerId} というマネージャーは居ない。` };
+    }
+
+    const runner = await this.#runnerOf(record);
+    if (!runner) {
+      // `'absent'` を返さない: マネージャーは存在し、宛先がいま開いていないだけで、`app.ts` が 404 にすると一時的な状態が「そんなものは無い」という終端になる。言い方は `send()` と同じものを使う: 同じ観測に2つの言い方を持たせると片方だけが直る。
+      return { outcome: 'unknown', detail: this.#runnerNotOpenDetail(record) };
+    }
+
+    return { record, runner };
+  }
+
+  /** 段B（自動の畳みの取りやめ）: 止める直前に新しい動きが入っていた回を日誌に残し、止めていない結果を返す。条件は呼び元が見る。 */
+  async #cancelAutoFold(
+    managerId: string,
+    record: ManagerRecord,
+    who: string,
+  ): Promise<ManagerAbortResult> {
+    const detail =
+      `${who}が停止を試みたが、止める直前に ${managerId} へ新しい動きが入っていた` +
+      `（status=${record.job.status}）ので取りやめた。止めていない。`;
+    await this.#journal({
+      type: 'decision',
+      decision: `[auto-fold] ${managerId} の自動の畳みを取りやめた（直前に依頼が入った）: ${detail}`,
+      grounds:
+        'デーモンの自動畳み（Issue #1394）: 止める直前の読み直しで、手が空いた状態ではなくなっていた',
+    });
+    return { outcome: 'not_stopped', detail };
+  }
+
+  /** 段C（宛先の食い違い）: 委譲が別の runner へ移っていた回に、移った先で止まりを確かめ直す。条件は呼び元が見る。 */
+  async #reconfirmAfterMove(
+    record: ManagerRecord,
+    managerId: string,
+  ): Promise<{
+    outcome: 'stopped' | 'not_stopped' | 'unknown';
+    stopError: unknown;
+    sessionGone: boolean | undefined;
+  }> {
+    const movedRunner = await this.#runnerOf(record);
+    if (movedRunner === null) {
+      return { outcome: 'unknown', stopError: undefined, sessionGone: undefined };
+    }
+    return await this.#confirmStoppedAndReleaseLease(record, movedRunner, managerId);
+  }
+
+  /** 段D（止めた台帳の確定）: 止まったと確かめた回の台帳の整理・保存・在庫の控え・像の片付け。控えた知らせの文を返す。条件は呼び元が見る。 */
+  async #settleStoppedRecord(record: ManagerRecord, managerId: string): Promise<string> {
+    record.waiting = [];
+    record.attached = false;
+    record.job.status = 'stopped';
+    this.#workerLimitStopped.delete(managerId);
+    delete record.job.workerLimitStopped;
+    await this.#persist(record);
+    // `#retire()` で在庫が消えるので、読むのは必ずその前（`WithheldReportsStore#stoppedNote`）。
+    const withheldNote = this.#withheld.stoppedNote(managerId);
+    this.#retire(managerId);
+    return withheldNote;
   }
 
   async stop(options?: ManagerPoolStopOptions): Promise<void> {
