@@ -5937,47 +5937,7 @@ class Pool implements ManagerPool {
       this.#farewellRunners.add(fromRunnerId);
       return;
     }
-    if (event.type === 'hello') {
-      this.#farewellRunners.delete(fromRunnerId);
-      this.#farewellRunners.delete(event.runnerId);
-      if (this.#stopped) return;
-      // 前の名乗りを持ち越さない: 同じ runnerId の器が入れ替わって版が下がりうる。
-      this.#runnerCapabilities.set(event.runnerId, new Set(event.capabilities ?? []));
-      this.#attachmentStager.noteHello(
-        event.runnerId,
-        event.attachmentBodyLimit,
-        event.attachmentStageLimit,
-      );
-      if (event.managerModel === undefined && event.workerModel === undefined) {
-        this.#runnerModels.delete(event.runnerId);
-      } else {
-        this.#runnerModels.set(event.runnerId, {
-          ...(event.managerModel === undefined ? {} : { manager: event.managerModel }),
-          ...(event.workerModel === undefined ? {} : { worker: event.workerModel }),
-        });
-      }
-      if (event.anthropicRoute === undefined) {
-        this.#runnerAnthropicRoutes.delete(event.runnerId);
-      } else {
-        this.#runnerAnthropicRoutes.set(event.runnerId, event.anthropicRoute);
-      }
-      this.#setRunnerManagerPeers(event.runnerId, event.managerPeers, event.managerPeersClosed);
-      // 初回だけ素通りにしない: 起動時に掴んだ器と SSE の繋がった先が違う場合（畳まれつつある旧 runner がまだ `/health` に答える間）に取り直しが起きない。
-      void this.#reattach(event.runnerId);
-      return;
-    }
-
-    if (event.type === 'anthropic_route') {
-      if (this.#stopped) return;
-      this.#runnerAnthropicRoutes.set(event.runnerId, event.anthropicRoute);
-      return;
-    }
-
-    if (event.type === 'manager_peers') {
-      if (this.#stopped) return;
-      this.#setRunnerManagerPeers(event.runnerId, event.managerPeers, event.managerPeersClosed);
-      return;
-    }
+    if (this.#applyRunnerNotice(event, fromRunnerId)) return;
 
     if (event.type === 'scratch_sweep') {
       await this.#onScratchSweep(event, fromRunnerId);
@@ -6001,59 +5961,14 @@ class Pool implements ManagerPool {
     this.#observeSessionGeneration(record, event);
     const generation = this.#judgeSessionGeneration(record, event);
     if (generation === 'stale' && isSessionScopedEvent(event)) {
-      if (
-        event.type === 'report' &&
-        (await this.#deliverReportFromUnreplacedSession(record, event, fromRunnerId))
-      ) {
-        return;
-      }
-      if (
-        event.type === 'ask' &&
-        (await this.#noticeAskFromUnreplacedSession(record, event, fromRunnerId))
-      ) {
-        return;
-      }
-      const dropped = await this.#droppedReportFiles(event, fromRunnerId);
-      await this.#journal({
-        type: 'exchange',
-        with: 'manager',
-        role: 'inbound',
-        text:
-          `${EXCHANGE_KIND_DECISION_PREFIX}[${event.managerId}] （古いセッションの出来事のため無視。いま追っている世代は ` +
-          `${record.sessionGeneration ?? '不明'}、この出来事の世代は ${event.sessionGeneration ?? '不明'}）` +
-          (event.type === 'closed'
-            ? `runner 側の終了イベント（status=${event.status}）を受け取った: ${event.reason}`
-            : `古いセッションの ${event.type} を無視した`) +
-          dropped.text,
-        ...dropped.attachments,
-      });
+      await this.#dropStaleSessionEvent(record, event, fromRunnerId);
       return;
     }
 
     // 古い世代の出来事を捨てた後に見る: 前のセッションの遅れた出来事で「戻れた」と確定しないため。
     this.#restored.observe(record, event, fromRunnerId);
 
-    // 窓の間は `job.runnerId` がまだ元の runner で `#ignoreIfMovedAway` が素通りし、移送の前に古い報告が台帳と受信箱へ流れるので、結論が出るまで預かる。
-    if (
-      event.type === 'session' ||
-      event.type === 'report' ||
-      event.type === 'ask' ||
-      event.type === 'settled'
-    ) {
-      // 移送先自身の出来事も預かる: 素通りさせると `#ignoreIfMovedAway` が「移った後の古い runner」と読んで捨てる。
-      if (this.#relocatingTo.has(event.managerId)) {
-        this.#deferEvent(event, fromRunnerId);
-        return;
-      }
-      // 世代で選り分けない: 世代の判定は窓が閉じるとき（応答で追う世代が決まった後）に行う。
-      if (
-        event.type === 'report' &&
-        this.#sameRunnerResumeWindow.get(event.managerId) === fromRunnerId
-      ) {
-        this.#deferEvent(event, fromRunnerId);
-        return;
-      }
-    }
+    if (this.#deferIfWindow(event, fromRunnerId)) return;
 
     // 移った後の古い runner の出来事は、この種類なら入口で捨てる（個別の判定は `closed` / `resume_failed` / `usage` / `rescue_files`: 捨て方が違う）。
     // `report` / `ask` は停止済みの扱い（日誌へ残す）が先: 停止済みなら下の case が受ける。
@@ -6489,6 +6404,116 @@ class Pool implements ManagerPool {
         throw new Error(`未知の runner イベント: ${JSON.stringify(exhaustive)}`);
       }
     }
+  }
+
+  /** `#handleEvent` の入口の段: hello / anthropic_route / manager_peers の runner 名乗りを受ける（同期。当たれば true）。 */
+  #applyRunnerNotice(
+    event: RunnerEvent,
+    fromRunnerId: string,
+  ): event is Extract<RunnerEvent, { type: 'hello' | 'anthropic_route' | 'manager_peers' }> {
+    if (event.type === 'hello') {
+      this.#farewellRunners.delete(fromRunnerId);
+      this.#farewellRunners.delete(event.runnerId);
+      if (this.#stopped) return true;
+      // 前の名乗りを持ち越さない: 同じ runnerId の器が入れ替わって版が下がりうる。
+      this.#runnerCapabilities.set(event.runnerId, new Set(event.capabilities ?? []));
+      this.#attachmentStager.noteHello(
+        event.runnerId,
+        event.attachmentBodyLimit,
+        event.attachmentStageLimit,
+      );
+      if (event.managerModel === undefined && event.workerModel === undefined) {
+        this.#runnerModels.delete(event.runnerId);
+      } else {
+        this.#runnerModels.set(event.runnerId, {
+          ...(event.managerModel === undefined ? {} : { manager: event.managerModel }),
+          ...(event.workerModel === undefined ? {} : { worker: event.workerModel }),
+        });
+      }
+      if (event.anthropicRoute === undefined) {
+        this.#runnerAnthropicRoutes.delete(event.runnerId);
+      } else {
+        this.#runnerAnthropicRoutes.set(event.runnerId, event.anthropicRoute);
+      }
+      this.#setRunnerManagerPeers(event.runnerId, event.managerPeers, event.managerPeersClosed);
+      // 初回だけ素通りにしない: 起動時に掴んだ器と SSE の繋がった先が違う場合（畳まれつつある旧 runner がまだ `/health` に答える間）に取り直しが起きない。
+      void this.#reattach(event.runnerId);
+      return true;
+    }
+
+    if (event.type === 'anthropic_route') {
+      if (this.#stopped) return true;
+      this.#runnerAnthropicRoutes.set(event.runnerId, event.anthropicRoute);
+      return true;
+    }
+
+    if (event.type === 'manager_peers') {
+      if (this.#stopped) return true;
+      this.#setRunnerManagerPeers(event.runnerId, event.managerPeers, event.managerPeersClosed);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** `#handleEvent` の入口の段: 古いセッションの出来事を、配る・知らせる・日誌に残して捨てる（呼び元が古い世代かどうかで呼ぶ）。 */
+  async #dropStaleSessionEvent(
+    record: ManagerRecord,
+    event: Extract<RunnerEvent, { type: 'closed' | 'session' | 'report' | 'ask' | 'settled' }>,
+    fromRunnerId: string,
+  ): Promise<void> {
+    if (
+      event.type === 'report' &&
+      (await this.#deliverReportFromUnreplacedSession(record, event, fromRunnerId))
+    ) {
+      return;
+    }
+    if (
+      event.type === 'ask' &&
+      (await this.#noticeAskFromUnreplacedSession(record, event, fromRunnerId))
+    ) {
+      return;
+    }
+    const dropped = await this.#droppedReportFiles(event, fromRunnerId);
+    await this.#journal({
+      type: 'exchange',
+      with: 'manager',
+      role: 'inbound',
+      text:
+        `${EXCHANGE_KIND_DECISION_PREFIX}[${event.managerId}] （古いセッションの出来事のため無視。いま追っている世代は ` +
+        `${record.sessionGeneration ?? '不明'}、この出来事の世代は ${event.sessionGeneration ?? '不明'}）` +
+        (event.type === 'closed'
+          ? `runner 側の終了イベント（status=${event.status}）を受け取った: ${event.reason}`
+          : `古いセッションの ${event.type} を無視した`) +
+        dropped.text,
+      ...dropped.attachments,
+    });
+  }
+
+  /** `#handleEvent` の入口の段: 移送中・同じ runner への復帰窓の出来事を預ける（同期。預けたら true）。 */
+  #deferIfWindow(event: RunnerEvent, fromRunnerId: string): boolean {
+    // 窓の間は `job.runnerId` がまだ元の runner で `#ignoreIfMovedAway` が素通りし、移送の前に古い報告が台帳と受信箱へ流れるので、結論が出るまで預かる。
+    if (
+      event.type === 'session' ||
+      event.type === 'report' ||
+      event.type === 'ask' ||
+      event.type === 'settled'
+    ) {
+      // 移送先自身の出来事も預かる: 素通りさせると `#ignoreIfMovedAway` が「移った後の古い runner」と読んで捨てる。
+      if (this.#relocatingTo.has(event.managerId)) {
+        this.#deferEvent(event, fromRunnerId);
+        return true;
+      }
+      // 世代で選り分けない: 世代の判定は窓が閉じるとき（応答で追う世代が決まった後）に行う。
+      if (
+        event.type === 'report' &&
+        this.#sameRunnerResumeWindow.get(event.managerId) === fromRunnerId
+      ) {
+        this.#deferEvent(event, fromRunnerId);
+        return true;
+      }
+    }
+    return false;
   }
 
   /** `note` の段1: 作業者の落ちの印を立てて台帳へ写す（呼び元が `event.workerLimit` の有無で呼ぶ）。 */
