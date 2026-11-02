@@ -352,6 +352,7 @@ const KINDS_BY_ENCLOSING: Record<string, Record<string, string>> = {
     '#handleEvent': 'decision,failure,reply',
     '#ignoreIfMovedAway': 'decision',
     '#ignoreOrDeferClosed': 'decision',
+    '#journalNote': 'reply',
     '#noteAmbiguousResolved': 'recovery',
     '#noteAmbiguousSighting': 'failure',
     '#noteClosedFailure': 'failure',
