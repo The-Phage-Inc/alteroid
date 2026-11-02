@@ -2286,6 +2286,59 @@ class Pool implements ManagerPool {
   }
 
   async #startAfterSupersedeCheck(input: ManagerStartInput): Promise<ManagerSummary> {
+    const { runner, managerId, startAttachments } = await this.#prepareStart(input);
+    const cwd = input.cwd ?? runner.workspacePath;
+    const now = this.#now();
+    const at = new Date(now).toISOString();
+    // 前任が預かっていた未追跡のファイルがあれば、最初の依頼文の末尾に取り戻しの口を足す（台帳の `request` は元のまま）
+    let startRequest = input.request;
+    if (input.supersedes !== undefined) {
+      startRequest = await this.#startRequestWithPredecessorNote(
+        input.request,
+        input.supersedes,
+        runner.runnerId,
+      );
+    }
+
+    const { record, lease } = this.#newStartRecord(input, runner, managerId, cwd, now, at);
+    this.#records.set(managerId, record);
+    this.#rememberTokenIdentity(managerId);
+
+    let started: { cwd: string; sessionGeneration?: string };
+    try {
+      started = await runner.start({
+        managerId,
+        request: startRequest,
+        cwd,
+        lease: { fence: lease.fence, ttlMs: lease.ttlMs },
+        ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
+      });
+    } catch (error) {
+      // 起こせなかったものを一覧に残さない: 「走っている」と見えて、誰も読まない相手へ指示を送り続けることになる。
+      this.#records.delete(managerId);
+      throw error;
+    }
+    const requestedCwd = this.#noteStarted(record, runner, started, cwd, lease);
+    await this.#persist(record);
+    await this.#journal({
+      type: 'exchange',
+      with: 'manager',
+      role: 'outbound',
+      managerId,
+      text: `${EXCHANGE_KIND_REPLY_PREFIX}[${managerId}] ${input.request}`,
+      ...(startAttachments.length === 0 ? {} : { attachments: attachmentRefsOf(startAttachments) }),
+    });
+    if (input.supersedes !== undefined)
+      await this.#handOverToSuccessor(input.supersedes, managerId);
+    return this.#startedSummaryOf(record, requestedCwd);
+  }
+
+  /** 起こす前の支度（runner の選択・接続・添付の断り・cwd の確認・managerId の発行・大きいファイルの押し出し）。断るときは投げる。 */
+  async #prepareStart(input: ManagerStartInput): Promise<{
+    runner: RunnerClient;
+    managerId: string;
+    startAttachments: NonNullable<ManagerStartInput['attachments']>;
+  }> {
     const runner = await this.#runners.select({
       ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
       ...(input.runnerId === undefined ? {} : { runnerId: input.runnerId }),
@@ -2313,22 +2366,29 @@ class Pool implements ManagerPool {
       const failed = await this.#attachmentStager.stage(runner, managerId, startAttachments);
       if (failed !== undefined) throw new ManagerAttachmentsRefusedError(failed);
     }
-    const cwd = input.cwd ?? runner.workspacePath;
-    const now = this.#now();
-    const at = new Date(now).toISOString();
-    // 前任が預かっていた未追跡のファイルがあれば、最初の依頼文の末尾に取り戻しの口を足す（台帳の `request` は元のまま）
-    let startRequest = input.request;
-    if (input.supersedes !== undefined) {
-      const predecessor =
-        this.#records.get(input.supersedes)?.job ?? (await this.#latestJobOf(input.supersedes));
-      const note = this.#rescueStash.note(
-        predecessor?.rescueStash,
-        runner.runnerId,
-        input.supersedes,
-      );
-      if (note !== undefined) startRequest = `${input.request}\n\n[system] ${note}`;
-    }
+    return { runner, managerId, startAttachments };
+  }
 
+  /** 前任が預かっていた未追跡のファイルの取り戻しの口を、最初の依頼文の末尾へ足す（口が無ければ依頼文のまま返す）。 */
+  async #startRequestWithPredecessorNote(
+    request: string,
+    supersedes: string,
+    runnerId: string,
+  ): Promise<string> {
+    const predecessor = this.#records.get(supersedes)?.job ?? (await this.#latestJobOf(supersedes));
+    const note = this.#rescueStash.note(predecessor?.rescueStash, runnerId, supersedes);
+    return note === undefined ? request : `${request}\n\n[system] ${note}`;
+  }
+
+  /** 新しい委譲の貸し出しと台帳の行を組む（同期。`#records.set` は呼び元）。 */
+  #newStartRecord(
+    input: ManagerStartInput,
+    runner: RunnerClient,
+    managerId: string,
+    cwd: string,
+    now: number,
+    at: string,
+  ): { record: ManagerRecord; lease: ReturnType<typeof grantLease> } {
     // 新しい委譲の貸し出しは、`#claimForResume` の関門を通さない: 握っている者が存在せず、奪う操作ではない。
     // 台帳へ書けたことも条件にしない（新規の委譲は台帳が書けなくても走らせる）。
     const lease = grantLease({
@@ -2365,23 +2425,17 @@ class Pool implements ManagerPool {
       waiting: [],
       attached: true,
     };
-    this.#records.set(managerId, record);
-    this.#rememberTokenIdentity(managerId);
+    return { record, lease };
+  }
 
-    let started: { cwd: string; sessionGeneration?: string };
-    try {
-      started = await runner.start({
-        managerId,
-        request: startRequest,
-        cwd,
-        lease: { fence: lease.fence, ttlMs: lease.ttlMs },
-        ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
-      });
-    } catch (error) {
-      // 起こせなかったものを一覧に残さない: 「走っている」と見えて、誰も読まない相手へ指示を送り続けることになる。
-      this.#records.delete(managerId);
-      throw error;
-    }
+  /** runner が起こした結果を台帳の行へ写す（同期。頼んだ cwd と違ったときだけ、その頼んだ値を返す）。 */
+  #noteStarted(
+    record: ManagerRecord,
+    runner: RunnerClient,
+    started: { cwd: string; sessionGeneration?: string },
+    cwd: string,
+    lease: ReturnType<typeof grantLease>,
+  ): string | undefined {
     this.#noteRunnerSessionSince(record);
     if (started.sessionGeneration !== undefined && started.sessionGeneration.length > 0) {
       record.sessionGeneration = started.sessionGeneration;
@@ -2395,17 +2449,11 @@ class Pool implements ManagerPool {
     }
     // 名簿を引き直さず、この回に貸し出しを立てた相手を写す。`undefined` で上書きしない: 一度名乗った器の値まで消えて以後判定できなくなる。
     if (lease.instanceId !== undefined) record.job.sessionInstanceId = lease.instanceId;
-    await this.#persist(record);
-    await this.#journal({
-      type: 'exchange',
-      with: 'manager',
-      role: 'outbound',
-      managerId,
-      text: `${EXCHANGE_KIND_REPLY_PREFIX}[${managerId}] ${input.request}`,
-      ...(startAttachments.length === 0 ? {} : { attachments: attachmentRefsOf(startAttachments) }),
-    });
-    if (input.supersedes !== undefined)
-      await this.#handOverToSuccessor(input.supersedes, managerId);
+    return requestedCwd;
+  }
+
+  /** 起こした直後の要約を組む（同期。`cwdConfirmed` / `requestedCwd` を足す）。 */
+  #startedSummaryOf(record: ManagerRecord, requestedCwd: string | undefined): ManagerSummary {
     const silent = this.#silentRunners();
     const registeredRunnerIds = this.#registeredRunnerIds();
     const summary = summaryOf(
