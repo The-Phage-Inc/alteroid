@@ -5683,22 +5683,72 @@ class Pool implements ManagerPool {
     // 引けなかったものを「無い」として進めない: 材料無しで resume すると `resume_failed` の `recovered: false` が `lost` に確定し、一時的に DB が読めなかっただけで委譲が恒久に終端する。
     if (material.kind === 'unreadable') return 'unreadable';
 
-    // 主の記録が戻る回だけ作業者の分も戻す: 主が無い回に作業者だけ戻しても、続ける会話が無い
-    const subagents =
+    const { subagents, peers } =
       material.kind === 'loaded' && projectKey !== undefined
-        ? await this.#sessionLoaders.loadSubagents(record.job.id, projectKey, sessionId)
-        : [];
-    // peer（Codex）の記録も同じ条件で戻す: 主が無ければ、peer の続きを頼む担当の会話そのものが無い
-    const peers =
-      material.kind === 'loaded' && projectKey !== undefined
-        ? await this.#sessionLoaders.loadPeers(record.job.id, projectKey, sessionId)
-        : [];
+        ? await this.#loadResumeCompanions(record.job.id, projectKey, sessionId)
+        : { subagents: [], peers: [] };
 
     // チェックポイント1: `#claimForResume` の後・`runner.resume()` の直前に置く。前に置くと確認から呼び出しまでの窓が開くだけで得が無く、呼ぶ前に見送れる回は実 I/O を減らす。
     if (record.stopConfirmedAt !== undefined) return 'stopped-meanwhile';
 
     // 応答の `cwd` と比べる基準は `record.job.cwd`（`undefined` のことがある）ではなくこの値。
     const requestedCwd = cwd ?? runner.workspacePath;
+    const resumed = await this.#issueResume(record, runner, {
+      sessionId,
+      requestedCwd,
+      request,
+      message,
+      attachments,
+      material,
+      subagents,
+      peers,
+    });
+    this.#noteResumedCwd(record, runner, resumed, requestedCwd);
+
+    // チェックポイント2: ここで `record.attached` などを書くと、止めたつもりの委譲が「走っているはず」を名乗ったまま誰にも追われなくなる。
+    // `record.job.status` は書かない（`abort()` が `'stopped'` を書いて `#persist()` 済み）。畳み直せなかったときは、台帳は「止めた」なのに runner にセッションが生き残る最も危ない不一致なので黙らない。
+    if (record.stopConfirmedAt !== undefined) {
+      await this.#settleStoppedAfterResume(record, runner);
+      return 'stopped-meanwhile';
+    }
+
+    this.#recordResumed(record, runner, resumed, material, projectKey);
+    return 'resumed';
+  }
+
+  /** `#resume` の段: 主の記録が戻る回に、作業者（subagents）と peer の記録を引く（呼び元が条件を見てから呼ぶ）。 */
+  async #loadResumeCompanions(
+    managerId: string,
+    projectKey: string,
+    sessionId: string,
+  ): Promise<{
+    subagents: Awaited<ReturnType<SessionLoaders['loadSubagents']>>;
+    peers: Awaited<ReturnType<SessionLoaders['loadPeers']>>;
+  }> {
+    // 主の記録が戻る回だけ作業者の分も戻す: 主が無い回に作業者だけ戻しても、続ける会話が無い
+    const subagents = await this.#sessionLoaders.loadSubagents(managerId, projectKey, sessionId);
+    // peer（Codex）の記録も同じ条件で戻す: 主が無ければ、peer の続きを頼む担当の会話そのものが無い
+    const peers = await this.#sessionLoaders.loadPeers(managerId, projectKey, sessionId);
+    return { subagents, peers };
+  }
+
+  /** `#resume` の段: 世代を下ろして `#restored.begin` を立て、`runner.resume()` を出す（応答が返らない失敗は一覧で確かめ、居なければ `#restored.end` して投げる）。 */
+  async #issueResume(
+    record: ManagerRecord,
+    runner: RunnerClient,
+    args: {
+      sessionId: string;
+      requestedCwd: string;
+      request: string | undefined;
+      message: string | undefined;
+      attachments: RunnerAttachment[] | undefined;
+      material: Awaited<ReturnType<SessionLoaders['loadSession']>>;
+      subagents: Awaited<ReturnType<SessionLoaders['loadSubagents']>>;
+      peers: Awaited<ReturnType<SessionLoaders['loadPeers']>>;
+    },
+  ): Promise<Partial<Awaited<ReturnType<RunnerClient['resume']>>>> {
+    const { sessionId, requestedCwd, request, message, attachments, material, subagents, peers } =
+      args;
     // 出す直前に追っている世代を下ろす: 応答が返るまで（失敗して返らなければその後も）世代の判定はしない。
     delete record.sessionGeneration;
     // 応答より前に立てる: 新しいセッションの出来事は resume の応答より先に届きうる（`manager-report-before-resume-response.test.ts`）。
@@ -5748,6 +5798,16 @@ class Pool implements ManagerPool {
         grounds: `resume の失敗: ${reasonOf(error)}。${runner.runnerId} の一覧にこの委譲が居た`,
       });
     }
+    return resumed;
+  }
+
+  /** `#resume` の段（同期）: 応答の `cwd` が頼んだ値と違えば、台帳の `cwd` と locator を直して `cwdSwapNotice` を立てる。 */
+  #noteResumedCwd(
+    record: ManagerRecord,
+    runner: RunnerClient,
+    resumed: Partial<Awaited<ReturnType<RunnerClient['resume']>>>,
+    requestedCwd: string,
+  ): void {
     // 応答が返らず引き取った回（`resumed.cwd` が無い）は何もしない: 「未確認」を `requestedCwd` で埋めると、倒れていた回まで「頼んだとおり開けた」と嘘をつく。
     // 倒れたかは応答後にしか分からず、resume 前に組む「移送の一言」へ混ぜられないので `cwdSwapNotice` で伝える。前回の通知は持ち越さない。
     record.cwdSwapNotice = undefined;
@@ -5756,24 +5816,31 @@ class Pool implements ManagerPool {
       record.job.workspace = workspaceLocatorFrom(this.#workspace, runner.runnerId, resumed.cwd);
       record.cwdSwapNotice = { requested: requestedCwd, actual: resumed.cwd };
     }
+  }
 
-    // チェックポイント2: ここで `record.attached` などを書くと、止めたつもりの委譲が「走っているはず」を名乗ったまま誰にも追われなくなる。
-    // `record.job.status` は書かない（`abort()` が `'stopped'` を書いて `#persist()` 済み）。畳み直せなかったときは、台帳は「止めた」なのに runner にセッションが生き残る最も危ない不一致なので黙らない。
-    if (record.stopConfirmedAt !== undefined) {
-      this.#restored.end(record.job.id);
-      const { outcome: foldOutcome } = await this.#confirmStoppedAndReleaseLease(
-        record,
-        runner,
-        record.job.id,
-      );
-      if (foldOutcome === 'stopped') {
-        await this.#persist(record);
-      } else {
-        noteResumeAfterStopFoldFailed(record.job.id, foldOutcome);
-      }
-      return 'stopped-meanwhile';
+  /** `#resume` の段: resume の後で止められていた委譲を畳み直す（呼び元が `stopConfirmedAt` を見てから呼ぶ）。 */
+  async #settleStoppedAfterResume(record: ManagerRecord, runner: RunnerClient): Promise<void> {
+    this.#restored.end(record.job.id);
+    const { outcome: foldOutcome } = await this.#confirmStoppedAndReleaseLease(
+      record,
+      runner,
+      record.job.id,
+    );
+    if (foldOutcome === 'stopped') {
+      await this.#persist(record);
+    } else {
+      noteResumeAfterStopFoldFailed(record.job.id, foldOutcome);
     }
+  }
 
+  /** `#resume` の段（同期）: 受理された resume を台帳と pool の欄へ写す。await が無い並びなので途中で切らない。 */
+  #recordResumed(
+    record: ManagerRecord,
+    runner: RunnerClient,
+    resumed: Partial<Awaited<ReturnType<RunnerClient['resume']>>>,
+    material: Awaited<ReturnType<SessionLoaders['loadSession']>>,
+    projectKey: string | undefined,
+  ): void {
     record.attached = true;
     const previousRunnerId = record.job.runnerId;
     record.job.runnerId = runner.runnerId;
@@ -5806,7 +5873,6 @@ class Pool implements ManagerPool {
       resumed.reusedLiveSession !== true;
     this.#unresumable.delete(record.job.id);
     this.#resumedCount.set(record.job.id, (this.#resumedCount.get(record.job.id) ?? 0) + 1);
-    return 'resumed';
   }
 
   #swapNote(runnerId: string, before: string | undefined): string {
