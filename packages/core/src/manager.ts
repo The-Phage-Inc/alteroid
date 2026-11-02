@@ -4013,27 +4013,7 @@ class Pool implements ManagerPool {
     if (this.#stopped) return [];
     await this.#ensureConnected();
 
-    const alive = new Map<
-      string,
-      { runner: RunnerClient; state: Awaited<ReturnType<RunnerClient['list']>>[number] }
-    >();
-    // 生死を聞けなかった器を覚える: 応答が無いことを「セッションが無い」と読むと、生きている仕事を二重に起こし、`gh pr create` のような取り返しのつかない操作が二度走る。
-    const unheard = new Set<string>();
-    // 状態は読めなかったが runner に居る委譲: 「居ない」と畳むと、まだ走っている委譲を resume し、待っていた確認を捨てる。
-    const unreadable = new Map<string, RunnerClient>();
-    for (const runner of await this.#runners.list()) {
-      const listing = await listRunnerManagers(runner).catch((error: unknown) => {
-        unheard.add(runner.runnerId);
-        // 黙って引き下がらない: 跡が無いと「セッションが無かった」のか「聞けなかった」のかを誰も言えない。
-        noteUnreadableRecord('runner のセッション一覧', `runnerId=${runner.runnerId}`, error);
-        return null;
-      });
-      if (listing === null) continue;
-      for (const state of listing.states) {
-        alive.set(state.managerId, { runner, state });
-      }
-      for (const managerId of listing.unreadableIds) unreadable.set(managerId, runner);
-    }
+    const { alive, unheard, unreadable } = await this.#listLivingSessions();
 
     const silent = this.#silentRunners();
     const registeredRunnerIds = this.#registeredRunnerIds();
@@ -4062,82 +4042,13 @@ class Pool implements ManagerPool {
       // 状態を読めなかったが runner に居る委譲は resume せずに引き取る: 生きているとしか読めない状態を名指しできないので `attached: false`（話しかけたら `host.resume()` が生きたセッションへ流して短絡する）。待ちは持ち越さず、`status` は台帳の値のまま。
       const unreadableOn = alive.has(job.id) ? undefined : unreadable.get(job.id);
       if (unreadableOn !== undefined) {
-        const record: ManagerRecord = {
-          job: { ...job, runnerId: unreadableOn.runnerId },
-          waiting: [],
-          attached: false,
-          reattachedAcrossRestart: true,
-        };
-        this.#records.set(job.id, record);
-        await this.#persist(record);
+        await this.#adoptUnreadable(job, unreadableOn);
         continue;
       }
 
       const living = alive.get(job.id);
       if (living) {
-        // `attached: true` を固定しない: runner が畳まれた `lost` / `failed` を名乗ることがあり、畳まれたセッションへの `push` は黙って捨てられるのに、届いたことにして台帳の終端状態を `running` へ巻き戻す。
-        // `done` も同じ隙間を持つが、この一覧（`RunnerManagerState`）はどちらの `done` かを区別する材料を持たない。
-        // だからホワイトリストで書く: ブラックリストに `done` を足す形は、状態が増えたとき既定が `attached: true`（危険側）へ倒れる。
-        // 安全側に倒しても代償は無い: 待機している `done` は resume 扱いになるが、`host.resume()` が生きたセッションへ `push` して短絡する。
-        const attached =
-          living.state.status === 'running' || living.state.status === 'waiting_human';
-        // 台帳の `cwd` を runner が実際に開いているセッションの値へ揃える: 頼んだだけの古い値を持ち越すと、`manager_list` / Web UI が実際と違う `cwd` を名乗り続ける。
-        const record: ManagerRecord = {
-          job: {
-            ...job,
-            status: living.state.status,
-            ...this.#placementOn(living.runner, living.state),
-          },
-          waiting: living.state.waiting,
-          attached,
-          reattachedAcrossRestart: true,
-          ...(living.state.tokenFingerprint === undefined
-            ? {}
-            : { tokenFingerprintAtReattach: living.state.tokenFingerprint }),
-          // `running` だけ: `waiting_human` は確認を待っていてターンを終えておらず、配り直しは `#redeliverWaitingAfterRestore` が持つ
-          ...(living.state.status === 'running' ? { reportCheckAfterRestore: true as const } : {}),
-        };
-        this.#records.set(job.id, record);
-        // 現役と違う鍵で走り続けている委譲は、起こし直しの借りに載せる（#4643）: 借り（`#usageWakeOwed`）はメモリにしか無く再起動で消えるが、
-        // 「回した時点で古い鍵のまま走っていた」はセッションの鍵の指紋と現役の指紋から引き取りの場で組み直せる。載せないと、古い鍵で枠に落ちた
-        // 通知は回し手に「もう回した後」として捨てられ（正しい）、鍵の側からの契機が二度と来ず、その委譲はクローンが手で起こすまで止まる。
-        const activeFingerprint = this.#tokenIdentity?.()?.fingerprint;
-        if (
-          attached &&
-          living.state.tokenFingerprint !== undefined &&
-          activeFingerprint !== undefined &&
-          living.state.tokenFingerprint !== activeFingerprint
-        ) {
-          this.#usageWakeOwed.add(job.id);
-        }
-        // `#rememberTokenIdentity(job.id)` を呼ばない: 引き取っただけでセッションの env は古い世代の鍵のままなので、観測しただけの現役の世代を書くと本物の食い違いが「一致」に化ける。
-        // 記録が無いままにする: 嘘の「一致」より、取れない軸に0の行を作らず正直に「材料が無い」を選ぶ。理由は `reattachedAcrossRestart` で名乗る。
-        await this.#persist(record);
-        if (attached) {
-          this.#restored.notify(record, 'attached');
-          this.#redeliverWaitingAfterRestore(record);
-        }
-        resumed.push(
-          summaryOf(
-            record,
-            isLive(record, silent),
-            lostSinceOf(record, silent),
-            vanishedOf(record, registeredRunnerIds),
-            record.sessionMissingSince,
-            record.turnEndedAt,
-            record.turnEndReason,
-            record.turnEndTail,
-            record.toolUseStallAt,
-            record.toolUseStallPending,
-            this.#withheld.awaitingBackgroundOf(record.job.id),
-            this.#tokenIdentities.get(record.job.id)?.generation,
-            this.#tokenIdentity?.()?.generation,
-            this.#tokenIdentity !== undefined,
-            this.#resetTimeSkewMatches.get(record.job.id),
-            this.#usageStopped.has(record.job.id) ? record.job.usageStoppedAt : undefined,
-            undefined,
-          ),
-        );
+        resumed.push(await this.#adoptLiving(job, living, silent, registeredRunnerIds));
         continue;
       }
 
@@ -4163,94 +4074,230 @@ class Pool implements ManagerPool {
       const runner = await this.#runnerOf(record);
       if (!runner) continue;
 
-      // cause は `'runner'`: runner がセッションを知らないのは器の入れ替わり（作業ツリーが消えている）と区別できず、`'daemon'` だと枝名の clone 案内と「コミット前の変更は失われている」が出ない。
-      const nudge = restartNudge(
-        fresh.status,
-        'runner',
-        fresh.workspace,
-        fresh.lastUnpushedWorkObservation,
-        undefined,
-        this.#rescueStash.note(fresh.rescueStash, runner.runnerId),
+      const summary = await this.#resumeAfterRestart(
+        job,
+        record,
+        fresh,
+        runner,
+        silent,
+        registeredRunnerIds,
       );
-      // 1本が戻せなくても残りを道連れにしない: 投げると走査が止まり、後ろに並んだ委譲は `#records` にすら載らないまま台帳に `running` で残る（呼び出し元は例外を握り潰すので跡はログ1行だけ）。`#resumeOnce` の中の実 I/O は投げうる。
-      // 同じ runner への resume が飛んでいる間は `closed` を預ける窓を立て、どの抜け方でも必ず1回閉じる。
-      // 別の契機が resume 中なら窓は持たない: そちらの窓を壊さない。
-      const windowOpen = !this.#resuming.has(job.id);
-      try {
-        if (windowOpen) this.#sameRunnerResumeWindow.set(job.id, runner.runnerId);
-        let ok: ResumeOutcome | undefined;
-        // 受理された回は `running` を persist した後に閉じる: 処理し直した結果を後から上書きしないため。受理されなかった回と投げた回は `moved` を立てずに閉じる。
-        try {
-          ok = await this.#resumeOnce(record, runner, nudge);
-          if (ok === 'resumed') {
-            // `#resumeOnce` から戻った直後、他の await を挟む前に読む: `#resuming` の関門は既に外れており、await の隙間に別の契機が新しい resume を仕掛けて `record.cwdSwapNotice` を上書きしうる。
-            const swapNotice = cwdSwapNoticeClause(record);
-            // 受理は「戻れた」ではない: 失敗は SSE で追いかけてくるので、無条件に上書きすると書いたばかりの終端状態が `running` へ巻き戻る。
-            if (record.job.status === 'lost') {
-              continue;
-            }
-            // 応答より先に届いた確認（`waiting`）があれば `waiting_human` を保つ（`#send` の同じ書き込みと同じ理由）。
-            record.job.status = record.waiting.length > 0 ? 'waiting_human' : 'running';
-            await this.#persist(record);
-            // `runner.send()` の失敗は無視する: 本体の resume は成功しており、この一言が届かなくても致命ではない。
-            if (swapNotice !== undefined) {
-              await runner.send(job.id, swapNotice).catch(() => undefined);
-            }
-            await this.#journalExchange(
-              'outbound',
-              `${EXCHANGE_KIND_RECOVERY_PREFIX}[${job.id}] （再起動後の再開）${nudge}` +
-                (swapNotice === undefined ? '' : ` ${swapNotice}`),
-            );
-            this.#restored.notify(record, 'resumed', 'runner');
-            resumed.push(
-              summaryOf(
-                record,
-                isLive(record, silent),
-                lostSinceOf(record, silent),
-                vanishedOf(record, registeredRunnerIds),
-                record.sessionMissingSince,
-                record.turnEndedAt,
-                record.turnEndReason,
-                record.turnEndTail,
-                record.toolUseStallAt,
-                record.toolUseStallPending,
-                this.#withheld.awaitingBackgroundOf(record.job.id),
-                this.#tokenIdentities.get(record.job.id)?.generation,
-                this.#tokenIdentity?.()?.generation,
-                this.#tokenIdentity !== undefined,
-                this.#resetTimeSkewMatches.get(record.job.id),
-                this.#usageStopped.has(record.job.id) ? record.job.usageStoppedAt : undefined,
-                undefined,
-              ),
-            );
-          }
-        } finally {
-          if (windowOpen) await this.#endRelocationWindow(job.id, ok === 'resumed');
-        }
-        // 貸し出し期限で断られたのは「まだ」: 黙って諦めると次の契機が永久に来ない（台帳では走っているのに誰も走っていない仕事が残る）ので、回数では諦めない梯子へ載せる。他の理由はここでは何もしない。
-        if (ok === 'held-by-lease') {
-          await this.#journal({
-            type: 'decision',
-            decision: leaseRefusalDecision(job.id, record.leaseRefusal),
-            grounds: record.leaseRefusal?.detail ?? '（根拠を取れなかった）',
-          });
-          this.#scheduleReattach(runner.runnerId);
-        }
-      } catch (error) {
-        if (isFencedRunnerError(error)) {
-          // 世代で拒まれた（409）は「戻せなかった」ではない: `lost` にして像から外すと、クローンが新しく起こし直し、fencing の失敗経路から二重実行へ到達する。状態は動かさず挑み直さず、必ず知らせる。
-          await this.#refuseFenced(job.id, error, '起動時の引き取りを止めた', '起動時の引き取り');
-        } else if (isRetryableRunnerError(error)) {
-          // 一時的なこけ方は黙って引き下がらない: 次の契機が永久に来ないことがあるので梯子へ載せる。
-          this.#scheduleReattach(runner.runnerId);
-        } else {
-          // `running` のままにしない: resume を実際に試して戻れなかったので、`lost` は確かめた事実。
-          // 直書きしない: resume を待つ間に `abort()` が `stopped` を書いていることがあり、`#confirmLost` は止めた後を動かさない（`#reattach` と同じ入口）。
-          await this.#confirmLost(record, error);
-        }
-      }
+      if (summary !== undefined) resumed.push(summary);
     }
     return resumed;
+  }
+
+  /** 全 runner に生きているセッションを聞く（聞けなかった器と、状態は読めなかった委譲も集める）。 */
+  async #listLivingSessions(): Promise<{
+    alive: Map<
+      string,
+      { runner: RunnerClient; state: Awaited<ReturnType<RunnerClient['list']>>[number] }
+    >;
+    unheard: Set<string>;
+    unreadable: Map<string, RunnerClient>;
+  }> {
+    const alive = new Map<
+      string,
+      { runner: RunnerClient; state: Awaited<ReturnType<RunnerClient['list']>>[number] }
+    >();
+    // 生死を聞けなかった器を覚える: 応答が無いことを「セッションが無い」と読むと、生きている仕事を二重に起こし、`gh pr create` のような取り返しのつかない操作が二度走る。
+    const unheard = new Set<string>();
+    // 状態は読めなかったが runner に居る委譲: 「居ない」と畳むと、まだ走っている委譲を resume し、待っていた確認を捨てる。
+    const unreadable = new Map<string, RunnerClient>();
+    for (const runner of await this.#runners.list()) {
+      const listing = await listRunnerManagers(runner).catch((error: unknown) => {
+        unheard.add(runner.runnerId);
+        // 黙って引き下がらない: 跡が無いと「セッションが無かった」のか「聞けなかった」のかを誰も言えない。
+        noteUnreadableRecord('runner のセッション一覧', `runnerId=${runner.runnerId}`, error);
+        return null;
+      });
+      if (listing === null) continue;
+      for (const state of listing.states) {
+        alive.set(state.managerId, { runner, state });
+      }
+      for (const managerId of listing.unreadableIds) unreadable.set(managerId, runner);
+    }
+    return { alive, unheard, unreadable };
+  }
+
+  /** 状態を読めなかったが runner に居る委譲を、resume せずに台帳へ載せる（`attached: false`）。 */
+  async #adoptUnreadable(job: Job, unreadableOn: RunnerClient): Promise<void> {
+    const record: ManagerRecord = {
+      job: { ...job, runnerId: unreadableOn.runnerId },
+      waiting: [],
+      attached: false,
+      reattachedAcrossRestart: true,
+    };
+    this.#records.set(job.id, record);
+    await this.#persist(record);
+  }
+
+  /** runner が生きているセッションを開いている委譲を、resume せずに台帳へ引き取る。一覧へ載せる要約を返す。 */
+  async #adoptLiving(
+    job: Job,
+    living: { runner: RunnerClient; state: Awaited<ReturnType<RunnerClient['list']>>[number] },
+    silent: ReadonlyMap<string, string>,
+    registeredRunnerIds: ReadonlySet<string> | null,
+  ): Promise<ManagerSummary> {
+    // `attached: true` を固定しない: runner が畳まれた `lost` / `failed` を名乗ることがあり、畳まれたセッションへの `push` は黙って捨てられるのに、届いたことにして台帳の終端状態を `running` へ巻き戻す。
+    // `done` も同じ隙間を持つが、この一覧（`RunnerManagerState`）はどちらの `done` かを区別する材料を持たない。
+    // だからホワイトリストで書く: ブラックリストに `done` を足す形は、状態が増えたとき既定が `attached: true`（危険側）へ倒れる。
+    // 安全側に倒しても代償は無い: 待機している `done` は resume 扱いになるが、`host.resume()` が生きたセッションへ `push` して短絡する。
+    const attached = living.state.status === 'running' || living.state.status === 'waiting_human';
+    // 台帳の `cwd` を runner が実際に開いているセッションの値へ揃える: 頼んだだけの古い値を持ち越すと、`manager_list` / Web UI が実際と違う `cwd` を名乗り続ける。
+    const record: ManagerRecord = {
+      job: {
+        ...job,
+        status: living.state.status,
+        ...this.#placementOn(living.runner, living.state),
+      },
+      waiting: living.state.waiting,
+      attached,
+      reattachedAcrossRestart: true,
+      ...(living.state.tokenFingerprint === undefined
+        ? {}
+        : { tokenFingerprintAtReattach: living.state.tokenFingerprint }),
+      // `running` だけ: `waiting_human` は確認を待っていてターンを終えておらず、配り直しは `#redeliverWaitingAfterRestore` が持つ
+      ...(living.state.status === 'running' ? { reportCheckAfterRestore: true as const } : {}),
+    };
+    this.#records.set(job.id, record);
+    // 現役と違う鍵で走り続けている委譲は、起こし直しの借りに載せる（#4643）: 借り（`#usageWakeOwed`）はメモリにしか無く再起動で消えるが、
+    // 「回した時点で古い鍵のまま走っていた」はセッションの鍵の指紋と現役の指紋から引き取りの場で組み直せる。載せないと、古い鍵で枠に落ちた
+    // 通知は回し手に「もう回した後」として捨てられ（正しい）、鍵の側からの契機が二度と来ず、その委譲はクローンが手で起こすまで止まる。
+    const activeFingerprint = this.#tokenIdentity?.()?.fingerprint;
+    if (
+      attached &&
+      living.state.tokenFingerprint !== undefined &&
+      activeFingerprint !== undefined &&
+      living.state.tokenFingerprint !== activeFingerprint
+    ) {
+      this.#usageWakeOwed.add(job.id);
+    }
+    // `#rememberTokenIdentity(job.id)` を呼ばない: 引き取っただけでセッションの env は古い世代の鍵のままなので、観測しただけの現役の世代を書くと本物の食い違いが「一致」に化ける。
+    // 記録が無いままにする: 嘘の「一致」より、取れない軸に0の行を作らず正直に「材料が無い」を選ぶ。理由は `reattachedAcrossRestart` で名乗る。
+    await this.#persist(record);
+    if (attached) {
+      this.#restored.notify(record, 'attached');
+      this.#redeliverWaitingAfterRestore(record);
+    }
+    return this.#restoredSummaryOf(record, silent, registeredRunnerIds);
+  }
+
+  /** 起動時の引き取りで一覧へ載せる要約を作る（生きていたセッションの引き取りと resume の受理で共有する）。 */
+  #restoredSummaryOf(
+    record: ManagerRecord,
+    silent: ReadonlyMap<string, string>,
+    registeredRunnerIds: ReadonlySet<string> | null,
+  ): ManagerSummary {
+    return summaryOf(
+      record,
+      isLive(record, silent),
+      lostSinceOf(record, silent),
+      vanishedOf(record, registeredRunnerIds),
+      record.sessionMissingSince,
+      record.turnEndedAt,
+      record.turnEndReason,
+      record.turnEndTail,
+      record.toolUseStallAt,
+      record.toolUseStallPending,
+      this.#withheld.awaitingBackgroundOf(record.job.id),
+      this.#tokenIdentities.get(record.job.id)?.generation,
+      this.#tokenIdentity?.()?.generation,
+      this.#tokenIdentity !== undefined,
+      this.#resetTimeSkewMatches.get(record.job.id),
+      this.#usageStopped.has(record.job.id) ? record.job.usageStoppedAt : undefined,
+      undefined,
+    );
+  }
+
+  /** 再起動後に resume できる委譲を runner へ戻す（同じ runner への resume の窓の開閉・resume・受理後の書き戻し・拒否と失敗の後始末）。戻せた回は一覧へ載せる要約を返す。 */
+  async #resumeAfterRestart(
+    job: Job,
+    record: ManagerRecord,
+    fresh: Job,
+    runner: RunnerClient,
+    silent: ReadonlyMap<string, string>,
+    registeredRunnerIds: ReadonlySet<string> | null,
+  ): Promise<ManagerSummary | undefined> {
+    let summary: ManagerSummary | undefined;
+    // cause は `'runner'`: runner がセッションを知らないのは器の入れ替わり（作業ツリーが消えている）と区別できず、`'daemon'` だと枝名の clone 案内と「コミット前の変更は失われている」が出ない。
+    const nudge = restartNudge(
+      fresh.status,
+      'runner',
+      fresh.workspace,
+      fresh.lastUnpushedWorkObservation,
+      undefined,
+      this.#rescueStash.note(fresh.rescueStash, runner.runnerId),
+    );
+    // 1本が戻せなくても残りを道連れにしない: 投げると走査が止まり、後ろに並んだ委譲は `#records` にすら載らないまま台帳に `running` で残る（呼び出し元は例外を握り潰すので跡はログ1行だけ）。`#resumeOnce` の中の実 I/O は投げうる。
+    // 同じ runner への resume が飛んでいる間は `closed` を預ける窓を立て、どの抜け方でも必ず1回閉じる。
+    // 別の契機が resume 中なら窓は持たない: そちらの窓を壊さない。
+    const windowOpen = !this.#resuming.has(job.id);
+    try {
+      if (windowOpen) this.#sameRunnerResumeWindow.set(job.id, runner.runnerId);
+      let ok: ResumeOutcome | undefined;
+      // 受理された回は `running` を persist した後に閉じる: 処理し直した結果を後から上書きしないため。受理されなかった回と投げた回は `moved` を立てずに閉じる。
+      try {
+        ok = await this.#resumeOnce(record, runner, nudge);
+        if (ok === 'resumed') {
+          // `#resumeOnce` から戻った直後、他の await を挟む前に読む: `#resuming` の関門は既に外れており、await の隙間に別の契機が新しい resume を仕掛けて `record.cwdSwapNotice` を上書きしうる。
+          const swapNotice = cwdSwapNoticeClause(record);
+          // 受理は「戻れた」ではない: 失敗は SSE で追いかけてくるので、無条件に上書きすると書いたばかりの終端状態が `running` へ巻き戻る。
+          if (record.job.status === 'lost') {
+            return undefined;
+          }
+          await this.#settleResumedAfterRestart(record, runner, job.id, nudge, swapNotice);
+          summary = this.#restoredSummaryOf(record, silent, registeredRunnerIds);
+        }
+      } finally {
+        if (windowOpen) await this.#endRelocationWindow(job.id, ok === 'resumed');
+      }
+      // 貸し出し期限で断られたのは「まだ」: 黙って諦めると次の契機が永久に来ない（台帳では走っているのに誰も走っていない仕事が残る）ので、回数では諦めない梯子へ載せる。他の理由はここでは何もしない。
+      if (ok === 'held-by-lease') {
+        await this.#journal({
+          type: 'decision',
+          decision: leaseRefusalDecision(job.id, record.leaseRefusal),
+          grounds: record.leaseRefusal?.detail ?? '（根拠を取れなかった）',
+        });
+        this.#scheduleReattach(runner.runnerId);
+      }
+    } catch (error) {
+      if (isFencedRunnerError(error)) {
+        // 世代で拒まれた（409）は「戻せなかった」ではない: `lost` にして像から外すと、クローンが新しく起こし直し、fencing の失敗経路から二重実行へ到達する。状態は動かさず挑み直さず、必ず知らせる。
+        await this.#refuseFenced(job.id, error, '起動時の引き取りを止めた', '起動時の引き取り');
+      } else if (isRetryableRunnerError(error)) {
+        // 一時的なこけ方は黙って引き下がらない: 次の契機が永久に来ないことがあるので梯子へ載せる。
+        this.#scheduleReattach(runner.runnerId);
+      } else {
+        // `running` のままにしない: resume を実際に試して戻れなかったので、`lost` は確かめた事実。
+        // 直書きしない: resume を待つ間に `abort()` が `stopped` を書いていることがあり、`#confirmLost` は止めた後を動かさない（`#reattach` と同じ入口）。
+        await this.#confirmLost(record, error);
+      }
+    }
+    return summary;
+  }
+
+  /** resume が受理された委譲の状態を書き戻し、一言と日誌と通知を出す（`#resumeAfterRestart` の受理の枝）。 */
+  async #settleResumedAfterRestart(
+    record: ManagerRecord,
+    runner: RunnerClient,
+    jobId: string,
+    nudge: string,
+    swapNotice: string | undefined,
+  ): Promise<void> {
+    // 応答より先に届いた確認（`waiting`）があれば `waiting_human` を保つ（`#send` の同じ書き込みと同じ理由）。
+    record.job.status = record.waiting.length > 0 ? 'waiting_human' : 'running';
+    await this.#persist(record);
+    // `runner.send()` の失敗は無視する: 本体の resume は成功しており、この一言が届かなくても致命ではない。
+    if (swapNotice !== undefined) {
+      await runner.send(jobId, swapNotice).catch(() => undefined);
+    }
+    await this.#journalExchange(
+      'outbound',
+      `${EXCHANGE_KIND_RECOVERY_PREFIX}[${jobId}] （再起動後の再開）${nudge}` +
+        (swapNotice === undefined ? '' : ` ${swapNotice}`),
+    );
+    this.#restored.notify(record, 'resumed', 'runner');
   }
 
   /** runner が実際に開いているセッションの値へ台帳の宛先・cwd・workspace・sessionId を揃える（起動時の引き取りと、移送先に既に居た委譲の取り直しが共有する）。 */
