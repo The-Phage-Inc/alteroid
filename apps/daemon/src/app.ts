@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web';
 import type {
@@ -39,10 +39,6 @@ import type {
 } from '@alteroid/core';
 import {
   conversationBindingKey,
-  type MemoryDocument,
-  MemoryConflictError,
-  memoryVersion,
-  memoryVersionMatches,
   PracticeConflictError,
   practiceVersion,
   practiceVersionMatches,
@@ -118,7 +114,6 @@ import {
   removeArchiveJournalFirst,
   removeInboxChunkJournalFirst,
   summarizeInboxBacklog,
-  memorySlugSchema,
   practiceKindSchema,
   practiceSlugSchema,
   fingerprintOf,
@@ -149,9 +144,7 @@ import {
   REMOVE_MANY_LIMIT_DEFAULT,
   REMOVE_MANY_LIMIT_MAX,
   reportRunnerRevision,
-  describeResetTargets,
   describeUnreadableManagerRow,
-  resetWorkspaceState,
   resolveBuildRevision,
   scheduleKindSchema,
   SCHEDULE_EVERY_MINUTES_MAX_MESSAGE,
@@ -288,11 +281,6 @@ import {
   managerActionResponseSchema,
   managerDetailResponseSchema,
   managersListResponseSchema,
-  memoryDeleteResponseSchema,
-  memoryListResponseSchema,
-  memoryConflictResponseSchema,
-  memoryReadResponseSchema,
-  memoryWriteResponseSchema,
   meResponseSchema,
   okResponseSchema,
   scheduleCreateResponseSchema,
@@ -323,8 +311,6 @@ import {
   profileResponseSchema,
   profileUpdateResponseSchema,
   reportsResponseSchema,
-  resetRequestSchema,
-  resetResponseSchema,
   runnersListResponseSchema,
   runnersVacateCommandSchema,
   runnersVacateResponseSchema,
@@ -354,6 +340,7 @@ import {
 import { createAppContext, principalRefOf } from './app-context.js';
 import {
   ifMatchDeleteQuery,
+  ifMatchField,
   deliberateClient,
   mimeEssence,
   noBodyPostRequestBody,
@@ -384,6 +371,8 @@ import {
   answerApprovalViaOf,
   humanActionOf,
 } from './app-shared.js';
+import { adminRoutes } from './app-routes-admin.js';
+import { memoryRoutes } from './app-routes-memory.js';
 
 export { humanActionOf } from './app-shared.js';
 // 外から叩かせるなら境界は手前（リバースプロキシ・トンネル・認証）に置く: 能力側で絞らず実行環境の境界で守る（north_star 禁止2）。
@@ -523,26 +512,7 @@ const octetStreamClient = createMiddleware(async (c, next) => {
   await next();
 });
 
-// 書き込みの `ifMatch`: 省略は後勝ち、`null` は「まだ無いこと」を前提にする（読んだ版を前提にする書き込みの共通の欄）。
-const ifMatchField = z.string().nullable().optional();
-const memoryBody = z.object({ content: z.string(), ifMatch: ifMatchField });
-
 // 記憶・やり方の 409 の本文の組み立て（検査の順序は route ごとに違うので寄せない）。`error` は `as const` のリテラルのまま返す: 文が `string` に広がると `hc` の応答の型が変わる。
-const MEMORY_CONFLICT_ERROR = {
-  write: '記憶が読んだ後に変わっています（書き換えていません）',
-  remove: '記憶が読んだ後に変わっています（消していません）',
-} as const;
-const memoryCurrent = (document: MemoryDocument) => ({
-  document,
-  version: memoryVersion(document.content),
-});
-const memoryConflictBody = <Op extends keyof typeof MEMORY_CONFLICT_ERROR>(
-  current: MemoryDocument | null,
-  op: Op,
-) => ({
-  error: MEMORY_CONFLICT_ERROR[op],
-  current: current === null ? null : memoryCurrent(current),
-});
 const PRACTICE_CONFLICT_ERROR = {
   write: 'やり方が読んだ後に変わっています（書き換えていません）',
   remove: 'やり方が読んだ後に変わっています（消していません）',
@@ -3129,239 +3099,7 @@ export function createApp(deps: AppDeps) {
         }),
     )
 
-    .get(
-      '/memory',
-      describeRoute({
-        tags: ['memory'],
-        summary: '記憶文書の一覧',
-        description: '記憶（PersonaStore）の文書一覧。本文は含まない（メタ情報だけ）。',
-        responses: {
-          200: jsonResponse('記憶文書のメタ情報一覧。', memoryListResponseSchema),
-        },
-      }),
-      async (c) => c.json({ documents: await stores.persona.list() }),
-    )
-
-    .get(
-      '/memory/:slug',
-      describeRoute({
-        tags: ['memory'],
-        summary: '記憶文書を1つ読む',
-        responses: {
-          200: jsonResponse('記憶文書。', memoryReadResponseSchema),
-          400: errorResponse('記憶のスラッグが不正。'),
-          404: errorResponse('該当する記憶が無い。'),
-        },
-      }),
-      async (c) => {
-        // `PUT`/`DELETE` と同じ門: ここが無いと `FsPersonaStore#path` が投げる例外が `onError` まで抜けて 500 になり、同じ入力なのに応答が違う。
-        const slug = c.req.param('slug');
-        if (!memorySlugSchema.safeParse(slug).success) {
-          return c.json({ error: '記憶のスラッグが不正' as const }, 400);
-        }
-        const doc = await stores.persona.read(slug);
-        if (!doc) return c.json({ error: 'not found' as const }, 404);
-        return c.json({ document: doc, version: memoryVersion(doc.content) });
-      },
-    )
-
-    .put(
-      '/memory/:slug',
-      describeRoute({
-        tags: ['memory'],
-        summary: '記憶文書を全文置換で書く',
-        description:
-          '人間が API から記憶を書き換える口。書き換えは日誌に残る（`cause: human`）。' +
-          '日誌を先に書き、書けなければ本文を書かずに 500 を返す（印の付かない保存を起こさない）。' +
-          '本文が書けなかった（409 ほか）ときは、日誌に打ち消しの行（`action: write_failed`）を足す。',
-        responses: {
-          200: jsonResponse(
-            '書き換え後の記憶文書。`created` は新規なら true、置換なら false。',
-            memoryWriteResponseSchema,
-          ),
-          400: errorResponse('記憶のスラッグが不正、または本文が JSON として不正。'),
-          409: jsonResponse(
-            '`ifMatch`（読んだ時の版）が、いまの版と違う（読んでから書くまでの間に別の書き手が' +
-              '書いた、または消した）。**何も書いていない。** `current` にいまの版を返す。',
-            memoryConflictResponseSchema,
-          ),
-          500: journalWriteFailedResponse('日誌が書けなかった（**本文を書いていない**）。'),
-        },
-      }),
-      jsonBody(memoryBody, invalidWith('記憶の本文の形が不正')),
-      async (c) => {
-        const slug = c.req.param('slug');
-        if (!memorySlugSchema.safeParse(slug).success) {
-          return c.json({ error: '記憶のスラッグが不正' as const }, 400);
-        }
-        const before = await stores.persona.read(slug);
-        const { content, ifMatch } = c.req.valid('json');
-        // 読んだ版が既に食い違っていれば、日誌を書く前に 409 で返す: ふつうの衝突のたびに `write` と `write_failed` の2行を日誌へ積まないため。
-        // ここを抜けた後に割り込まれた回は、下の `persona.write` の排他が 409 にし、打ち消しの行で対応を保つ。
-        if (!memoryVersionMatches(before, ifMatch)) {
-          return c.json(memoryConflictBody(before, 'write'), 409);
-        }
-        // 日誌を先に書き、書けなければ本文を書かずに 500（#4774）: 本文の後に書いて `appendJournalOrDrop` で握ると、本文は変わったのに裏付けの `cause:'human'` の行が無く、`markHumanTouched` も呼べない「印の付かない人間の保存」が生まれる（クローンが次の蒸留で黙って上書きできてしまう）。
-        let entry;
-        try {
-          entry = await stores.journal.append({
-            type: 'memory_update',
-            slug,
-            cause: 'human',
-            action: 'write',
-            // クローンの道具（memory_write）と同じ機械可読な面: 片方だけ足すと「人間の書き込みだけ数えられない」が生まれる。
-            bytesBefore: before === null ? 0 : Buffer.byteLength(before.content, 'utf8'),
-            bytesAfter: Buffer.byteLength(content, 'utf8'),
-            summary: 'HTTP API 経由で人間が記憶を書き換えた',
-          });
-        } catch (error) {
-          noteDroppedRecord(
-            '記憶書き換えの日誌（保存していない）',
-            `slug=${slug}`,
-            kindOfError(error),
-          );
-          return c.json(journalWriteFailedBody(), 500);
-        }
-        let doc;
-        try {
-          // 印（`humanTouchedAt`）は本文と同じ排他・同じ1文で立てる: 本文の後に別の呼び出しで立てると、その間は `clone-only` で、蒸留が人間の本文を全置換・削除できた。書けなかった回は印も立たない。裏付けの行は上で先に書いてある。
-          doc = await stores.persona.write(slug, content, { ifMatch, humanTouchedAt: entry.at });
-        } catch (error) {
-          // 日誌には「人間が書いた」が残っているので打ち消す: `deriveHumanTouchedAtFromJournal` が、この行を印の根拠にしない。足せなければ跡だけ残し（`appendJournalOrDrop`）、応答は元の失敗のまま返す（再構築で印が立ちうるのは守りすぎの側）。
-          await appendJournalOrDrop(
-            stores,
-            {
-              type: 'memory_update',
-              slug,
-              cause: 'human',
-              action: 'write_failed',
-              summary:
-                'HTTP API 経由の人間の保存は本文に届かなかった（直前の write の行を打ち消す）',
-            },
-            '記憶書き換えの打ち消しの日誌',
-            `slug=${slug}`,
-          );
-          // 黙って上書きしない: 書いていない。
-          if (error instanceof MemoryConflictError) {
-            return c.json(memoryConflictBody(error.current, 'write'), 409);
-          }
-          throw error;
-        }
-        // 無い slug への書き込みは新規作成: 打ち間違いの slug が更新と同じ 200 に紛れないよう、応答で言い分ける。
-        return c.json({
-          document: doc,
-          version: memoryVersion(doc.content),
-          created: before === null,
-        });
-      },
-    )
-
-    .delete(
-      '/memory/:slug',
-      describeRoute({
-        tags: ['memory'],
-        summary: '記憶文書を消す',
-        description:
-          '書けるのに消せないと、間違って作った記憶が永久に判断の材料に残る。消した事実は' +
-          '日誌に残る（`cause: human`）ので、記憶から消えても記録からは消えない。\n\n' +
-          '**読んだ版を前提にできる（Issue #2881）。** クエリ `ifMatch` に、読んだ時の版' +
-          '（`GET /memory/{slug}` の `version`）を付けると、いまの版と違うとき**何も消さず 409** で' +
-          'いまの版を返す（読んだ後にクローンが書いた内容を黙って消さない）。\n\n' +
-          '**版は必須。** `ifMatch` を付けない削除は **428** で断り、何も消さず・日誌にも積まず、' +
-          'いまの版を `current` に返す（読み直して、その `version` を付けて打ち直す）。' +
-          'スラッグが不正なら 400、記憶が無ければ 404 を先に返す。',
-        responses: {
-          200: jsonResponse('消した。', memoryDeleteResponseSchema),
-          409: jsonResponse(
-            '`ifMatch`（読んだ時の版）が、いまの版と違う（読んでから消すまでの間に別の書き手が' +
-              '書いた）。**何も消していない。** `current` にいまの版を返す。',
-            memoryConflictResponseSchema,
-          ),
-          428: jsonResponse(
-            '`ifMatch`（読んだ時の版）が無い。**何も消していない。** `current` にいまの版を返す' +
-              '（409 と同じ形）。',
-            memoryConflictResponseSchema,
-          ),
-          400: errorResponse('記憶のスラッグが名前として成立しない（「無い」とは区別する）。'),
-          404: errorResponse('該当する記憶が無い。'),
-          500: journalWriteFailedResponse('消す前の日誌が書けなかった（**消していない**）。'),
-        },
-      }),
-      queryParams(ifMatchDeleteQuery),
-      async (c) => {
-        const slug = c.req.param('slug');
-        if (!memorySlugSchema.safeParse(slug).success) {
-          return c.json({ error: '記憶のスラッグが不正' as const }, 400);
-        }
-        const { ifMatch } = c.req.valid('query');
-        const existing = await stores.persona.read(slug);
-        if (existing === null) return c.json({ error: 'not found' as const }, 404);
-        // 読み直せるよう、いまの版を 409 と同じ形で返す。
-        if (ifMatch === undefined) {
-          return c.json(
-            {
-              error: '消す記憶の版（ifMatch）が無いので、消していません' as const,
-              current: memoryCurrent(existing),
-            },
-            428,
-          );
-        }
-        // 読んだ版が既に食い違っていれば、日誌を書く前に 409 で返す（消さないので書く跡が無い。ふつうの衝突のたびに2行を積まない）。
-        if (!memoryVersionMatches(existing, ifMatch)) {
-          return c.json(memoryConflictBody(existing, 'remove'), 409);
-        }
-        // 日誌を先に書き、書けなければ消さずに 500（#5243）: 消した後に書いて `appendJournalOrDrop` で握ると、人間がクローンの記憶を消したのにクローンへ名指しされず、学びにもならない。
-        // 先の行は `memory_update`（`cause:'human'`）にせず `decision` にする: `memory_update` の `cause:'human'` は `deriveHumanTouchedAtFromJournal` などが派生値の根拠に読む行なので、消せなかった回に残すと派生を誤らせる。`decision` の先の行は humanAction を持たないので、クローンへ名指しもされない。
-        // 効いた後の `memory_update` の行（下）は今までどおり。
-        const entryBefore: JournalEntryInput = {
-          type: 'decision',
-          decision: `人間が記憶 ${slug} を消す`,
-          grounds: '人間が直接 API から消そうとしている',
-        };
-        try {
-          await stores.journal.append(entryBefore);
-        } catch (error) {
-          noteDroppedRecord('記憶削除の日誌（消していない）', `slug=${slug}`, kindOfError(error));
-          return c.json(journalWriteFailedBody(), 500);
-        }
-        // `markHumanTouched` はここでは呼ばない: `PersonaStore.remove` が保護状態の派生値も一緒に消す（実体の無い印は監査上の嘘になる）ので、印を立てても同じ操作の中で消える。delete は「人間の意思で消した」であって、将来ここに書かれる新しい内容を無条件に保護する理由にならない。
-        try {
-          await stores.persona.remove(slug, { ifMatch });
-        } catch (error) {
-          // 先の行を打ち消す: 消していない。
-          await humanRetractor(stores, {
-            operation: '記憶を消す',
-            subject: `記憶 ${slug} の削除`,
-            what: '記憶削除の打ち消しの日誌',
-            detail: `slug=${slug}`,
-          })(
-            error instanceof MemoryConflictError
-              ? '消す直前に記憶が書き換えられていた（見た版と違う）'
-              : '記憶の削除が失敗した',
-          );
-          if (error instanceof MemoryConflictError) {
-            return c.json(memoryConflictBody(error.current, 'remove'), 409);
-          }
-          throw error;
-        }
-        // 削除自体は効いているので、日誌への追記だけが落ちても 500 を返さない（`appendJournalOrDrop`）。
-        await appendJournalOrDrop(
-          stores,
-          {
-            type: 'memory_update',
-            slug,
-            cause: 'human',
-            action: 'remove',
-            bytesBefore: Buffer.byteLength(existing.content, 'utf8'),
-            bytesAfter: 0,
-            summary: 'HTTP API 経由で人間が記憶を削除した',
-          },
-          '記憶削除の日誌',
-          `slug=${slug}`,
-        );
-        return c.json({ ok: true as const, slug });
-      },
-    )
+    .route('/', memoryRoutes(ctx))
 
     // `apply` / `enforce` に当たる経路を足さない: 「このやり方に従え」という操作はどの入口にも存在しない（`docs/north_star.md`）。やり方は読む素材で、従うかはそのときのクローンが決める。
     // 日誌は `practice_write` / `practice_remove`（クローンの道具）と同じ `type: 'decision'` に揃える: 揃えないと同じ操作が人間経由かクローン経由かで日誌の型が変わる。
@@ -8553,102 +8291,7 @@ export function createApp(deps: AppDeps) {
       }),
     )
 
-    // 資格は `authenticate` だけで `requireOperator` は付けない: 基準は「壊すかどうか」ではなく、鍵そのものを扱う口だけが一段上の強さを持つ。ここは鍵を扱わず記憶も台帳も消さず、止めた後に起動し直せば元に戻る（`POST /reset` とは取り返しのつき方が違う）。`deliberateClient` は資格の門ではない（ブラウザの単純リクエストを止めるもの）ので、資格の門が見当たらないのを「付け忘れ」と読まないこと。
-    .post(
-      '/shutdown',
-      describeRoute({
-        tags: ['system'],
-        summary: 'デーモンを止める',
-        description: '`daemon stop` の受け口。運ぶ情報は無い（`{}` を送る）。',
-        requestBody: emptyJsonPostRequestBody('デーモンを止められないため'),
-        responses: {
-          200: jsonResponse('停止を受け付けた（実際の停止は少し遅れる）。', okResponseSchema),
-          ...noBodyPostResponses(),
-        },
-      }),
-      deliberateClient,
-      (c) => {
-        setTimeout(() => deps.shutdown(), 10);
-        return c.json({ ok: true });
-      },
-    )
-
-    // `confirm: true` を必須にする: 確認ダイアログは呼ぶ前の話で、この口自体にも確認の印を要求して確認を経ない直接の呼び出し（スクリプト等）を 400 で止める。`access grant` だけのアカウントに記憶そのものを消せる資格までは渡さない。
-    .post(
-      '/reset',
-      describeRoute({
-        tags: ['system'],
-        summary: 'トークン情報以外のワークスペースを全部消す',
-        // `describeResetTargets()` から組み立てる（CLI の確認の文と同じ出所）: 手で書き写すとここだけ古くなる。
-        description:
-          `${describeResetTargets()}を全部消す。` +
-          '**認証トークンのプール・マネージャーへ降ろす環境変数・Web UI の' +
-          'ログインアカウントは消さない。** 取り消せない。',
-        responses: {
-          200: jsonResponse('消した件数の内訳。', resetResponseSchema),
-          400: errorResponse('`confirm: true` を伴っていない。'),
-          403: errorResponse(NO_ACCESS_GRANT_DESCRIPTION),
-          503: errorResponse(
-            '添付の中身を置き場から消せなかったので、添付は消していない（添付より前の順に消すものは消えている。#4814）。本文の `error` に理由。もう一度リセットすると再試行する。',
-          ),
-        },
-      }),
-      jsonBody(resetRequestSchema, () => ({
-        error: '`confirm: true` を伴っていない（取り消せない操作なので確認を必須にしてある）',
-      })),
-      async (c) => {
-        let cleared: Awaited<ReturnType<typeof resetWorkspaceState>>;
-        try {
-          cleared = await resetWorkspaceState(stores, {
-            ...(deps.clearSessionLog === undefined
-              ? {}
-              : { clearSessionLog: deps.clearSessionLog }),
-          });
-        } catch (error) {
-          if (!(error instanceof AttachmentContentRemoveError)) throw error;
-          // 添付は最後のほうに消す: ここへ来た時点で、記憶・日誌などは消えている（途中で止まった）。500 で理由を隠さず、残ったものと再試行できることを言う。
-          await appendJournalOrDrop(
-            stores,
-            {
-              type: 'decision',
-              decision:
-                'ワークスペースのリセットが途中で止まった（添付の中身を置き場から消せなかった。添付と、それより後の消去は済んでいない）',
-              grounds: `${describeActor(c.get('principal'))}（POST /reset）。理由: ${error.reason}。もう一度リセットすると再試行する。`,
-            },
-            'ワークスペースリセットの断りの日誌',
-            `id=${error.id}`,
-          );
-          return c.json(
-            {
-              error: `添付の中身を置き場から消せなかったので、リセットが途中で止まった（添付は消していない。それ以前の消去は済んでいる）。理由: ${error.reason}。もう一度リセットすると再試行する`,
-            },
-            503,
-          );
-        }
-        // 写しは置き場の外のファイルなのでここで消す。消せなくても 500 にしない: 本体はもう消えており、申告の `cleared` を失わない。
-        if (deps.attachmentCopiesDir !== undefined) {
-          await rm(deps.attachmentCopiesDir, { recursive: true, force: true }).catch(
-            (error: unknown) => {
-              writeStderrLine(
-                `alteroidd: リセットで添付の写しを消せなかった: ${reasonOf(error)}\n`,
-              );
-            },
-          );
-        }
-        // 日誌が落ちても 500 を返さない（特に重要）: `cleared` は取り消せない操作の唯一の申告で、500 にすると実際には消えている件数が応答から失われる。
-        await appendJournalOrDrop(
-          stores,
-          {
-            type: 'decision',
-            decision: 'ワークスペースをリセットした（トークン情報以外を全部消した）',
-            grounds: `${describeActor(c.get('principal'))}（POST /reset。confirm 済み）`,
-          },
-          'ワークスペースリセットの日誌',
-          `cleared=${JSON.stringify(cleared)}`,
-        );
-        return c.json(resetResponseSchema.parse({ cleared }));
-      },
-    );
+    .route('/', adminRoutes(ctx, deps));
 
   // チェーンに載せない: `.get(...)` を差し込むと以降の型引数が積み重なり `AppType`（CLI の `hc<AppType>` が依存する型）の推論が壊れかねない。`exclude` は describeRoute の無い経路が spec に載らない動作を明示する二重の安全策。
   app.get(
