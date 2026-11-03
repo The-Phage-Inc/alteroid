@@ -1,16 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { createSdkMcpServer, tool as sdkTool } from '@anthropic-ai/claude-agent-sdk';
+import { createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
 import { describeArchiveRemovedBytesUnit } from './archive-removed-bytes.js';
 import { codexChatgptAuthStatusOf, describeCodexChatgptAuth } from './codex-chatgpt-auth.js';
 import { fallbackAttachmentCopiesDir, fetchAttachmentCopy } from './attachment-fetch.js';
-import {
-  ATTACHMENT_FROM_CLASSES,
-  readAttachmentLimits,
-  type AttachmentLimits,
-} from './attachment.js';
+import { ATTACHMENT_FROM_CLASSES, readAttachmentLimits } from './attachment.js';
 import { putLocalFile } from './file-put.js';
 import {
   deleteFile,
@@ -78,7 +74,6 @@ import {
 } from './manager-cursor.js';
 import { encodeScheduleCursor, resolveScheduleCursor } from './schedule-cursor.js';
 import {
-  assertNeverRunnerLegStatus,
   describePidsSaturation,
   RUNNER_CAPABILITY_AWAITING_BACKGROUND_SIGNAL,
 } from './runner-protocol.js';
@@ -235,7 +230,7 @@ import {
   localDayRange,
   parseTimeOfDay,
 } from './schedule.js';
-import type { ScheduleStatus } from './schedule.js';
+
 import { scheduleReplaceEntry } from './schedule-replace.js';
 import {
   JOURNAL_ENTRY_TYPES,
@@ -271,9 +266,7 @@ import {
   taskStatusLine,
 } from './task-tools.js';
 import type {
-  AttachmentRef,
   Task,
-  ChatStreamEvent,
   TaskOrigin,
   ExternalOutput,
   Job,
@@ -379,7 +372,6 @@ import {
   journalSearchContinuationUntil,
   searchJournalBackwardInSlices,
   type JournalSearchCoverage,
-  type JournalSlicedSearchOptions,
 } from './journal-sliced-search.js';
 import { describeManagerFoldCandidate } from './manager-fold-candidate.js';
 import { describeManagerModels, managerModelsOf } from './manager-models.js';
@@ -394,9 +386,9 @@ import {
 import { describeWaitingKind } from './waiting-kind-format.js';
 import { formatElapsedAgo, formatMinutesAgo } from './format-elapsed.js';
 import { RESCUE_NOT_PUSHED_TEXT, rescueNotPushedDetail } from './workspace-swap-hints.js';
-import { strictToolInput } from './strict-tool-input.js';
+
 import { chunkIdsByChars } from './chunk-ids.js';
-import type { ToolUseIdProbe } from './subagent-caller-gauge.js';
+
 import {
   CLOSE_MANY_IDS_SHOWN,
   CLOSE_MANY_JOURNAL_ID_CHARS,
@@ -421,27 +413,31 @@ import {
   formatIntRangeJa,
   formatStringLengthJa,
 } from './tool-arg-checks.js';
-
-const MISSING_ARG_HINT =
-  '引数が届いていない（received undefined ＝ 呼び出しの JSON にその鍵が最初から無かった。道具が受け取ってから落としたのではない）。書いたつもりなら、まず呼び出しの生の形を疑うこと —— タグの接頭辞の脱落など、呼び出しの組み立てが壊れていると引数は静かに落ちる。決定的な対照: 引数の並びも長さも1文字も変えず、タグだけ正しく書いて1回送り直す。それで通れば、原因は呼び出しの形であって、この道具でも引数の中身でもない';
-
-// `.describe()` を貼り直す: `clone()` で説明が落ち、モデルが読む道具の意味が削れるため
-function withMissingArgHint<Shape extends object>(shape: Shape): Shape {
-  const hinted = Object.entries(shape).map(([key, value]) => {
-    const schema = value as z.ZodTypeAny & { _zod?: { def?: object } };
-    const def = schema?._zod?.def;
-    if (!def || typeof schema.clone !== 'function') return [key, value];
-    const cloned = schema.clone({
-      ...def,
-      error: (iss: { input?: unknown }) => (iss.input === undefined ? MISSING_ARG_HINT : undefined),
-    } as never);
-    return [key, schema.description === undefined ? cloned : cloned.describe(schema.description)];
-  });
-  return Object.fromEntries(hinted) as Shape;
-}
-
-const tool: typeof sdkTool = (name, description, inputSchema, handler, extras) =>
-  sdkTool(name, description, strictToolInput(withMissingArgHint(inputSchema)), handler, extras);
+import { CLOSES_SCHEMA, describeClosesViolation, finishWithCloses } from './clone-tools-closes.js';
+import {
+  tool,
+  describeRunnerLegState,
+  TRANSCRIPT_PAGE,
+  JOURNAL_TEXT_EXCERPT,
+  describeUnreadableJournalEntry,
+  RUNNER_MANAGER_PEERS_EXCERPT,
+  text,
+  type ToolText,
+  JournalNotRecordedError,
+  appendJournalOrThrow,
+  appendJournalOrDrop,
+  NO_POOL,
+  type FixedFold,
+  NO_FIXED_FOLD,
+  isSubagentCaller,
+  foldFixedFor,
+  USAGE_AXIS_LIMIT,
+  USAGE_AXIS_PAGE,
+  maxUpdatedAt,
+  renderRisenSection,
+} from './clone-tools-common.js';
+import { CLONE_TOOL_NAMES, type CloneToolName } from './clone-tools-names.js';
+import type { ToolContext } from './clone-tools-context.js';
 
 export const MCP_INPUT_VALIDATION_ERROR_MARKER =
   'Input validation error: Invalid arguments for tool ';
@@ -490,102 +486,14 @@ function stringifyToolResponseForValidationCheck(toolResponse: unknown): string 
 import { MCP_SERVER_NAME } from './mcp-server-name.js';
 
 export { MCP_SERVER_NAME };
-
-/** いまのターンの返信に添える添付の口（`reply_attach`）。 */
-export interface ReplyAttachments {
-  /** このターンの返信にすでに添えた控え（個数・合計は新しい分と合わせて数える）。 */
-  current(): readonly AttachmentRef[];
-  /** 返信に添える。会話の SSE へ `attachments` を流し、返信の日誌の `exchange` に載せる。 */
-  add(refs: readonly AttachmentRef[]): void;
-}
-
-export interface ToolContext {
-  stores: Stores;
-  /** `journal_read` の語の検索の窓・予算・時計（#5126）。試験が小さくするための口。省けば既定（1日・8秒）。 */
-  journalSearch?: JournalSlicedSearchOptions;
-  emit(event: ChatStreamEvent): void;
-  flushReply?(): Promise<void>;
-  // optional にしない: 渡し忘れが型検査を通り、承認が黙って会話に紐づかなくなるため
-  conversationId: () => string | undefined;
-  /**
-   * いまのターンの仕事が属する会話。会話のあるターンでは `conversationId` と同じで、内部ターンでは
-   * 委譲の起点（マネージャーからの一件なら、その委譲の `Job.conversationId`）。`manager_start` の起点と、
-   * `ask_human` / `request_permission` が積む承認の会話に写す。返信の宛先（`conversationId`）とは別である。
-   */
-  // optional にする: 無い器（テストの ToolContext）は従来どおり `conversationId` だけを見る。クローン本体は必ず渡す
-  workConversationId?: () => string | undefined;
-  recentDenials?: () => readonly RecentDenial[];
-  /**
-   * `manager_start` が委譲を起こした／`manager_send` が既存の委譲へ頼んだ（その委譲が結び付いた task の id = `Job.taskId`。結び付いていなければ `undefined`）。
-   * いまのターンで頼んだ委譲の task を控え、その task をこのターンの返答で自動 done にしない判定に使う（#5469 P5。判定は `hasDelegationForTask`）。無い器（テスト・蒸留）は何もしない。
-   */
-  noteDelegationStarted?: (taskId: string | undefined) => void;
-  /**
-   * `ask_human` / `request_permission` が人間への問いを積んだ（その問いの会話 id。無ければ `undefined`）。
-   * そのターンでは、その会話の task を自動 done にしない（人間の答え待ちになるため。#5469 P5）。無い器は何もしない。
-   * 前のターンで出した未回答の問いは、器が閉じる直前に承認待ちの台帳（pendingOnly）から引くので、ここで控えるのは「このターンで出した問い」だけ（台帳に書けない回の保険を兼ねる）。
-   */
-  noteQuestionAsked?: (conversationId: string | undefined) => void;
-  /**
-   * いまのターンが答えている相手の task の id（読んだ人間の発言の id、回答のターンでは答えた承認が持つ task の id）。
-   * `ask_human` / `request_permission` が承認待ちの行（`taskIds`）に写し、その承認への回答のターンの返答が閉じてよい task を絞るのに使う（#5469 P5）。無い器は何も写さない。
-   */
-  currentTaskIds?: () => readonly string[];
-  /**
-   * `task_say` が書いた先の task の id。そのターンの返答が宛てた task を、起点の会話全体でなく書いた先に絞るため控える（#5469 P5）。無い器は何もしない。
-   */
-  noteTaskSaid?: (taskId: string) => void;
-  // 添付があるとき（`attachments`）だけ第3引数を渡す: 添付の無い従来の呼び出しの形を変えないため
-  postToConversation?: (
-    conversationId: string,
-    text: string,
-    attachments?: readonly AttachmentRef[],
-  ) => void;
-  // 無い器（テスト等）では `reply_attach` は断る: 返信に添える先が無いまま「添えた」と言わないため
-  replyAttachments?: ReplyAttachments;
-  managers?: ManagerPool;
-  /**
-   * この報告の全文を、いまの会話の発言にそのまま載せたか。載せていれば、その時刻（確定した控えだけ。reset 後・押し込めなかった回・切り詰めた報告は `null`）。
-   * 無い器（テスト・蒸留）は常に `null` と同じ: 引き直せば全文が返る（安全側）。
-   */
-  managerReportShownAt?: (managerId: string, text: string) => Date | null;
-  /**
-   * 固定の文言を、同じ会話の2回目から短い参照にする口（`manager_list` の件数行・「…ほか N 件」の固定文）。
-   * 無い器（テスト・蒸留）は常に全文を返す口と同じ: 参照が指す先（会話の上の全文）が無いので、安全側に倒す。
-   */
-  foldFixed?: (id: string, full: string, ref: string, supersedes?: string) => string;
-  /**
-   * 継続中の依頼 `kind` を、この呼びで書き換えた・外した・一覧で見せた。定期の tick の要約が「会話で最後に全文で出した版と同じ」と畳む控えのうち、その kind の分を捨てる
-   * （道具の応答で見えた版と、控えの版がずれるため。次の定期の tick は全文）。無い器（テスト・蒸留）は何もしない。サブエージェントの呼びでも捨てる（捨てるのは安全側）。
-   */
-  forgetStandingRow?: (kind: string) => void;
-  /**
-   * `schedule_list` が継続中の依頼 `kind` の行を見せた（`rowFullText` は定期の tick の行と同じ字面）。控えがその版と同じなら残し、違う・無いなら `forgetStandingRow` と同じく捨てる。
-   * 無い器（テスト・蒸留）は何もしない（`forgetStandingRow` も無いので控えが無い）。
-   */
-  keepStandingRowIfSame?: (kind: string, rowFullText: string) => void;
-  /**
-   * この道具の呼びがサブエージェント（作業者）のものか。`foldFixed` と `managerReportShownAt` が指す「会話の上の全文」は本体の会話にしか無いので、サブエージェントの呼びは畳まず、控えも更新しない（#5428）。
-   * 引数は呼びの tool_use_id（取れなければ `undefined`）。取れないときの倒し方は実装が決める（クローンは本体扱い＋警告）。
-   * 無い器（テスト・蒸留）は常に本体と同じ。
-   */
-  isSubagentCall?: (toolUseId: string | undefined, probe?: ToolUseIdProbe) => boolean;
-  profile?: ProfileService;
-  accountUsage?: () => AccountUsageState;
-  runtime?: () => CloneRuntimeFacts;
-  runnerModels?: () => Promise<readonly string[]>;
-  /** 接続中の runner が名乗った SDK の接続先とモデルの別名の行。 */
-  runnerAnthropicRoutes?: () => Promise<readonly string[]>;
-  // optional にも既定値にもしない: 省略時の既定は guardFullReplace を素通りさせるか、日誌の cause を偽るため
-  // ターンごとに変わるので、ハンドラの中で呼ぶ
-  memoryCause: () => 'distill' | 'clone';
-  // 呼ぶたびに評価する: createCloneTools の呼び出し時に1回だけだと nextAt が固定されるため
-  scheduler?: () => ScheduleStatus[];
-  dropQueuedInboxEvents?: (ids: readonly string[]) => Promise<number>;
-  queuedInMemory?: () => number | undefined;
-  attachmentCopiesDir?: string;
-  attachmentLimits?: AttachmentLimits;
-}
+export {
+  TOOL_USE_ID_META_KEY,
+  toolUseIdFromExtra,
+  toolUseIdProbeFromExtra,
+} from './clone-tools-common.js';
+export { CLONE_TOOL_NAMES } from './clone-tools-names.js';
+export type { CloneToolName } from './clone-tools-names.js';
+export type { ReplyAttachments, ToolContext } from './clone-tools-context.js';
 
 const MANAGER_ATTACHMENTS_DESCRIPTION =
   '人間の添付を担い手にも見せたいときに、その添付の id（通知行の id=… / conversation_read の添付行）を渡す。' +
@@ -600,72 +508,6 @@ export function qualifiedToolName(name: string): string {
 
 // モデルの引数からは受けない: 名乗りを引数に任せると「誰の観測か」が申告の申告になるため
 export const GITHUB_OBSERVATION_CLONE_OBSERVER = 'clone';
-
-export const CLONE_TOOL_NAMES = [
-  'memory_list',
-  'memory_read',
-  'memory_write',
-  'memory_append',
-  'memory_delete',
-  'memory_frontmatter_set',
-  'memory_outline',
-  'memory_section_read',
-  'memory_section_move',
-  'journal_write',
-  'journal_read',
-  'conversation_read',
-  'attachment_fetch',
-  'file_put',
-  'file_list',
-  'file_keep',
-  'file_delete',
-  'reply_attach',
-  'ask_human',
-  'request_permission',
-  'approvals_list',
-  'approval_trace',
-  'approval_withdraw',
-  'daily_report_write',
-  'usage_read',
-  'schedule_list',
-  'schedule_create',
-  'schedule_remove',
-  'task_list',
-  'task_add',
-  'task_move',
-  'task_set_status',
-  'task_set_status_many',
-  'task_keep',
-  'task_say',
-  'progress_read',
-  'github_observation_record',
-  'inbox_remove_many',
-  'profile_read',
-  'profile_write',
-  'profile_remove',
-  'practice_list',
-  'practice_read',
-  'practice_history',
-  'practice_write',
-  'practice_remove',
-  'token_list',
-  'permission_grant_list',
-  'account_list',
-  'self_read',
-  'self_status',
-  'self_dropped',
-  'manager_start',
-  'manager_send',
-  'manager_stop',
-  'manager_list',
-  'manager_report',
-  'manager_transcript',
-  'archive_remove',
-  'archive_remove_many',
-  'runner_list',
-] as const;
-
-export type CloneToolName = (typeof CLONE_TOOL_NAMES)[number];
 
 export const SELF_JOURNALING_CLONE_TOOLS = [
   'github_observation_record',
@@ -1027,47 +869,6 @@ function describeRunnerBacklog(snapshots: readonly RunnerBacklogSnapshot[]): str
   return lines.length === 0 ? null : lines.join('\n');
 }
 
-// `instanceSwapped` を先に見る: 脚が 'connected' でも新しい器との接続で、滞留を持っていた古い器とは別物のため
-function describeRunnerLegState(snapshot: RunnerBacklogSnapshot): string {
-  if (snapshot.instanceSwapped === true) {
-    return (
-      'もう来ない（この滞留を観測した後に器が入れ替わった。runner の Outbox は' +
-      'プロセスのメモリだけなので、溜まっていた分は配られずに消えている——' +
-      '生ログから拾うしかない）'
-    );
-  }
-  const leg = snapshot.legState;
-  if (leg === undefined) {
-    return '判定できない（この runner は脚の状態を報告しない、またはいま名簿に居ない）';
-  }
-  switch (leg.status) {
-    case 'connected': {
-      // 閾値で「死んでいる」を判定しない: 判定を足すと静かに間違える判定を作るため
-      const lastByteAt =
-        leg.lastByteAt === undefined
-          ? '開いてから1バイトも受け取っていない'
-          : `最後にバイトを受け取ったのは ${leg.lastByteAt}`;
-      return (
-        'まだ届いていない。届く見込みがある' +
-        `（脚は繋がっている。待ってよい。${leg.since} から、${lastByteAt}）`
-      );
-    }
-    case 'down': {
-      const detail = [
-        leg.since === undefined ? undefined : `${leg.since} から`,
-        leg.lastFailureReason === undefined ? undefined : `直近の理由: ${leg.lastFailureReason}`,
-        leg.nextRetryAt === undefined ? undefined : `次の再試行: ${leg.nextRetryAt}`,
-      ].filter((part): part is string => part !== undefined);
-      const detailSuffix = detail.length === 0 ? '' : `（${detail.join('、')}）`;
-      return `⚠ 再接続するまで1件も届かない${detailSuffix}`;
-    }
-    case 'never-connected':
-      return '⚠ 再接続するまで1件も届かない（このデーモンが起きてから一度も繋がっていない）';
-    default:
-      return assertNeverRunnerLegStatus(leg);
-  }
-}
-
 // ネットワークを叩かない: `runnerBacklog()` のキャッシュとストアの読み出しだけで言い分ける
 // `describeRunnerLegState` を再利用する: 同じ判定を2箇所へ書くと字面が割れるため
 async function describeTranscriptMissingLeg(pool: ManagerPool, managerId: string): Promise<string> {
@@ -1102,9 +903,6 @@ async function describeTranscriptMissingLeg(pool: ManagerPool, managerId: string
 }
 
 const REPORT_PAGE = 8_000;
-
-// `REPORT_PAGE` と同じ値でも使い回さない: 意味が違い、片方だけ直したくなったときに一緒に動くため
-const TRANSCRIPT_PAGE = 8_000;
 
 // 全行を JSON.parse しない: 生ログは MB 級になりうるため末尾からこの文字数だけ見る
 const REPORT_GENERATED_PROBE_CHARS = 200_000;
@@ -1287,8 +1085,6 @@ function taskOriginBadge(entry: { origin: TaskOrigin; source?: string }): string
   return entry.source === undefined ? `[${label}]` : `[${label} / ${entry.source}]`;
 }
 
-// 本文を薄くして件数を残す: 日誌は特定の時刻の1行を探すために引き、全文は `id` で取りに行けるため
-const JOURNAL_TEXT_EXCERPT = 120;
 const JOURNAL_BUDGET = 8_000;
 // 一覧の見出しに出す添付の数。超えた分は「ほか N 件」にする
 const JOURNAL_LISTING_ATTACHMENTS = 5;
@@ -1314,9 +1110,6 @@ const TOKEN_COOLDOWN_SOURCE_LABEL: Record<CooldownSource | 'unrecorded', string>
 const APPROVAL_QUESTION_EXCERPT = 200;
 function describeUnreadableApproval(id: string): string {
   return `承認待ち ${id} は在るが読めない（壊れた行。消されたのではない。id は合っている）。行は書き換えていない。`;
-}
-function describeUnreadableJournalEntry(label: string, id: string): string {
-  return `${label} ${id} は在るが読めない（形が合わない壊れた行。無いのではなく、id は合っている）。行は書き換えていない。`;
 }
 const APPROVAL_PAGE = 8_000;
 // `APPROVAL_LIST_BUDGET` と値が同じでも使い回さない: 片方だけ直したくなったとき一緒に動くため
@@ -1396,8 +1189,6 @@ export async function renderPeerReach(managers: ManagerPool | undefined): Promis
 
 const SELF_STATUS_PEER_REACH_BUDGET = 1600;
 
-const RUNNER_MANAGER_PEERS_EXCERPT = 400;
-
 // 内訳が無い（古い runner・材料を渡さない構成）ときは合計だけを出す: 内訳を0に潰さないため
 function describeUnrecognised(
   total: number,
@@ -1456,33 +1247,6 @@ const CONVERSATION_PAGE = 8_000;
  */
 export const CLONE_ALLOWED_TOOLS = CLONE_TOOL_NAMES.map(qualifiedToolName);
 
-function text(body: string) {
-  return { content: [{ type: 'text' as const, text: body }] };
-}
-
-type ToolText = ReturnType<typeof text>;
-
-// `manager_send` / `journal_write` の任意引数 `closes` の上限: 1回の呼びで片付く行の数として十分で、引数が肥大しない大きさ
-const CLOSES_MAX = 5;
-// 説明文は2道具で同じ1文にする（道具定義は毎ターン読み直されるため、長くしない）
-const CLOSES_SCHEMA = z
-  .array(z.object({ id: z.string(), reason: z.string() }))
-  .optional()
-  .describe('任意。この呼びで片付いた task を、id と理由で done にする（返事だけでは閉じない）');
-
-// 件数と各 reason の形は、本来の作業の前に丸ごと検査する（`task_set_status` の reason と同じ検査）
-function describeClosesViolation(closes: readonly { id: string; reason: string }[] | undefined) {
-  const lengthError = describeArrayLengthViolation('closes', closes, { max: CLOSES_MAX });
-  if (lengthError !== null) return `${lengthError}何もしていない。`;
-  for (const [index, entry] of (closes ?? []).entries()) {
-    const reasonError =
-      describeStringLengthViolation(`closes[${index}].reason`, entry.reason, { min: 1 }) ??
-      describeBlankViolation(`closes[${index}].reason`, entry.reason);
-    if (reasonError !== null) return `${reasonError}何もしていない。`;
-  }
-  return null;
-}
-
 // 断り文の部品は `tool-arg-checks.ts` へ切り出してある（道具と HTTP が同じ関数を共有するため）。既存の import 元（この文書）を変えないよう、書式の関数だけここから再公開する
 export { formatIntRangeJa, formatStringLengthJa, formatArrayLengthJa };
 
@@ -1508,28 +1272,6 @@ function describePracticeKindViolation(
 
 // `.min(1)` を入力スキーマ側に置かない: SDK の `tool()` がハンドラより前に検証するため、件数の検査はハンドラの先頭の `safeParse` へ渡す
 const inboxRemoveManyTypesToolInputSchema = z.array(z.enum(CLONE_REMOVABLE_INBOX_EVENT_TYPES));
-
-// 一律に「完了した」と書かない: 記録そのものが行為の道具では「やり直すな」が嘘になり、やり直すべきときに止めてしまうため
-type JournalFailureOutcome = 'act-completed' | 'act-not-performed' | 'act-partially-completed';
-
-// ガードで握り潰して成功として返さない: `isError: true` は依頼者がその場で気づける唯一の合図のため、跡を残してから投げ直す
-class JournalNotRecordedError extends Error {
-  // 呼び手が作り直す応答のために持つ（本文は `journalEntryShape` と `collapseErrorCause` を通した文だけを使う）
-  readonly entry: JournalEntryInput;
-  readonly journalCause: unknown;
-
-  constructor(
-    tool: CloneToolName,
-    entry: JournalEntryInput,
-    outcome: JournalFailureOutcome,
-    cause: unknown,
-  ) {
-    super(formatJournalNotRecordedMessage(tool, entry, outcome, cause));
-    this.name = 'JournalNotRecordedError';
-    this.entry = entry;
-    this.journalCause = cause;
-  }
-}
 
 class CloseManyStoppedError extends Error {
   constructor(message: string) {
@@ -1649,48 +1391,6 @@ function formatCloseManyCloseFailedMessage(args: {
   ].join('\n');
 }
 
-function formatJournalNotRecordedMessage(
-  tool: CloneToolName,
-  entry: JournalEntryInput,
-  outcome: JournalFailureOutcome,
-  cause: unknown,
-): string {
-  // 道具の引数を `journalEntryShape` の外から転記しない: 鍵や本文が応答へ漏れるため
-  // `cause.message` を使わない: `DrizzleQueryError` の message は2行目に行の値そのものを含むため `collapseErrorCause` を通す
-  const shape = journalEntryShape(entry);
-  const reason = collapseErrorCause(cause);
-  switch (outcome) {
-    case 'act-completed':
-      return [
-        '⚠⚠ 完了済み・未記録・やり直し禁止',
-        `${tool} は完了した（副作用は済んでいる）が、日誌へ記録できなかった。`,
-        `記録できなかったエントリ: ${shape}`,
-        `理由: ${reason}`,
-        'やり直さないこと（同じ副作用がもう一度起きる）。journal_write で記録を書き直すこと。',
-      ].join('\n');
-    case 'act-not-performed':
-      return [
-        '⚠⚠ 未記録・行為は起きていない・やり直してよい',
-        `${tool} は、この記録に失敗した時点で副作用を1つも起こしていない` +
-          '（日誌へ記録すること自体が道具の行為であるか、状態を変える前に日誌を' +
-          '先に書く道具であるかのどちらかに当たる）。',
-        `記録できなかったエントリ: ${shape}`,
-        `理由: ${reason}`,
-        'やり直してよい（同じ内容でもう一度呼べる。重複は起きない）。',
-      ].join('\n');
-    case 'act-partially-completed':
-      return [
-        '⚠⚠ 一部完了・未記録・やり直し禁止',
-        `${tool} は移し先への追記まで済んだが、出どころからの切り取りは行っていない。`,
-        'いま同じ節が移し先と出どころの両方に在る——重複しているが、失われてはいない。',
-        'そのうえで日誌へ記録できなかった。',
-        `記録できなかったエントリ: ${shape}`,
-        `理由: ${reason}`,
-        'やり直さないこと（重複がもう1つ増える）。memory_outline で現状を読み直してから決めること。',
-      ].join('\n');
-  }
-}
-
 class ApprovalNotRecordedError extends Error {
   constructor(approval: PendingApproval, cause: unknown) {
     super(formatApprovalNotRecordedMessage(approval, cause));
@@ -1710,20 +1410,6 @@ function formatApprovalNotRecordedMessage(approval: PendingApproval, cause: unkn
   ].join('\n');
 }
 
-async function appendJournalOrThrow(
-  tool: CloneToolName,
-  journal: JournalStore,
-  entry: JournalEntryInput,
-  outcome: JournalFailureOutcome,
-): Promise<JournalEntry> {
-  try {
-    return await journal.append(entry);
-  } catch (error) {
-    noteDroppedRecord('日誌', journalEntryShape(entry), error);
-    throw new JournalNotRecordedError(tool, entry, outcome, error);
-  }
-}
-
 // `message` も `reasonOf` も使わない: `profile.apply` の例外は失敗したクエリの `params:` にスクリプト全文を添えうるため、クラス名だけを返す
 function errorKindOf(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
@@ -1741,20 +1427,6 @@ async function retractTaskReopenEntry(
     decision: `直前の task の開き直しの行は効いていない（開き直していない）。理由: ${why}`,
     grounds: `${taskId} の開き直し。日誌を先に書いたが、開き直しが実行されなかったため打ち消す`,
   });
-}
-
-// `appendJournalOrThrow` を使わない: 1行目が書けた後の追記が投げると、道具の結果がもう決まっているのに応答が変わるため
-async function appendJournalOrDrop(
-  tool: CloneToolName,
-  journal: JournalStore,
-  entry: JournalEntryInput,
-): Promise<JournalEntry | undefined> {
-  try {
-    return await journal.append(entry);
-  } catch (error) {
-    noteDroppedRecord(`日誌（${tool}）`, journalEntryShape(entry), error);
-    return undefined;
-  }
 }
 
 // 長さの上限もエスケープも掛けない: journal 側に無い制約をここにだけ足す理由が無いため
@@ -2626,11 +2298,6 @@ function runnerManagerTokenTag(manager: RunnerManagerEntry): string {
   return ` ⚠世代${manager.tokenGeneration}≠現役${manager.activeTokenGeneration}`;
 }
 
-const NO_POOL = text(
-  'いまは委譲できない場面である（記憶へ移すための内部ターン）。' +
-    '実作業が必要なら、この場では記憶に残すだけにして、次の会話で委譲すること。',
-);
-
 export const MEMORY_GUARD_ENV = 'ALTEROID_MEMORY_GUARD';
 
 export const MEMORY_GUARD_VALUES = ['on', 'off'] as const;
@@ -3082,96 +2749,6 @@ export function createCloneTools(context: ToolContext) {
   }
   const getConversationId = context.conversationId;
   const getWorkConversationId = context.workConversationId ?? getConversationId;
-
-  // `closes` の1件分: Task を done にする。`task_set_status` と同じ作法（遷移は `setStatus` が持ち、日誌は `taskStatusChangeEntry`）
-  // `via`: どの呼びで閉じたか。日誌の grounds にそのまま書く
-  async function closeTaskBody(
-    id: string,
-    reason: string,
-    via: string = 'task_set_status',
-  ): Promise<string> {
-    const reasonError =
-      describeStringLengthViolation('reason', reason, { min: 1 }) ??
-      describeBlankViolation('reason', reason);
-    if (reasonError !== null) return reasonError;
-    const unreadableNote = `task ${id} は読めない形で入っている。読めない形のまま書き直さないので、閉じていない。`;
-    let existing: Task | null;
-    try {
-      existing = await stores.tasks.get(id);
-    } catch (error) {
-      if (error instanceof UnreadableTaskError) return unreadableNote;
-      throw error;
-    }
-    if (existing === null) {
-      return `task ${id} は無い（task_list で実在する id を確かめること）。`;
-    }
-    if (existing.closedAt !== undefined) {
-      return `${id} は既に ${existing.closedAt} に閉じてある（${existing.closedReason ?? '理由の記録なし'}）。`;
-    }
-    // 閉じたかどうかは `setStatus` の戻り値に任せる: 直前の `get` の後に他の経路が先に閉じていると、実際には閉じていないのに日誌へ書くことになるため
-    let result;
-    try {
-      result = await stores.tasks.setStatus(id, 'done', {
-        reason,
-        by: 'clone',
-        at: new Date().toISOString(),
-      });
-    } catch (error) {
-      if (error instanceof UnreadableTaskError) return unreadableNote;
-      throw error;
-    }
-    if (result.kind === 'not-found') {
-      return `task ${id} は無い（確かめた直後に消えていた）。この呼びでは閉じていない。`;
-    }
-    if (result.kind === 'unchanged') return `${id} は既に done。`;
-    if (result.kind === 'rejected') {
-      return `${id} は ${result.from} から done へは移せない（閉じた件から戻せるのは queued だけ）。この呼びでは閉じていない。`;
-    }
-    // 自分で閉じたことは日誌に残す（`task_set_status` と同じ行）
-    await appendJournalOrThrow(
-      'task_set_status',
-      stores.journal,
-      taskStatusChangeEntry(id, result.before, 'done', reason, via),
-      'act-completed',
-    );
-    return `${id} を done にした。`;
-  }
-
-  // `closes` 付きの呼びの仕上げ: 本来の作業が通ったときだけ閉じ、閉じた id ごとの結果を各1行で応答の末尾へ足す。
-  // 閉じる側の失敗（日誌が書けない等）は本来の作業を失敗にしない: 作業は済んでいるため、その行の結果として言う
-  async function finishWithCloses(
-    res: ToolText,
-    closes: readonly { id: string; reason: string }[] | undefined,
-    workDone: boolean,
-    via: 'manager_send' | 'journal_write',
-  ): Promise<ToolText & { isError?: boolean }> {
-    if (closes === undefined || closes.length === 0) return res;
-    const head = res.content[0]?.text ?? '';
-    if (!workDone) {
-      return text(`${head}\n本来の作業が通っていないので、closes の行は1行も閉じていない。`);
-    }
-    const lines: string[] = [];
-    let failed = false;
-    for (const entry of closes) {
-      try {
-        lines.push(
-          `closes ${entry.id}: ${await closeTaskBody(entry.id, entry.reason, `${via} の closes`)}`,
-        );
-      } catch (error) {
-        // 単独の `task_set_status` は日誌が書けないと `isError` で返る。ここも握り潰して成功の1行にせず、`isError` で合図する
-        // （本来の作業の結果は先頭に残す: 作業は済んでいるので、応答ごと失敗に見えて同じ送信をやり直されないため）
-        failed = true;
-        lines.push(
-          error instanceof JournalNotRecordedError
-            ? `closes ${entry.id}: **task は done にしている**が、日誌に残せていない（既に閉じているので、閉じ直す呼びは要らない）。` +
-                '人間が後から読めるよう、journal_write で閉じたことを書き残すこと。'
-            : `closes ${entry.id}: 閉じる処理が失敗した（${reasonOf(error)}）。閉じたかどうかは task_list で確かめること。`,
-        );
-      }
-    }
-    const body = text(`${head}\n${lines.join('\n')}`);
-    return failed ? { ...body, isError: true } : body;
-  }
 
   // `default` のときは足さない: 日誌を読む側と歯が、その文言で見ているため
   function profileRowLabel(name: string): string {
@@ -4297,6 +3874,7 @@ export function createCloneTools(context: ToolContext) {
           'act-not-performed',
         );
         return finishWithCloses(
+          stores,
           text(
             grounds === undefined
               ? `日誌に記録した（${entry.id}）。⚠ grounds が呼び出しに届かなかったので、` +
@@ -8071,7 +7649,8 @@ export function createCloneTools(context: ToolContext) {
         const closesError = describeClosesViolation(closes);
         if (closesError !== null) return text(closesError);
         // 送れなかった（早い断り・保留・失敗）呼びは1行も閉じず、そう書く
-        const notDone = (res: ToolText) => finishWithCloses(res, closes, false, 'manager_send');
+        const notDone = (res: ToolText) =>
+          finishWithCloses(stores, res, closes, false, 'manager_send');
         if (!context.managers) return notDone(NO_POOL);
         // 空白だけは断らない: HTTP も通すため
         const messageError = describeStringLengthViolation('message', message, { min: 1 });
@@ -8162,13 +7741,14 @@ export function createCloneTools(context: ToolContext) {
             '（届けたのは resume の口まで。同じ本文で新しい委譲を立てないこと）',
           );
           return finishWithCloses(
+            stores,
             text(`[${managerId}] ${result.detail}${unusedNote}\n${deliveredNote}`),
             closes,
             sent,
             'manager_send',
           );
         }
-        return finishWithCloses(text(result.detail), closes, sent, 'manager_send');
+        return finishWithCloses(stores, text(result.detail), closes, sent, 'manager_send');
       },
     ),
 
@@ -11014,47 +10594,6 @@ function compareManagerAttention(a: ManagerSummary, b: ManagerSummary): number {
   return compareManagerPosition(managerPositionOf(a), managerPositionOf(b));
 }
 
-// 一覧を数えて答えさせない: 一覧は予算で打ち切られ、`status` だけを数えると上振れする（`running` は終端へ勝手には行かない）ため2軸で数える
-// 0 の行は作らない: 「切断 0本」と書くと、観測して 0 だったのか数えていないのかが読めなくなるため、在るときだけ書く
-// `usageStopped` を上の内訳へ足し合わせない: `status` と独立の横断する軸で、同じ委譲を2回数えることになるため
-// 固定の文言を畳む口（`ToolContext.foldFixed`）。無ければ全文のまま
-type FixedFold = NonNullable<ToolContext['foldFixed']>;
-const NO_FIXED_FOLD: FixedFold = (_id, full) => full;
-
-/** CLI が MCP 呼びの `_meta` に積む tool_use_id のキー。SDK の型に無い CLI の内部実装で、公開契約ではない（#5428）。 */
-export const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
-
-/** handler の第2引数（SDK 型では `unknown`）から呼びの tool_use_id を読む。文字列でなければ `undefined`。 */
-export function toolUseIdFromExtra(extra: unknown): string | undefined {
-  if (typeof extra !== 'object' || extra === null) return undefined;
-  const meta = (extra as { _meta?: unknown })._meta;
-  if (typeof meta !== 'object' || meta === null) return undefined;
-  const id = (meta as Record<string, unknown>)[TOOL_USE_ID_META_KEY];
-  return typeof id === 'string' && id !== '' ? id : undefined;
-}
-
-/** 計器用: tool_use_id が「取れた／無かった／あったが文字列でない（空文字を含む）」のどれか。値は返さない。 */
-export function toolUseIdProbeFromExtra(extra: unknown): ToolUseIdProbe {
-  if (typeof extra !== 'object' || extra === null) return 'missing';
-  const meta = (extra as { _meta?: unknown })._meta;
-  if (typeof meta !== 'object' || meta === null) return 'missing';
-  const id = (meta as Record<string, unknown>)[TOOL_USE_ID_META_KEY];
-  if (id === undefined) return 'missing';
-  return typeof id === 'string' && id !== '' ? 'present' : 'wrongType';
-}
-
-/** サブエージェントの呼びか。口の無い器は本体と同じ（`false`）。 */
-function isSubagentCaller(context: ToolContext, extra: unknown): boolean {
-  return (
-    context.isSubagentCall?.(toolUseIdFromExtra(extra), toolUseIdProbeFromExtra(extra)) ?? false
-  );
-}
-
-/** 固定文を畳む口。サブエージェントの呼びと口の無い器は全文のまま（`foldFixed` の説明のとおり）。 */
-function foldFixedFor(context: ToolContext, extra: unknown): FixedFold {
-  return isSubagentCaller(context, extra) ? NO_FIXED_FOLD : (context.foldFixed ?? NO_FIXED_FOLD);
-}
-
 // 1応答に最大5回出る RESTART_BEFORE_CHECK_ADVICE（件数の行の lost・消失、印の意味、失敗の行ごと）を、初出の1回だけ全文にする。
 // 2回目以降は結論（確かめる前に起こし直さない）を短く残して「上と同じ」と言う: 行ごとの失敗の説明は別の行として読まれるため、消さずに短くする
 const RESTART_ADVICE_AGAIN = '**確かめる前に起こし直さないこと**（上と同じ）。';
@@ -11189,6 +10728,9 @@ const OMITTED_PAGING_FULL =
   'status や q で絞れば頁数を減らせる。';
 const OMITTED_PAGING_REF = '（頁数は台帳の本数に比例して増える。status や q で絞れば減らせる）';
 
+// 一覧を数えて答えさせない: 一覧は予算で打ち切られ、`status` だけを数えると上振れする（`running` は終端へ勝手には行かない）ため2軸で数える
+// 0 の行は作らない: 「切断 0本」と書くと、観測して 0 だったのか数えていないのかが読めなくなるため、在るときだけ書く
+// `usageStopped` を上の内訳へ足し合わせない: `status` と独立の横断する軸で、同じ委譲を2回数えることになるため
 function describeManagerCounts(
   managers: readonly ManagerSummary[],
   fold: FixedFold = NO_FIXED_FOLD,
@@ -11711,13 +11253,8 @@ function safeJson(value: unknown): string {
   }
 }
 
-// 軸ごとに上限を置き、打ち切ったことを必ず書く: 「全部でこれだけ」と読める出力を黙って作ると嘘になるため
-const USAGE_AXIS_LIMIT = 14;
-
 export const USAGE_AXES = ['date', 'manager', 'model', 'layer', 'site', 'token'] as const;
 type UsageAxis = (typeof USAGE_AXES)[number];
-
-const USAGE_AXIS_PAGE = 100;
 
 // `USAGE_AXIS_TITLES` と分ける: 見出しと、その軸が何で切っているかの注記は用途が違うため
 const USAGE_AXIS_NOTES: Record<UsageAxis, string> = {
@@ -11878,29 +11415,6 @@ async function unrecordedManagersLines(
     stores.usage.recordedManagerIds(),
   ]);
   return describeUnrecordedManagers(findUnrecordedManagers(managers, recordedManagerIds, since));
-}
-
-function maxUpdatedAt(rows: readonly UsageRow[]): string | undefined {
-  let max: string | undefined;
-  for (const row of rows) {
-    if (max === undefined || row.updatedAt > max) max = row.updatedAt;
-  }
-  return max;
-}
-
-// 文言を1か所に寄せる: 片方だけ直すと読み手が「同じことを別の言葉で言っている」と誤読するため
-function renderRisenSection<T>(risen: readonly T[], formatEntry: (entry: T) => string): string[] {
-  if (risen.length === 0) return [];
-  const lines = [
-    '',
-    '⚠ 順位が上がった、または既に見せた行が伸びた可能性がある行' +
-      '（前回の呼び出し以降に記録が増えたため。この頁の本体とは重複しない）:',
-  ];
-  for (const entry of risen.slice(0, USAGE_AXIS_LIMIT)) lines.push(formatEntry(entry));
-  if (risen.length > USAGE_AXIS_LIMIT) {
-    lines.push(`  …ほか ${risen.length - USAGE_AXIS_LIMIT} 件は省略。`);
-  }
-  return lines;
 }
 
 function renderUsage(
