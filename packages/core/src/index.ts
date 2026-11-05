@@ -242,6 +242,11 @@ export { verifyTaskStoreContract } from './task-store-contract.js';
 export { verifyTaskRemoveForConversationContract } from './task-remove-for-conversation-contract.js';
 export { TASK_TITLE_MAX, describeTaskPlacement } from './task-tools.js';
 export { scheduleReplaceEntry } from './schedule-replace.js';
+export {
+  claimScheduledRunRow,
+  completeScheduledRunRow,
+  editScheduledRequestRow,
+} from './schedule-run-transition.js';
 export { dropUnreadTimersOfKind, removeScheduleJournalFirst } from './schedule-remove.js';
 export {
   removeArchiveChunkJournalFirst,
@@ -821,6 +826,7 @@ export type {
 } from './persona-contract.js';
 export { verifyScheduleNulContract } from './schedule-nul-contract.js';
 export { verifyScheduleIfMatchContract } from './schedule-if-match-contract.js';
+export { verifyScheduleRunContract } from './schedule-run-contract.js';
 export { verifyMcpServersIfMatchContract } from './mcp-servers-if-match-contract.js';
 export { verifyScheduleUnreadableContract } from './schedule-unreadable-contract.js';
 export { verifyJobNulContract } from './job-nul-contract.js';
