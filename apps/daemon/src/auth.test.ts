@@ -7,6 +7,7 @@ import {
   createMcpServerService,
   createMemoryStores,
   DEFAULT_SSE_HEARTBEAT_MS,
+  fakeCloneHost,
   fakeManagerPool,
 } from '@alteroid/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -36,7 +37,7 @@ function stubClone(): CloneHost {
     relocateFrom: () => undefined,
     vacate: () => Promise.resolve({}),
   });
-  return {
+  return fakeCloneHost({
     managers,
     post: () => 'conversation-1',
     postPersisted: () => Promise.resolve('persisted' as const),
@@ -49,7 +50,7 @@ function stubClone(): CloneHost {
     endConversation: () => Promise.resolve(),
     answerApproval: () => Promise.resolve(true),
     stop: () => Promise.resolve(),
-  } as unknown as CloneHost;
+  } as unknown as Partial<CloneHost>);
 }
 
 let nextSubject = 'sub-1';
@@ -1036,7 +1037,7 @@ describe('許可済みのアカウントは /credentials /reset /mcp-servers /pr
     const account = await grantedAccount();
     const response = await reopen({ authorization: `Bearer ${account.token}` });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ outcome: 'unsupported' });
+    expect(await response.json()).toEqual({ outcome: 'now', previousSessionId: null });
   });
 
   it('① 許可済みのアカウントは /memory・PUT /credentials・POST /reset を通る（#2862: ログインできる許可済みは全員持ち主）', async () => {
