@@ -9,8 +9,8 @@ import {
   type RunnerPermissionRulesResult,
   type RunnerRegistry,
 } from './runner-protocol.js';
+import { createPushChannel, pushToRunners } from './push-channel.js';
 import type { PermissionGrant } from './schema.js';
-import { createSerialQueue } from './serial-queue.js';
 import { sessionAllowRuleShapeOf } from './session-allow-rules.js';
 import type { Stores } from './store.js';
 
@@ -143,12 +143,12 @@ export function createDelegatedPermissionRuleService(
   options: DelegatedPermissionRuleServiceOptions,
 ): DelegatedPermissionRuleService {
   const { stores, runners } = options;
-  const pushListeners = new Set<
-    (results: readonly PermissionRulesRunnerResult[], scope?: { unnamed: true }) => void
-  >();
-
-  // 前の失敗で列が止まらないように、常に解決する形で繋ぐ。
-  const { run: serial } = createSerialQueue();
+  // 列は前の失敗で止まらない（常に解決する形で繋ぐ）。2つめの引数 `unnamed` は名簿を引けず runner を名指せなかった回の印。
+  const {
+    serial,
+    onPushed,
+    notify: notifyListeners,
+  } = createPushChannel<PermissionRulesRunnerResult, { unnamed: true }>();
 
   async function journal(decision: string, grounds: string): Promise<void> {
     try {
@@ -181,14 +181,8 @@ export function createDelegatedPermissionRuleService(
   }
 
   function notify(results: readonly PermissionRulesRunnerResult[], unnamed?: true): void {
-    for (const listener of pushListeners) {
-      try {
-        if (unnamed === true) listener(results, { unnamed: true });
-        else listener(results);
-      } catch {
-        // 帳面に積めなかっただけで、配布の結果そのものは返す。
-      }
-    }
+    // 購読者の例外は握られる（帳面に積めなかっただけで、配布の結果そのものは返す）。
+    notifyListeners(results, unnamed === true ? { unnamed: true } : undefined);
   }
 
   // 読めなかった回の失敗を、配る先の runner ごとに知らせる。名簿も引けず配る先が分からないときは、名指しなしで知らせる（受け取る側が知っている runner 全部へ記録する）。
@@ -244,35 +238,18 @@ export function createDelegatedPermissionRuleService(
           notifyFailure(listed ?? [], reasonOf(error), listed === null);
           return [];
         }
-        let rosterFailed = false;
-        const open = await runners.list().catch(() => {
-          rosterFailed = true;
-          return [];
-        });
-        if (rosterFailed) {
+        let results: PermissionRulesRunnerResult[];
+        try {
+          results = await pushToRunners<PermissionRulesRunnerResult>(runners, async (runner) => {
+            const placed = await runner.setPermissionRules(set.rules);
+            return { count: placed.count, changed: placed.changed };
+          });
+        } catch {
+          // 名簿（`runners.list()`）の失敗だけがここへ来る（runner ごとの失敗は結果の `ok:false` に入る）。
           // 配る先が分からない: 知っている runner（ManagerPool の帳面）へ失敗を記録させる。
           notifyFailure([], '登録済みの runner の名簿を引けなかった', true);
           return [];
         }
-        const results = await Promise.all(
-          open.map(async (runner): Promise<PermissionRulesRunnerResult> => {
-            try {
-              const placed = await runner.setPermissionRules(set.rules);
-              return {
-                runnerId: runner.runnerId,
-                ok: true,
-                count: placed.count,
-                changed: placed.changed,
-              };
-            } catch (error) {
-              return {
-                runnerId: runner.runnerId,
-                ok: false,
-                error: reasonOf(error),
-              };
-            }
-          }),
-        );
         for (const result of results) {
           if (result.ok) {
             await journal(
@@ -294,9 +271,6 @@ export function createDelegatedPermissionRuleService(
         return results;
       }),
 
-    onPushed: (listener) => {
-      pushListeners.add(listener);
-      return () => pushListeners.delete(listener);
-    },
+    onPushed,
   };
 }
