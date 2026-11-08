@@ -148,6 +148,7 @@ import { isManagerInFlight } from './job-status-running.js';
 import { ManagerClosedFrontReceiver } from './manager-closed-front.js';
 import { ManagerDenialReceiver } from './manager-denial.js';
 import { ManagerParkedPeersReceiver } from './manager-parked-peers.js';
+import { ManagerSelfFencedReceiver } from './manager-self-fenced.js';
 import { ManagerSessionReceiver } from './manager-session.js';
 import { ManagerToolUseReceiver } from './manager-tool-use.js';
 import { askDeliveryOf, ManagerWaitingReceiver } from './manager-waiting.js';
@@ -1823,6 +1824,8 @@ class Pool implements ManagerPool {
   /** 担当の `parked_peers_closed` を、知らせか台帳の預けへ回す（`#handleEvent` の `case` が `handle` を直に返す）。 */
   readonly #parkedPeers: ManagerParkedPeersReceiver;
   readonly #waiting: ManagerWaitingReceiver;
+  /** 自己失効の `closed` を受け、貸し出しを返して引き取りを挑み直す（`#closeWithoutTransition` が `closeSelfFenced` の Promise を直に返す）。 */
+  readonly #selfFenced: ManagerSelfFencedReceiver;
   /** `closed` の前段のうち、`lost` 確定後の `closed` と重複 `closed(failed)` を日誌へ書いて像を畳む（`#closeWithoutTransition` が `Promise` を直に返す）。 */
   readonly #closedFront: ManagerClosedFrontReceiver;
 
@@ -2179,6 +2182,14 @@ class Pool implements ManagerPool {
       emit: (managerId, kind, text, requestId, markup) =>
         this.#emit(managerId, kind, text, requestId, markup),
       nowIso: () => this.#nowIso(),
+    });
+    this.#selfFenced = new ManagerSelfFencedReceiver({
+      now: () => this.#now(),
+      journalExchange: this.#journalExchange.bind(this),
+      persist: (record) => this.#persist(record),
+      emit: (managerId, kind, text) => this.#emit(managerId, kind, text),
+      withdrawWaiting: (record, reason) => this.#withdrawWaiting(record, reason),
+      scheduleReattach: (runnerId) => this.#scheduleReattach(runnerId),
     });
     this.#closedFront = new ManagerClosedFrontReceiver({
       nowIso: () => this.#nowIso(),
@@ -6733,38 +6744,8 @@ class Pool implements ManagerPool {
     ) {
       return this.#closedFront.closeDuplicateFailed(event);
     }
-    if (event.selfFenced === true) return this.#closeSelfFenced(record, event);
+    if (event.selfFenced === true) return this.#selfFenced.closeSelfFenced(record, event);
     return false;
-  }
-
-  // `closed` の段2-3: 自己失効の `closed`。状態は動かさず貸し出しだけ返し、引き取りを挑み直す。
-  async #closeSelfFenced(
-    record: ManagerRecord,
-    event: Extract<RunnerEvent, { type: 'closed' }>,
-  ): Promise<void> {
-    // 自己失効は「終わった」ではない: `lost` をそのまま書くと `#restoreJobs` も `#reattach` も引き取らず、二重実行を止めた代わりに誰も拾わない仕事ができる。状態は動かさず貸し出しだけ返して梯子へ載せる。
-    // 判定は構造化された印だけで行う: `reason` の文字列一致だと、マネージャーが同じ文を書いた回まで巻き込む（`sdk-failure.ts` と同じ理由）。
-    this.#withdrawWaiting(record, '器が貸し出し期限で自分で畳んだ');
-    record.attached = false;
-    // 返すのは印を立てることで消すことではない: 世代（`fence`）を残す。
-    if (record.job.lease !== undefined) {
-      record.job.lease = releaseLease(record.job.lease, this.#now());
-    }
-    await this.#persist(record);
-    await this.#journalExchange(
-      'inbound',
-      `${EXCHANGE_KIND_RECOVERY_PREFIX}[${event.managerId}] 器が貸し出し期限で自分で畳んだ（自己失効）。` +
-        `台帳の状態（${record.job.status}）は動かさず、別の器で続きを起こし直す: ${event.reason}`,
-    );
-    // クローンへも知らせる: 黙って止まったように見えるのが一番まずい。末尾の `event.reason` は包まない: 既に完成した1つの prose 文（runner の定型文）で、この層に包む材料が無い。包むなら `runner.ts` 側。
-    this.#emit(
-      event.managerId,
-      'report',
-      `器がデーモンと連絡を失い、貸し出し期限で自分で畳みました（自己失効）。` +
-        `この委譲は終わっていません — 引き取りを自動で挑み直します: ${event.reason}`,
-    );
-    // 像から外さない（終わっていない）。
-    if (record.job.runnerId !== undefined) this.#scheduleReattach(record.job.runnerId);
   }
 
   // `closed` の段3: 終端として確定させる本体。台帳へ写し、失敗・peer・report 無しの done・畳んだ報告を知らせ、像を外して起こし直す。
