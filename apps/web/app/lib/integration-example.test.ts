@@ -21,6 +21,39 @@ describe('別の alteroid の「設定 — MCP サーバ」に貼る JSON', () =
     expect(mcpServersSchema.safeParse(parsed).success).toBe(true);
   });
 
+  it('登録名を渡さないときの出力は、報告用の alteroid-report のまま1バイトも変わらない', () => {
+    expect(mcpServerJson('http://127.0.0.1:7777', 'altk_secret')).toBe(
+      '{\n' +
+        '  "alteroid-report": {\n' +
+        '    "type": "http",\n' +
+        '    "url": "http://127.0.0.1:7777/mcp",\n' +
+        '    "headers": {\n' +
+        '      "Authorization": "Bearer altk_secret"\n' +
+        '    }\n' +
+        '  }\n' +
+        '}',
+    );
+  });
+
+  it('登録名を渡すと、そのキーで同じ形になり、予約名ではないので mcpServersSchema を通る（アクセストークンは alteroid-remote）', () => {
+    const parsed: unknown = JSON.parse(
+      mcpServerJson('http://127.0.0.1:7777', 'alt_secret', 'alteroid-remote'),
+    );
+    expect(parsed).toEqual({
+      'alteroid-remote': {
+        type: 'http',
+        url: 'http://127.0.0.1:7777/mcp',
+        headers: { Authorization: 'Bearer alt_secret' },
+      },
+    });
+    expect(mcpServersSchema.safeParse(parsed).success).toBe(true);
+    // `alteroid` にしない理由: alteroid 自身の MCP サーバの名前として予約されていて、貼れない
+    const reserved: unknown = JSON.parse(
+      mcpServerJson('http://127.0.0.1:7777', 'alt_secret', 'alteroid'),
+    );
+    expect(mcpServersSchema.safeParse(reserved).success).toBe(false);
+  });
+
   it('接続先が分からないときは推測せず印を置く（それでも型は通る）', () => {
     const json = mcpServerJson(null, 'altk_secret');
     expect(json).toContain(`${ORIGIN_PLACEHOLDER}/mcp`);
