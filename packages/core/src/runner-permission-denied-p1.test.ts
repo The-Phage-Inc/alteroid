@@ -216,7 +216,8 @@ describe('allow の一往復（issue #1105 P1）', () => {
     expect(allowNote?.text).not.toContain('撃ち直せば通る');
     expect(allowNote?.text).not.toContain('同じ入力で撃ち直してよいこと');
     expect(allowNote?.text).toContain('同じ入力で撃ち直しても、分類器にまた止められうる');
-    expect(allowNote?.text).toContain('別の手（入力を変える・手順を分ける・人間に頼む）');
+    expect(allowNote?.text).toContain('別の手（手順を分ける・人間に頼む）');
+    expect(allowNote?.text).toContain('同じ操作を別のコマンドに言い換えない');
     expect(asks[0]?.summary).toContain('撃ち直すかは担い手が決める');
 
     const retryResult = await firePreToolUse(started.options, {
@@ -261,7 +262,7 @@ describe('allow の一往復（issue #1105 P1）', () => {
     expect(summary).toContain('allow しても撃ち直しは通らないことがある');
     expect(summary).toContain('人間が止められた中身を見て誤検知だと確かめる必要がある');
     expect(summary).toContain(
-      '続けて同じ入力を撃たず、別の手（入力を変える・手順を分ける・人間に頼む）を取ること',
+      '続けて同じ入力を撃たず、別の手（手順を分ける・人間に頼む）を取ること。同じ操作を別のコマンドに言い換えない（ファイルの読み・探しなら Read/Grep/Glob へ移す）',
     );
     expect(summary).not.toContain('「同じ入力で撃ち直してよい」と伝える');
     expect(summary).toContain('この許可で通るかは確かめていない。');
