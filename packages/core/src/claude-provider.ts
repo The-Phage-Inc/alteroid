@@ -44,6 +44,7 @@ import type {
   AgentToolAuditRecord,
 } from './agent-hooks.js';
 import { CLONE_COMPACTION_INSTRUCTIONS } from './clone-compaction-instructions.js';
+import { MANAGER_COMPACTION_INSTRUCTIONS } from './manager-compaction-instructions.js';
 import { splitInProcessMcpServers } from './clone-mcp-config-file.js';
 import { noteBackgroundFailure } from './dropped-record.js';
 import { excerpt } from './excerpt.js';
@@ -127,7 +128,7 @@ function wrapObservationHook<T>(
   };
 }
 
-// クローン本体の PreCompact: 観測の記録を渡したうえで、要約への指示を `systemMessage` で返す。
+// クローン本体とマネージャーの PreCompact: 観測の記録を渡したうえで、要約への指示を `systemMessage` で返す（指示の中身は層ごとに別）。
 // 指示を足す口はこの返り値だけである（`hookSpecificOutput` に PreCompact の型は無い。同梱 CLI は返り値の `systemMessage` を要約の追加の指示に使う）。
 // 観測のフックは投げた例外を握らず投げ返す（`wrapObservationHook` と同じ）: 指示を足すためだけに、退避・蒸留の失敗の扱いを変えないため
 function wrapPreCompactHookWithInstructions(
@@ -424,8 +425,28 @@ const AUTO_COMPACT_WINDOW_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
  * `settings` では渡さない: CLI は env が置かれていれば env を優先するので、`settings` に載せると env での上書きと食い違う。
  */
 export function withCloneAutoCompactWindow(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return withDefaultAutoCompactWindow(env, CLONE_AUTO_COMPACT_WINDOW_DEFAULT);
+}
+
+function withDefaultAutoCompactWindow(env: NodeJS.ProcessEnv, window: string): NodeJS.ProcessEnv {
   if (isEnvSet(env, AUTO_COMPACT_WINDOW_ENV_KEY)) return { ...env };
-  return { ...env, [AUTO_COMPACT_WINDOW_ENV_KEY]: CLONE_AUTO_COMPACT_WINDOW_DEFAULT };
+  return { ...env, [AUTO_COMPACT_WINDOW_ENV_KEY]: window };
+}
+
+/**
+ * マネージャーのセッションの自動要約の窓（トークン）の既定値。
+ *
+ * Why: 窓を置かないとマネージャーの文脈は 1M の窓で約 967k まで伸びる。器の入れ替え後の resume や 1 時間を超える
+ * 待ちのあと、文脈まるごとのキャッシュの作り直しが毎回起きる。実測（teto・2026-11-24 JST・mgr-7d563c49）:
+ * 文脈は 727k〜862k、Opus の作り直し 7 回で $46.7（その日の Opus の費用 $59.6 のうち）。
+ * 作業者は同じプロセスで走るので、作業者の要約にもこの窓が効く見込み（本物の CLI では確かめていない）。
+ * 上書きの規則は `withCloneAutoCompactWindow` と同じ（env に置かれていれば尊重・空は未設定と読む・`settings` には載せない）。
+ */
+export const MANAGER_AUTO_COMPACT_WINDOW_DEFAULT = '350k';
+
+/** マネージャーの env に自動要約の窓の既定値を足した新しい env（置かれていれば上書きしない。渡された env は書き換えない）。 */
+export function withManagerAutoCompactWindow(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return withDefaultAutoCompactWindow(env, MANAGER_AUTO_COMPACT_WINDOW_DEFAULT);
 }
 
 /**
@@ -564,7 +585,7 @@ export function buildCloneSessionOptions(request: CloneSessionOptionsRequest): O
 
   return {
     ...cloneBaseOptions(request, { ...NO_ATTRIBUTION_SETTINGS }),
-    // 本セッションだけに足す: 蒸留は1回きりで会話を持ち越さず、要約が走る場面が無い。マネージャーは別の判断が要る（まだ入れない）
+    // 本セッションだけに足す: 蒸留は1回きりで会話を持ち越さず、要約が走る場面が無い。マネージャーには別の既定を `buildManagerSessionOptions` で入れる（`withManagerAutoCompactWindow`）
     env: withCloneAutoCompactWindow(withCliSessionEnv(request.env)),
     includePartialMessages: true,
     ...(cwd === undefined ? {} : { cwd }),
@@ -753,7 +774,7 @@ export function buildManagerSessionOptions(request: ManagerSessionOptionsRequest
     // `skills: 'all'` を明示し、名前を列挙しない: 省くと CLI の既定に委ねて器によって引けるものが変わり、列挙するとスキルが増えたときに追いつかないため
     // 上の `agents`（作業者）側には `skills` を書かない: `AgentDefinition.skills` は `'all'` を受けず、名前の配列は明示リストで絞ることになり、preload で作業者の文脈へ先に載って畳んだ意味も消えるため
     skills: 'all',
-    env: withManagerWorkerCacheTtl(withCliSessionEnv(env)),
+    env: withManagerAutoCompactWindow(withManagerWorkerCacheTtl(withCliSessionEnv(env))),
     // 生ログはデーモンへ預ける: runner は永続化の器を持たず、記憶ストアの鍵を runner に置かないため
     sessionStore,
     // [sdk-verbatim Options.settings]
@@ -779,7 +800,14 @@ export function buildManagerSessionOptions(request: ManagerSessionOptionsRequest
       ],
       // `PostToolUse` と `PostToolUseFailure` の片方だけを登録しない: 失敗・中断した道具呼び出しが日誌に1件も残らなくなるため
       PostToolUseFailure: postToolUseFailureMatchers(onPostToolUseFailure),
-      PreCompact: [{ hooks: [wrapObservationHook(onPreCompact, toAgentPreCompactRecord)] }],
+      // クローンと同じ口（返り値の `systemMessage`）で、マネージャー用の指示を渡す: 窓を絞ると要約が起きるので、依頼の決まりを逐語で残させるため
+      PreCompact: [
+        {
+          hooks: [
+            wrapPreCompactHookWithInstructions(onPreCompact, MANAGER_COMPACTION_INSTRUCTIONS),
+          ],
+        },
+      ],
       ...(onSessionStart === undefined
         ? {}
         : { SessionStart: [{ hooks: [wrapSessionStartHook(onSessionStart)] }] }),
