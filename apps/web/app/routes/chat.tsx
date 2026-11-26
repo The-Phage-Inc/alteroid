@@ -2119,10 +2119,11 @@ export function ChatPane({
         {liveNote !== undefined && liveNote.id === shownId ? liveNote.text : ''}
       </div>
 
+      {/* relative を外さない: 本文の sr-only（画像の読み込み中・脚注の見出し。absolute）が画面全体を基準にして抜け、上へ戻って読んでいるとページ全体が縦に伸びるため */}
       <div
         ref={scrollContainerRef}
         onScroll={handleScroll}
-        className="min-h-0 flex-1 overflow-y-auto py-4 pl-[calc(1rem+var(--safe-left))] pr-[calc(1rem+var(--safe-right))] md:pl-[calc(1.5rem+var(--safe-left))] md:pr-[calc(1.5rem+var(--safe-right))]"
+        className="relative min-h-0 flex-1 overflow-y-auto py-4 pl-[calc(1rem+var(--safe-left))] pr-[calc(1rem+var(--safe-right))] md:pl-[calc(1.5rem+var(--safe-left))] md:pr-[calc(1.5rem+var(--safe-right))]"
       >
         <LeftoverDrafts leftovers={leftovers} onDiscard={discardLeftover} />
         {history.data?.reachedStart === false && (
