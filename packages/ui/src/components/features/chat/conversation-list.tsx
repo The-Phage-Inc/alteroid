@@ -88,7 +88,8 @@ export function ConversationList({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* relative を外さない: 未読の sr-only（absolute）が画面全体を基準にして流れの外へ抜け、一覧の下の方に未読があるとページ全体が縦に伸びるため */}
+      <div className="relative min-h-0 flex-1 overflow-y-auto">
         <ErrorNote error={error} className="m-3" />
         {onRetry !== undefined && error !== undefined && error !== null && (
           <div className="px-3 pb-2">
